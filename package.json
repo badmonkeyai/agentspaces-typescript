@@ -1,0 +1,20 @@
+{
+  "name": "@agentspaces/client",
+  "version": "0.2.0",
+  "description": "Wire-compatible AgentSpaces peer in TypeScript: joins Java fleets over TCP, writes signed entries, takes under the claim lattice, reads spaces through anti-entropy.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "build/src/index.js",
+  "types": "build/src/index.d.ts",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test build/test/golden.test.js build/test/agents.test.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0"
+  }
+}

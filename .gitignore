@@ -1,0 +1,38 @@
+# AgentSpaces TypeScript client.
+#
+# test/golden.json is a vendored copy of agentspaces-spec/golden.json and IS committed.
+# package-lock.json IS committed (npm ci relies on it).
+
+# Dependencies
+node_modules/
+
+# Build output (tsc -> build/, per tsconfig.json)
+build/
+dist/
+*.tsbuildinfo
+
+# Test and coverage output
+coverage/
+.nyc_output/
+
+# npm / yarn / pnpm logs and caches
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.eslintcache
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.env.local
