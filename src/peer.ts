@@ -26,10 +26,12 @@
 
 import { Socket, connect } from "node:net";
 import { CborValue, dumps, loads } from "./cbor.js";
-import { AgentIdentity, Identity, deriveId, instantIso, verifyAgentCertificateAt, verifySignedGroupAd } from "./identity.js";
+import { AgentIdentity, Identity, deriveId, spaceIdLocal, instantIso, verifyAgentCertificateAt, verifySignedGroupAd } from "./identity.js";
 import * as revocation from "./revocation.js";
 import * as wire from "./wire.js";
 import type { Dict } from "./wire.js";
+
+const wireSpaceId = (group: string, space: string): string => spaceIdLocal(`${group}/${space}`);
 
 function sleep(millis: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, millis));
@@ -196,6 +198,7 @@ export class Peer {
     }
     const { entryId, body } = wire.entryDelta(space, this.group, typeName,
       dumps(value), this.identity, agentName, leaseMillis, agent, this.now());
+    this.foldDelta(loads(Buffer.from((loads(body) as Dict)["payload"] as Uint8Array)) as Dict);
     this.send("RUMOR", body);
     return entryId;
   }
@@ -237,7 +240,8 @@ export class Peer {
    */
   async takeEntry(space: string, typeName: string, agentName = "ts-worker",
                   leaseMillis = 60_000, settleMillis = 600,
-                  timeoutMillis = 15_000, agent: AgentIdentity | null = null): Promise<string | null> {
+                  timeoutMillis = 15_000, agent: AgentIdentity | null = null,
+                  exactEntryId: string | null = null): Promise<string | null> {
     const holder = agent !== null ? agent.agentId : this.identity.agent(agentName);
     if (this.revocations.refuses(holder, agent?.publicRaw ?? null, null)) {
       return null; // a revoked agent takes nothing, even locally
@@ -249,10 +253,13 @@ export class Peer {
       const now = this.now();
       for (const [entryId, dto] of this.states) {
         const record = dto["record"] as Dict | undefined;
-        if (!record || record["type"] !== typeName || dto["completed"]) {
+        if (!record || record["type"] !== typeName || dto["completed"]
+            || (record["group"] !== undefined && record["group"] !== this.group)
+            || record["spaceId"] !== wireSpaceId(this.group, space)
+            || (exactEntryId !== null && entryId !== exactEntryId)) {
           continue;
         }
-        const lease = record["lease"] as Dict | undefined;
+        const lease = (dto["leaseValue"] ?? record["lease"]) as Dict | undefined;
         if (!lease || Number(lease["expiresAtMillis"]) <= now) {
           continue;
         }
@@ -272,7 +279,10 @@ export class Peer {
         await sleep(300);
         const winner = this.claims.get(entryId)?.["claim"] as Dict | undefined;
         if (winner && winner["holder"] === holder
-            && Number(winner["epoch"]) === epoch) {
+            && Number(winner["epoch"]) === epoch
+            && Number(winner["expiresAtMillis"]) > this.now()
+            && !this.states.get(entryId)?.["completed"]
+            && !this.revocations.refuses(holder, agent?.publicRaw ?? null, null)) {
           return entryId;
         }
       }
@@ -286,6 +296,7 @@ export class Peer {
    * replicas can authenticate the completion (SPEC §11a).
    */
   completeEntry(space: string, entryId: string, agent: AgentIdentity | null = null): void {
+    this.requireHeld(space, entryId, agent);
     // A claim taken as an agent must be completed as that agent (A6, v0.1.13).
     const dto = wire.signState({ ...this.states.get(entryId)!, completed: true },
       this.identity, agent, this.now());
@@ -293,6 +304,55 @@ export class Peer {
     const proof = this.claims.get(entryId) ?? null;
     this.send("RUMOR", wire.rumorBody(`space:${space}`, `d:${entryId}`, 6,
       dumps({ state: dto, claimEntry: proof ? entryId : null, claim: proof })));
+  }
+
+  /** Checks the exact current live claim before an application emits a result. */
+  requireHeld(space: string, entryId: string, agent: AgentIdentity | null = null): void {
+    const state = this.states.get(entryId), record = state?.["record"] as Dict | undefined;
+    const claim = this.claims.get(entryId)?.["claim"] as Dict | undefined;
+    const holder = agent?.agentId ?? claim?.["holder"];
+    const signed = this.claims.get(entryId);
+    const localPeerHolder = agent !== null || (typeof holder === "string"
+      && holder.startsWith(this.identity.peerId + "/") && signed?.["holderCertificate"] == null
+      && signed?.["holderKey"] instanceof Uint8Array
+      && Buffer.from(signed["holderKey"] as Uint8Array).equals(this.identity.publicRaw));
+    if (!record || (record["group"] !== undefined && record["group"] !== this.group) || record["spaceId"] !== wireSpaceId(this.group, space)
+        || !localPeerHolder || state?.["completed"] || !claim || claim["entryId"] !== entryId
+        || claim["spaceId"] !== record["spaceId"] || claim["holder"] !== holder
+        || !Number.isFinite(Number(claim["expiresAtMillis"])) || Number(claim["expiresAtMillis"]) <= this.now()
+        || Number(((state?.["leaseValue"] ?? record["lease"]) as Dict)?.["expiresAtMillis"]) <= this.now()
+        || this.revocations.refuses(holder, agent?.publicRaw ?? null, null)) {
+      throw new Error("Current exact live claim required");
+    }
+  }
+
+  /** Extend a held claim using the existing claim lattice, with a fresh epoch. */
+  renewClaim(space: string, entryId: string, leaseMillis: number, agent: AgentIdentity): void {
+    if (!Number.isFinite(leaseMillis) || leaseMillis <= 0) throw new Error("Positive lease required");
+    this.requireHeld(space, entryId, agent);
+    const previous = this.claims.get(entryId)!["claim"] as Dict;
+    const claim = wire.takeClaim(entryId, String(previous["spaceId"]), Number(previous["epoch"]) + 1,
+      wire.hlcNow(agent.agentId, this.now()), agent.agentId, 0.0, this.now() + leaseMillis);
+    const signed = wire.signedClaim(claim, this.identity, agent);
+    this.claims.set(entryId, wire.mergeClaims(this.claims.get(entryId), signed));
+    this.send("RUMOR", wire.rumorBody(`space:${space}`, `c:${entryId}:${claim["stamp"]}`, 6,
+      wire.claimDelta(entryId, signed)));
+  }
+
+  /** Snapshot contains signed public material only. Restore re-verifies every entry. */
+  exportSnapshot(): Dict {
+    return { group: this.group, states: [...this.states.values()], claims: Object.fromEntries(this.claims), revocations: this.revocations.exportSigned() };
+  }
+  restoreSnapshot(snapshot: Dict): void {
+    if (snapshot["group"] !== this.group) throw new Error("Snapshot group mismatch");
+    this.revocations.restoreSigned((snapshot["revocations"] ?? {}) as Dict, this.now());
+    for (const [id, claim] of Object.entries((snapshot["claims"] ?? {}) as Dict)) {
+      this.foldClaim(id, claim as Dict);
+    }
+    for (const dto of (snapshot["states"] ?? []) as Dict[]) {
+      const record = dto["record"] as Dict | undefined;
+      if (record && (record["group"] === undefined || record["group"] === this.group)) this.fold(dto);
+    }
   }
 
   /**
@@ -327,7 +387,7 @@ export class Peer {
     return new Promise<void>((resolve, reject) => {
       const socket = connect({ host, port }, () => resolve());
       socket.on("error", reject);
-      socket.on("data", (chunk) => this.onData(chunk));
+      socket.on("data", (chunk) => this.onData(typeof chunk === "string" ? Buffer.from(chunk) : chunk));
       this.socket = socket;
     });
   }
