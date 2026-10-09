@@ -387,7 +387,7 @@ export class Peer {
     return new Promise<void>((resolve, reject) => {
       const socket = connect({ host, port }, () => resolve());
       socket.on("error", reject);
-      socket.on("data", (chunk) => this.onData(chunk));
+      socket.on("data", (chunk) => this.onData(typeof chunk === "string" ? Buffer.from(chunk) : chunk));
       this.socket = socket;
     });
   }
