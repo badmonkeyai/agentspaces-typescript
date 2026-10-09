@@ -415,7 +415,10 @@ test("exact takes filter space and entry, restore signed state and refuse expire
   restored.restoreSnapshot(loads(dumps(peer.exportSnapshot())) as Dict);
   assert.equal(restored.states.size, 3);
   restored.requireHeld("board", second, agent);
+  restored.renewClaim("board", second, 4000, agent);
   clock.advance(3000);
+  restored.requireHeld("board", second, agent);
+  clock.advance(2000);
   assert.throws(() => restored.completeEntry("board", second, agent), /exact live claim/);
   assert.equal(restored.states.get(second)?.["completed"], false);
 });

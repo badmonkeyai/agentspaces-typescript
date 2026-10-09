@@ -320,6 +320,19 @@ export class Peer {
     }
   }
 
+  /** Extend a held claim using the existing claim lattice, with a fresh epoch. */
+  renewClaim(space: string, entryId: string, leaseMillis: number, agent: AgentIdentity): void {
+    if (!Number.isFinite(leaseMillis) || leaseMillis <= 0) throw new Error("Positive lease required");
+    this.requireHeld(space, entryId, agent);
+    const previous = this.claims.get(entryId)!["claim"] as Dict;
+    const claim = wire.takeClaim(entryId, String(previous["spaceId"]), Number(previous["epoch"]) + 1,
+      wire.hlcNow(agent.agentId, this.now()), agent.agentId, 0.0, this.now() + leaseMillis);
+    const signed = wire.signedClaim(claim, this.identity, agent);
+    this.claims.set(entryId, wire.mergeClaims(this.claims.get(entryId), signed));
+    this.send("RUMOR", wire.rumorBody(`space:${space}`, `c:${entryId}:${claim["stamp"]}`, 6,
+      wire.claimDelta(entryId, signed)));
+  }
+
   /** Snapshot contains signed public material only. Restore re-verifies every entry. */
   exportSnapshot(): Dict {
     return { group: this.group, states: [...this.states.values()], claims: Object.fromEntries(this.claims), revocations: this.revocations.exportSigned() };
