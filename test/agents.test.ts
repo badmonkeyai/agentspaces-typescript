@@ -434,3 +434,12 @@ test("snapshot restore refuses tampered records and foreign groups", () => {
   assert.equal(target.states.size, 0);
   assert.throws(() => target.restoreSnapshot({ ...snapshot, group: "elsewhere" }), /group mismatch/);
 });
+
+
+test("peer-attested custom worker claims remain completable by their owning peer", async () => {
+  const peer = new Peer(Identity.generate(), GROUP);
+  const id = peer.writeEntry("board", "Board#v1", { title: "peer worker" });
+  assert.equal(await peer.takeEntry("board", "Board#v1", "custom-worker", 5000, 0, 1000, null, id), id);
+  peer.completeEntry("board", id);
+  assert.equal(peer.states.get(id)?.["completed"], true);
+});

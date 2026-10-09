@@ -310,11 +310,17 @@ export class Peer {
   requireHeld(space: string, entryId: string, agent: AgentIdentity | null = null): void {
     const state = this.states.get(entryId), record = state?.["record"] as Dict | undefined;
     const claim = this.claims.get(entryId)?.["claim"] as Dict | undefined;
-    const holder = agent?.agentId ?? this.identity.agent("ts-worker");
+    const holder = agent?.agentId ?? claim?.["holder"];
+    const signed = this.claims.get(entryId);
+    const localPeerHolder = agent !== null || (typeof holder === "string"
+      && holder.startsWith(this.identity.peerId + "/") && signed?.["holderCertificate"] == null
+      && signed?.["holderKey"] instanceof Uint8Array
+      && Buffer.from(signed["holderKey"] as Uint8Array).equals(this.identity.publicRaw));
     if (!record || (record["group"] !== undefined && record["group"] !== this.group) || record["spaceId"] !== wireSpaceId(this.group, space)
-        || state?.["completed"] || !claim || claim["entryId"] !== entryId
+        || !localPeerHolder || state?.["completed"] || !claim || claim["entryId"] !== entryId
         || claim["spaceId"] !== record["spaceId"] || claim["holder"] !== holder
-        || Number(claim["expiresAtMillis"]) <= this.now()
+        || !Number.isFinite(Number(claim["expiresAtMillis"])) || Number(claim["expiresAtMillis"]) <= this.now()
+        || Number(((state?.["leaseValue"] ?? record["lease"]) as Dict)?.["expiresAtMillis"]) <= this.now()
         || this.revocations.refuses(holder, agent?.publicRaw ?? null, null)) {
       throw new Error("Current exact live claim required");
     }
