@@ -397,3 +397,37 @@ test("a renewal under the wrong agent throws locally", () => {
   assert.throws(() => writer.renewEntry("tasks", foreign.entryId), /not by this peer/);
   assert.equal(sent.length, 0);
 });
+
+test("exact takes filter space and entry, restore signed state and refuse expired completion", async () => {
+  const clock = new Clock(T0), host = Identity.generate();
+  const agent = host.renewingSubordinate("board-worker", "PT24H", Identity.generate(), clock.now);
+  const peer = new Peer(host, GROUP, clock.now);
+  const foreign = peer.writeEntry("other", "Board#v1", { title: "foreign" }, "owner", 10000, agent);
+  const first = peer.writeEntry("board", "Board#v1", { title: "first" }, "owner", 10000, agent);
+  const second = peer.writeEntry("board", "Board#v1", { title: "second" }, "owner", 10000, agent);
+  assert.equal(peer.states.size, 3, "writes are visible without requiring an echo from a seed");
+  const held = await peer.takeEntry("board", "Board#v1", "worker", 2000, 0, 1000, agent, second);
+  assert.equal(held, second);
+  assert.equal(peer.claims.has(first), false);
+  assert.equal(peer.claims.has(foreign), false);
+  assert.throws(() => peer.completeEntry("other", second, agent), /exact live claim/);
+  const restored = new Peer(host, GROUP, clock.now);
+  restored.restoreSnapshot(loads(dumps(peer.exportSnapshot())) as Dict);
+  assert.equal(restored.states.size, 3);
+  restored.requireHeld("board", second, agent);
+  clock.advance(3000);
+  assert.throws(() => restored.completeEntry("board", second, agent), /exact live claim/);
+  assert.equal(restored.states.get(second)?.["completed"], false);
+});
+
+test("snapshot restore refuses tampered records and foreign groups", () => {
+  const host = Identity.generate(), peer = new Peer(host, GROUP);
+  peer.writeEntry("board", "Board#v1", { title: "original" });
+  const snapshot = loads(dumps(peer.exportSnapshot())) as Dict;
+  const record = ((snapshot["states"] as Dict[])[0]["record"] as Dict);
+  record["payload"] = dumps({ title: "forged" });
+  const target = new Peer(host, GROUP);
+  target.restoreSnapshot(snapshot);
+  assert.equal(target.states.size, 0);
+  assert.throws(() => target.restoreSnapshot({ ...snapshot, group: "elsewhere" }), /group mismatch/);
+});

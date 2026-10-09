@@ -41,7 +41,7 @@ const OWN_PEER = 1;
 const MAX_ISSUED_SKEW_MILLIS = 10 * 60 * 1000;
 const MAX_RETAINED = 4096;
 
-type Held = { rank: number; issued: number; hash: string; ad: Dict };
+type Held = { rank: number; issued: number; hash: string; ad: Dict; signed: Dict };
 
 const hex = (bytes: Uint8Array): string => Buffer.from(bytes).toString("hex");
 
@@ -104,6 +104,15 @@ export class Registry {
     return this.acceptSigned(stream, signed, nowMillis);
   }
 
+  exportSigned(): Dict {
+    return { [PEER_STREAM]: [...this.peers.values()].map(x => x.signed),
+      [CREDENTIAL_STREAM]: [...this.credentials.values()].map(x => x.signed) };
+  }
+  restoreSigned(snapshot: Dict, nowMillis: number): void {
+    for (const stream of STREAMS) for (const signed of (snapshot[stream] ?? []) as CborValue[])
+      this.acceptSigned(stream, signed, nowMillis);
+  }
+
   /** Verifies and accepts one decoded SignedRevocation {adBytes, publicKey, signature}. */
   acceptSigned(stream: string, signed: unknown, nowMillis: number): boolean {
     if (typeof signed !== "object" || signed === null || Array.isArray(signed)) {
@@ -139,7 +148,7 @@ export class Registry {
       if (founder === null || ad["issuer"] !== founder || typeof ad["revoked"] !== "string") {
         return false;
       }
-      return keep(this.peers, ad["revoked"] as string, { rank: FOUNDER, issued, hash, ad });
+      return keep(this.peers, ad["revoked"] as string, { rank: FOUNDER, issued, hash, ad, signed: s });
     }
     if (stream !== CREDENTIAL_STREAM) {
       return false;
@@ -166,7 +175,7 @@ export class Registry {
       return false;
     }
     return keep(this.credentials, `${String(target["kind"])}:${canonicalTarget(target)}`,
-      { rank, issued, hash, ad });
+      { rank, issued, hash, ad, signed: s });
   }
 
   peerRevoked(peerId: string): boolean {
