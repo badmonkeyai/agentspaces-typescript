@@ -96,10 +96,99 @@ Answers that fail (a different policy under the same id, a forged signature)
 are ignored, so a hostile seed can delay the join but never substitute a
 group; the promise rejects with a timeout error (default 10 s) when no
 verified document arrives, and only after success does the peer introduce
-itself. Frames whose envelope `ver` is not 2 are dropped before any signature
+itself. Frames whose envelope `ver` is not 3 are dropped before any signature
 work (SPEC section 9). `connect(host, port)` remains the path for
 literal-founding groups whose id every member derives from shared
 configuration.
+
+## Layers 3 and 4, TypeScript-shaped
+
+The same AgentSpace and the same capability services the Java annotations
+bind, as stage-3 decorators on plain classes (`L3L4-COVERAGE.md` §6.5).
+TypeScript keeps no parameter types at runtime, so the cue type is the
+decorator's first argument. An `@entry` class names its wire schema; a
+`Space` holds the layer-3 verbs; a `Template` carries the Java matchers
+(`eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `oneOf`, `contains`, `isNull`,
+`notNull`, or any function) over fields and tags; `watch` is an
+`EventEmitter` and `events` an async iterator, each delivering `WRITTEN`,
+`TAKEN`, and `COMPLETED` once per entry; `TakeContext.current()` (an
+`AsyncLocalStorage`) is the take a worker runs under.
+
+```ts
+@entry("ai.badmonkey.agentspaces.examples.fleet.ResearchFleet$ResearchTask#v1")
+class ResearchTask { constructor(public topic = "", public priority = 0) {} }
+
+@agent("researcher", { description: "Researches topics", goals: ["research"] })
+class Researcher {
+  @spaceTake(ResearchTask, "tasks", { lease: "30s", where: { priority: gte(1) }, produces: Finding })
+  research(task: ResearchTask): Finding { ... }
+
+  @spaceNotify(Finding, "tasks")
+  audit(finding: Finding): null { ... }
+
+  @bidFunction(ResearchTask, "tasks")
+  price(task: ResearchTask): number { ... }
+
+  @ballot("votes", { prefix: "council:" })
+  judge(proposal: Proposal): string | null { ... }
+
+  @onDecision("votes", { prefix: "council:" })
+  record(decision: Decision): null { ... }
+}
+
+const bound = new Binder(peer, { agent: identity.renewingSubordinate("ts-worker", "PT24H") }).bind(new Researcher());
+```
+
+`Binder.bind` runs the loops the Java `AgentBinder` runs, on Promises: the
+take loop, reactions off the delivery path, the ballot once per proposal, the
+decision once at quorum, and the AgentCard (with the declared actions and the
+agent certificate) published on the `ads` stream on bind. `vote.propose`,
+`vote.cast`, and `vote.decision` are the procedural forms; the tally rule is
+Java's. Numbers: a fractional field is encoded as a float64, an integral one
+as an integer, and decoded doubles are unwrapped before matching.
+
+The return conventions are the Java binder's (ISSUE-WorkflowVerbs,
+ISSUE-Motion): `null` writes nothing; `new Tagged(value, { region: "eu" })`
+is written with its tags; an array is the fork, each element written on its
+own after the take completes; a `new Motion(proposalId, question, options,
+quorum, space?)` opens a vote once per proposal id in its space or the
+binder's `voteSpace`. Two more cues: `@propose(Claim, "claims", "votes",
+["approve", "deny"], 2, { prefix: "claim:", key: "claimId" })` opens a vote
+from a cue once per key (the method returns the question, `null` to ask
+nothing, or a `Motion`), and `@spaceJoin("intake", "claimId", [part(Fraud),
+part(Coverage), part(Claim, { optional: true })], { resultSpace: ... })` is
+the LOCAL join: once per key, when every required part is readable, the
+method receives a `Joined` (`key`, `get`, `find`, `all`, `has`). The
+fleet-wide LEASED and ORDERED join modes, `@SpaceReduce`, and `@OrderedTake`
+need the ticket and the ordered log and are not here. `Space.entries(template)`
+is the metadata view (`Entry<T>`: `entryId`, `value`, `tags`, `issuer`,
+`expiresAtMillis`, `taken`), and every event carries its entry's tags. A
+watch, and `@spaceNotify(..., { on: [...] })`, deliver five kinds: `WRITTEN`,
+`TAKEN`, `COMPLETED`, `EXPIRED` (the write lease lapsed while the entry was
+open: a leased entry as a timer), and `REAPPEARED` (a take claim lapsed),
+the last two judged by a sweep on the clock, once per entry and lapse. A
+`new Contribution(epoch, value)` return starts the epoch on the binder's
+aggregate, and `produces` on a take or notify takes a list. The
+wire is version 3: maps a signature covers (`tags`, `costHints`,
+`spaceBindings`) are sorted by `canonicalMap`, shorter UTF-8 keys first and
+bytewise between equal lengths.
+
+`capabilities/` speaks the layer-4 pipes (`PIPE_DATA` frames addressed to a
+member): `Aggregate` (push-sum `avg`, roster `sum` and `count`, `min`, `max`,
+`estimate`, `Settle`, `awaitSettled`, `onEstimate`, and the `@onEstimate`
+decorator), `Semantic` (the hashing embedder with Java's `String.hashCode`
+so the vectors agree, `query`, `remoteQuery` over the query pipe, and
+answers to other members' queries), and `actions` and `invoke` (the actions
+the cards on the `ads` stream declare, invoked through the task space with
+the shared-fields correlation). A dial-only peer sends frames to the members
+it can reach (the seed it dialed), never to a member it only heard of.
+Not here: the ordered log (the Raft client), so ordered takes, reduces, and
+the fleet-wide LEASED and ORDERED join modes; the gossip-learning exchange
+(its payload is encoded and golden-pinned); and MAJORITY_GOSSIP.
+
+`demo/council.ts` is the whole of it against the Java `CouncilFleet`
+coordinator; `test/layer34.test.ts`, `test/layer4.test.ts`, and
+`test/verbs.test.ts` prove each piece without a socket.
 
 ## Run it
 
@@ -111,14 +200,18 @@ npm test                # tsc + golden vectors via node --test
 clients/run-trilingual-demo.sh
 ```
 
-The demo runs a Java coordinator publishing six tasks while a Python worker
-and this TypeScript worker race for them under the claim lattice; the
-coordinator prints each finding with the language-tagged worker that produced
-it. Three runtimes, one space, no broker.
+The demo runs a Java coordinator publishing six tasks while a Python worker,
+this TypeScript worker, and a LangChain4j worker race for them under the
+claim lattice; the coordinator prints each finding with the language-tagged
+worker that produced it. Its second act is the council: the Java
+`CouncilFleet` coordinator with the Python and TypeScript council workers
+voting, contributing to the push-sum epoch, answering the semantic query, and
+serving a remote action. Four runtimes, one space, no broker.
 
 ## Exact work selection and local snapshots
 
-`takeEntry` accepts an optional final `exactEntryId` argument. Selection always
+`takeEntry` accepts an optional `exactEntryId` argument (before the template
+matcher and the bid function). Selection always
 filters by the group's space ID, uses the effective renewed write lease, and
 rechecks the winning claim before returning. `requireHeld` validates an exact,
 current claim before an application records a result; `completeEntry` applies

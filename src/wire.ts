@@ -22,7 +22,7 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { CborDouble, CborValue, dumps, loads } from "./cbor.js";
+import { CborDouble, CborValue, canonicalMap, dumps, loads } from "./cbor.js";
 import {
   AgentIdentity, Identity, deriveId, spaceIdLocal, verifyAgentCertificateAt,
 } from "./identity.js";
@@ -32,9 +32,10 @@ export type Dict = { [key: string]: CborValue };
 /**
  * WireCodec.WIRE_VERSION: the only envelope version a receiver accepts. A
  * frame of any other version is dropped before its signature is examined
- * (SPEC §9, TECH-SPEC §3).
+ * (SPEC §9, TECH-SPEC §3). 3 since ISSUE-CanonicalMaps: map entries sorted
+ * by key in every encoding.
  */
-export const WIRE_VERSION = 2;
+export const WIRE_VERSION = 3;
 
 /**
  * Largest frame accepted or sent, mirroring the JVM transport's cap: a length
@@ -251,7 +252,7 @@ export function agentCard(group: string, identity: Identity, localName: string,
   const agent = identity.agent(localName);
   const card: Dict = { id: `aspace://${group}/agent/${agent}`, issuer: identity.peerId,
     group, issued: issuedIso, ttl: ttlIso, agent, description, goals, consumes,
-    produces, costHints, spaceBindings };
+    produces, costHints: canonicalMap(costHints), spaceBindings: canonicalMap(spaceBindings) };
   if (agentCertificate !== null && (agentPublicKey === null
       || agentCertificate["agent"] !== agent
       || !Buffer.from(agentCertificate["agentPublicKey"] as Uint8Array).equals(Buffer.from(agentPublicKey)))) {
@@ -385,9 +386,11 @@ export function contentId(block: Uint8Array): string {
  */
 export function signView(entryId: string, spaceId: string, typeName: string,
                          payload: Uint8Array, issuer: string,
-                         issued: string, keyEpoch: number | null = null): Dict {
+                         issued: string, keyEpoch: number | null = null,
+                         tags: Dict = {}): Dict {
+  // SPEC §7.1: the tags are part of the signed record, canonical on the wire.
   const view: Dict = { entryId, spaceId, type: typeName, payload, payloadRef: null,
-    issuer, issued, tags: {} };
+    issuer, issued, tags: canonicalMap(tags) };
   if (keyEpoch !== null) {
     view["keyEpoch"] = keyEpoch;
   }
@@ -528,13 +531,14 @@ export function signState(dto: Dict, identity: Identity, agent: AgentIdentity | 
 export function entryDelta(spaceName: string, group: string, typeName: string,
                            payload: Uint8Array, identity: Identity,
                            agentName: string, leaseMillis: number,
-                           agent: AgentIdentity | null = null, nowMillis?: number):
+                           agent: AgentIdentity | null = null, nowMillis?: number,
+                           tags: Dict = {}):
     { entryId: string; body: Buffer } {
   const entryId = randomUUID();
   const spaceId = spaceIdLocal(`${group}/${spaceName}`);
   const issuer = agent !== null ? agent.agentId : identity.agent(agentName);
   const issued = hlcNow(issuer, nowMillis);
-  const view = signView(entryId, spaceId, typeName, payload, issuer, issued);
+  const view = signView(entryId, spaceId, typeName, payload, issuer, issued, null, tags);
   let certificate: Dict | null = null;
   if (agent !== null) {
     certificate = agent.certificateCovering(hlcPhysical(issued));
@@ -547,7 +551,7 @@ export function entryDelta(spaceName: string, group: string, typeName: string,
   const lease: Dict = { holder: issuer, expiresAtMillis: expires, kind: "WRITE" };
   const record: Dict = {
     entryId, spaceId, type: typeName, payload, payloadRef: null, issuer,
-    issued, lease, tags: {}, sig: signature,
+    issued, lease, tags: view["tags"], sig: signature,
   };
   const adds = [{ replica: identity.peerId, counter: 1 }];
   const leaseValue: Dict = { holder: issuer, expiresAtMillis: expires, kind: "WRITE" };

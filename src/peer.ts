@@ -26,7 +26,7 @@
 
 import { Socket, connect } from "node:net";
 import { CborValue, dumps, loads } from "./cbor.js";
-import { AgentIdentity, Identity, deriveId, spaceIdLocal, instantIso, verifyAgentCertificateAt, verifySignedGroupAd } from "./identity.js";
+import { AgentIdentity, Identity, deriveId, instantIso, parseDurationMillis, parseInstantMillis, spaceIdLocal, verifyAgentCertificateAt, verifySignedGroupAd } from "./identity.js";
 import * as revocation from "./revocation.js";
 import * as wire from "./wire.js";
 import type { Dict } from "./wire.js";
@@ -42,6 +42,9 @@ interface PendingFounding {
   group: string;
   resolve(signed: Dict): void;
 }
+
+/** An advertisement as the cache holds it. */
+export type CachedAd = { type: string; ad: Dict; stored: Dict; issuer: string; expires: number };
 
 export class Peer {
   readonly states = new Map<string, Dict>();
@@ -192,16 +195,126 @@ export class Peer {
    */
   writeEntry(space: string, typeName: string, value: Dict,
              agentName = "typescript", leaseMillis = 600_000,
-             agent: AgentIdentity | null = null): string {
+             agent: AgentIdentity | null = null, tags: Dict = {}): string {
     if (agent !== null && this.revocations.refuses(agent.agentId, agent.publicRaw, null)) {
       throw new Error(`${agent.agentId} is revoked in this group`);
     }
     const { entryId, body } = wire.entryDelta(space, this.group, typeName,
-      dumps(value), this.identity, agentName, leaseMillis, agent, this.now());
+      dumps(value), this.identity, agentName, leaseMillis, agent, this.now(), tags);
+    // The writer holds its own entry too, folded into the verified local
+    // replica before transport, so a local read sees it at once.
     this.foldDelta(loads(Buffer.from((loads(body) as Dict)["payload"] as Uint8Array)) as Dict);
     this.send("RUMOR", body);
     return entryId;
   }
+
+  /**
+   * Publishes an advertisement this peer issued (an AgentCard, an AssetCard)
+   * on the `ads` stream as DiscoveryService.publish does: the stored form,
+   * under the advertisement's id and issue time.
+   */
+  publishAd(adType: string, ad: Dict): void {
+    const stored = wire.storedAd(adType, ad, this.identity);
+    this.acceptAd(stored); // our own cache holds it too, as DiscoveryService.publish does
+    const itemId = `${String(ad["id"])}:${parseInstantMillis(ad["issued"])}`;
+    this.send("RUMOR", wire.rumorBody("ads", itemId, 6, dumps(stored)));
+  }
+
+  /** Layer 4 (SPEC §6, §8): the members heard from (peer id to its advertisement, `{}` when only heard). */
+  readonly members = new Map<string, Dict>();
+  /**
+   * The members a frame of ours can reach: those that signed a frame that
+   * arrived on our connection. A dial-only peer has one socket, so a member
+   * learned only from the peers stream (another dial-only peer behind the
+   * same seed) is not among them; the seed drops, not relays, a frame to it.
+   */
+  readonly reachable = new Set<string>();
+  /** The advertisements the `ads` stream carried, by id. */
+  readonly ads = new Map<string, CachedAd>();
+  /** Capability frame handlers by capability type: `(fromPeerId, payload)`. */
+  readonly pipeHandlers = new Map<string, (from: string, payload: Uint8Array) => void>();
+
+  /** Anti-entropy pull of the `ads` stream (SPEC §6.2): the cards and capability advertisements the group holds. */
+  pullAds(): void {
+    this.send("DIGEST", wire.digestBody({ ads: new Uint8Array() }));
+  }
+
+  /**
+   * Admits a StoredAd as AdCache.accept does: the signature over the canonical
+   * bytes under the carried key, the issuer derived from that key, and the TTL
+   * not yet passed. Returns the cached entry, or null.
+   */
+  acceptAd(stored: unknown): CachedAd | null {
+    if (typeof stored !== "object" || stored === null) {
+      return null;
+    }
+    const s = stored as Dict;
+    const adBytes = s["adBytes"];
+    const key = s["publicKey"];
+    const signature = s["signature"];
+    if (!(adBytes instanceof Uint8Array) || !(key instanceof Uint8Array) || !(signature instanceof Uint8Array)) {
+      return null;
+    }
+    if (!Identity.verify(key, adBytes, signature)) {
+      return null;
+    }
+    let ad: Dict;
+    let expires: number;
+    try {
+      ad = loads(Buffer.from(adBytes)) as Dict;
+      if (typeof ad !== "object" || ad === null || ad["issuer"] !== deriveId(key)) {
+        return null;
+      }
+      expires = parseInstantMillis(ad["issued"]) + parseDurationMillis(ad["ttl"]);
+    } catch {
+      return null;
+    }
+    if (expires <= this.now()) {
+      return null;
+    }
+    const entry: CachedAd = { type: String(s["adType"]), ad, stored: s, issuer: String(ad["issuer"]), expires };
+    const id = String(ad["id"]);
+    const previous = this.ads.get(id);
+    if (previous === undefined || parseInstantMillis(previous.ad["issued"]) <= parseInstantMillis(ad["issued"])) {
+      this.ads.set(id, entry);
+    }
+    return this.ads.get(id)!;
+  }
+
+  /** The live AgentCards the ads stream carried. */
+  cards(): Dict[] {
+    const now = this.now();
+    return [...this.ads.values()].filter((e) => e.type === "AgentCard" && e.expires > now).map((e) => e.ad);
+  }
+
+  /** One capability frame to a member (CapabilityPipes.send): a PIPE_DATA envelope addressed to it. */
+  sendPipe(to: string, capability: string, payload: Uint8Array): void {
+    this.send("PIPE_DATA", dumps({ capability, payload }), to);
+  }
+
+  /** A `peers` stream item (PeerNode.SignedPeerAd): kept under its issuer when it verifies. */
+  private acceptPeerAd(payload: Uint8Array): void {
+    try {
+      const signed = loads(Buffer.from(payload)) as Dict;
+      const adBytes = signed["adBytes"] as Uint8Array;
+      const key = signed["publicKey"] as Uint8Array;
+      if (!Identity.verify(key, adBytes, signed["signature"] as Uint8Array)) {
+        return;
+      }
+      const ad = loads(Buffer.from(adBytes)) as Dict;
+      if (typeof ad === "object" && ad !== null && ad["issuer"] === deriveId(key)
+          && ad["issuer"] !== this.identity.peerId) {
+        this.members.set(String(ad["issuer"]), ad);
+      }
+    } catch {
+      // not a peer advertisement
+    }
+  }
+
+  /** Called after a state folds (the merged state), for spaces and watches. */
+  onState: ((dto: Dict) => void) | null = null;
+  /** Called after a claim folds (the merged signed claim). */
+  onClaim: ((entryId: string, signed: Dict) => void) | null = null;
 
   /**
    * Anti-entropy pull (spec §5.3): offer an empty digest. The revocation
@@ -241,7 +354,9 @@ export class Peer {
   async takeEntry(space: string, typeName: string, agentName = "ts-worker",
                   leaseMillis = 60_000, settleMillis = 600,
                   timeoutMillis = 15_000, agent: AgentIdentity | null = null,
-                  exactEntryId: string | null = null): Promise<string | null> {
+                  exactEntryId: string | null = null,
+                  matches: ((payload: Dict, tags: Dict) => boolean) | null = null,
+                  bid: number | ((payload: Dict) => number) = 0.0): Promise<string | null> {
     const holder = agent !== null ? agent.agentId : this.identity.agent(agentName);
     if (this.revocations.refuses(holder, agent?.publicRaw ?? null, null)) {
       return null; // a revoked agent takes nothing, even locally
@@ -267,9 +382,15 @@ export class Peer {
         if (current && Number(current["expiresAtMillis"]) > now) {
           continue;
         }
+        // A template narrows the candidates; a bid function prices the claim (AUCTION).
+        const payload = loads(Buffer.from((record["payload"] as Uint8Array) ?? new Uint8Array([0xf6]))) as Dict;
+        if (matches !== null && !matches(payload ?? {}, (record["tags"] as Dict) ?? {})) {
+          continue;
+        }
+        const price = typeof bid === "function" ? bid(payload ?? {}) : bid;
         const epoch = current ? Number(current["epoch"]) + 1 : 1;
         const claim = wire.takeClaim(entryId, String(record["spaceId"]), epoch,
-          wire.hlcNow(holder, now), holder, 0.0, now + leaseMillis);
+          wire.hlcNow(holder, now), holder, price, now + leaseMillis);
         const signed = wire.signedClaim(claim, this.identity, agent);
         this.claims.set(entryId, wire.mergeClaims(this.claims.get(entryId), signed));
         this.send("RUMOR", wire.rumorBody(`space:${space}`,
@@ -301,6 +422,7 @@ export class Peer {
     const dto = wire.signState({ ...this.states.get(entryId)!, completed: true },
       this.identity, agent, this.now());
     this.states.set(entryId, dto);
+    this.onState?.(dto);
     const proof = this.claims.get(entryId) ?? null;
     this.send("RUMOR", wire.rumorBody(`space:${space}`, `d:${entryId}`, 6,
       dumps({ state: dto, claimEntry: proof ? entryId : null, claim: proof })));
@@ -392,9 +514,9 @@ export class Peer {
     });
   }
 
-  private send(kind: string, body: Buffer): void {
+  private send(kind: string, body: Buffer, to: string | null = null): void {
     this.sendEnvelope(wire.envelope(this.group, kind, this.identity.peerId,
-      wire.hlcNow(this.identity.peerId, this.now()), body));
+      wire.hlcNow(this.identity.peerId, this.now()), body, to));
   }
 
   private sendEnvelope(env: Dict): void {
@@ -447,7 +569,21 @@ export class Peer {
     wire.hlcObserve(this.identity.peerId, env["stamp"], this.now());
     const kind = env["kind"];
     const body = Buffer.from((env["body"] as Uint8Array) ?? new Uint8Array());
-    if (kind === "PING") {
+    const sender = env["from"];
+    if (typeof sender === "string" && sender !== this.identity.peerId) {
+      if (!this.members.has(sender)) {
+        this.members.set(sender, {}); // a verified frame is a member heard from
+      }
+      this.reachable.add(sender);
+    }
+    if (kind === "PIPE_DATA") {
+      const frame = loads(body) as Dict;
+      const handler = typeof frame === "object" && frame !== null
+        ? this.pipeHandlers.get(String(frame["capability"])) : undefined;
+      if (handler !== undefined) {
+        handler(String(sender), (frame["payload"] as Uint8Array) ?? new Uint8Array());
+      }
+    } else if (kind === "PING") {
       const ping = loads(body) as Dict;
       // Java's probe nonces are random 64-bit longs: echo the decoded integer
       // as is (a bigint beyond 2^53), since a Number would lose it and the
@@ -459,6 +595,10 @@ export class Peer {
       const rumor = loads(body) as Dict;
       if (revocation.STREAMS.includes(String(rumor["streamId"]))) {
         this.revocations.accept(String(rumor["streamId"]), rumor["payload"], this.now());
+      } else if (rumor["streamId"] === "peers") {
+        this.acceptPeerAd((rumor["payload"] as Uint8Array) ?? new Uint8Array());
+      } else if (rumor["streamId"] === "ads") {
+        this.acceptAd(loads(Buffer.from((rumor["payload"] as Uint8Array) ?? new Uint8Array([0xf6]))));
       } else if (String(rumor["streamId"] ?? "").startsWith("space:")) {
         const delta = loads(Buffer.from(
           (rumor["payload"] as Uint8Array) ?? new Uint8Array([0xf6]))) as Dict;
@@ -472,6 +612,13 @@ export class Peer {
             && deltaBytes.length > 0) {
           for (const signed of (loads(Buffer.from(deltaBytes)) as CborValue[]) ?? []) {
             this.revocations.acceptSigned(stream, signed, this.now());
+          }
+          continue;
+        }
+        if (stream === "ads" && deltaBytes instanceof Uint8Array && deltaBytes.length > 0) {
+          const delta = loads(Buffer.from(deltaBytes)) as Dict;
+          for (const stored of ((delta?.["ads"] as unknown[]) ?? [])) {
+            this.acceptAd(stored);
           }
           continue;
         }
@@ -522,6 +669,7 @@ export class Peer {
     const previous = this.states.get(entryId);
     this.states.set(entryId,
         previous === undefined ? dto : joinStates(previous, dto));
+    this.onState?.(this.states.get(entryId)!);
   }
 
   /**
@@ -667,6 +815,7 @@ export class Peer {
       return;
     }
     this.claims.set(entryId, wire.mergeClaims(this.claims.get(entryId), signed));
+    this.onClaim?.(entryId, this.claims.get(entryId)!);
   }
 }
 

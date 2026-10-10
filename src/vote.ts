@@ -29,8 +29,11 @@
  */
 import { loads } from "./cbor.js";
 import type { Dict } from "./wire.js";
+import type { Peer } from "./peer.js";
+import type { AgentIdentity } from "./identity.js";
 
 export const BALLOT_TYPE = "ai.badmonkey.agentspaces.capabilities.vote.VoteCapability$Ballot#v1";
+export const PROPOSAL_TYPE = "ai.badmonkey.agentspaces.capabilities.vote.VoteCapability$Proposal#v1";
 export type Granularity = "PEER" | "AGENT";
 
 function dotKeys(dots: unknown): Set<string> {
@@ -103,4 +106,86 @@ export function tally(states: Map<string, Dict>, proposalId: string,
     result.set(option, (result.get(option) ?? 0) + 1);
   }
   return result;
+}
+
+// ------------------------------------------------------- proposals and casts
+
+/** A proposal as the fleet writes it (SPEC §8.4). */
+export type Proposal = { proposalId: string; question: string; options: string[]; quorum: number };
+
+/** The open proposals by id, from the folded Proposal records. */
+export function proposals(states: Map<string, Dict>): Map<string, Proposal> {
+  const found = new Map<string, Proposal>();
+  for (const dto of states.values()) {
+    const record = (dto["record"] as Dict) ?? {};
+    if (record["type"] !== PROPOSAL_TYPE || dto["completed"]) {
+      continue;
+    }
+    let proposal: unknown;
+    try {
+      proposal = loads(Buffer.from(record["payload"] as Uint8Array));
+    } catch {
+      continue;
+    }
+    const p = proposal as Dict;
+    if (typeof p === "object" && p !== null && typeof p["proposalId"] === "string" && !found.has(p["proposalId"])) {
+      found.set(p["proposalId"], { proposalId: p["proposalId"], question: String(p["question"] ?? ""),
+        options: ((p["options"] as unknown[]) ?? []).map(String), quorum: Number(p["quorum"] ?? 0) });
+    }
+  }
+  return found;
+}
+
+/**
+ * Opens a proposal: a Proposal entry in the vote space, in Java field order;
+ * idempotent on the id. Returns the entry id, or null when already open.
+ */
+export function propose(peer: Peer, space: string, proposalId: string, question: string,
+                        options: string[], quorum: number, leaseMillis = 3_600_000,
+                        agent: AgentIdentity | null = null, agentName = "typescript"): string | null {
+  if (proposals(peer.states).has(proposalId)) {
+    return null;
+  }
+  return peer.writeEntry(space, PROPOSAL_TYPE, { proposalId, question, options, quorum },
+    agentName, leaseMillis, agent);
+}
+
+/**
+ * Casts this agent's ballot: a Ballot entry whose `voter` is the
+ * authenticated writer (a tally skips any other); the first per voter counts.
+ */
+export function cast(peer: Peer, space: string, proposalId: string, option: string,
+                     leaseMillis = 3_600_000, agent: AgentIdentity | null = null,
+                     agentName = "typescript"): string {
+  const voter = agent !== null ? agent.agentId : peer.identity.agent(agentName);
+  return peer.writeEntry(space, BALLOT_TYPE, { proposalId, option, voter }, agentName, leaseMillis, agent);
+}
+
+/** A closed vote: the winner and the counts. */
+export type Decision = { proposalId: string; winner: string; tally: Map<string, number> };
+
+/**
+ * The QUORUM decision as Java closes it (SPEC §8.4): once distinct counted
+ * voters reach the quorum, the option with the most votes wins, ties broken
+ * to the lexicographically first option. Null while open or unknown.
+ */
+export function decision(states: Map<string, Dict>, proposalId: string, granularity: Granularity = "PEER",
+                         permits: ((issuer: string) => boolean) | null = null): Decision | null {
+  const proposal = proposals(states).get(proposalId);
+  if (proposal === undefined) {
+    return null;
+  }
+  const counts = tally(states, proposalId, proposal.options, granularity, permits);
+  let voters = 0;
+  for (const n of counts.values()) {
+    voters += n;
+  }
+  if (voters === 0 || voters < proposal.quorum) {
+    return null;
+  }
+  const winner = [...proposal.options].sort((a, b) => {
+    const diff = (counts.get(b) ?? 0) - (counts.get(a) ?? 0);
+    return diff !== 0 ? diff : a < b ? -1 : a > b ? 1 : 0;
+  })[0];
+  return { proposalId, winner, tally: counts };
 }

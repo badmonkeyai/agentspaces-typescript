@@ -19,3 +19,7 @@ export * from "./identity.js";
 export * as revocation from "./revocation.js";
 export * as wire from "./wire.js";
 export { Peer } from "./peer.js";
+export * as vote from "./vote.js";
+export * from "./space.js";
+export * from "./agents.js";
+export * as capabilities from "./capabilities/index.js";

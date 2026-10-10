@@ -105,6 +105,24 @@ function integer(value: bigint): number | bigint {
 }
 
 /** Encodes a value the way the Java codec encodes its equivalent. */
+/**
+ * A copy of a map-valued field with its entries in canonical order (shorter
+ * UTF-8 key first, then bytewise; RFC 8949 §4.2.1), the order the Java codec
+ * writes every map in as of wire v3 (ISSUE-CanonicalMaps). Apply it to maps a
+ * signature covers (tags, costHints, spaceBindings, resourceHints, parameters,
+ * access); never to an object standing for a record.
+ */
+export function canonicalMap(value: { [key: string]: CborValue }): { [key: string]: CborValue } {
+  const entries = Object.entries(value).map(([key, item]) =>
+    ({ key, item, bytes: Buffer.from(key, "utf8") }));
+  entries.sort((a, b) => a.bytes.length - b.bytes.length || Buffer.compare(a.bytes, b.bytes));
+  const out: { [key: string]: CborValue } = {};
+  for (const { key, item } of entries) {
+    out[key] = item;
+  }
+  return out;
+}
+
 export function dumps(value: CborValue): Buffer {
   const parts: Buffer[] = [];
   encode(value, parts);
@@ -145,6 +163,11 @@ function encode(value: CborValue, out: Buffer[]): void {
       encode(item, out);
     }
   } else {
+    // Indefinite-length map in the object's own order: an object stands for a
+    // Java record (declared component order) as often as for a map, so the
+    // encoder cannot sort. A map-valued field (tags, costHints, ...) is put in
+    // canonical order by canonicalMap where it is built (wire v3,
+    // ISSUE-CanonicalMaps).
     out.push(Buffer.from([0xbf]));
     for (const [key, item] of Object.entries(value)) {
       encode(key, out);

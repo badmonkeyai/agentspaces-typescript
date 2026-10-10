@@ -11,7 +11,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node --test build/test/golden.test.js build/test/agents.test.js"
+    "test": "tsc && node --test build/test/golden.test.js build/test/agents.test.js build/test/layer34.test.js build/test/layer4.test.js build/test/verbs.test.js"
   },
   "devDependencies": {
     "typescript": "^5.5.0",

@@ -401,13 +401,13 @@ test("a frame of another wire version is dropped before verification (SPEC 9)", 
   const id = identity();
   const env = wire.envelope(GOLDEN["group_id"], "PING", id.peerId,
     GOLDEN["hlc_encoded"], wire.pingBody(42), id.peerId);
-  assert.equal(env["ver"], 2);
+  assert.equal(env["ver"], 3);
   assert.notEqual(wire.decodeFrame(wire.encodeFrame(env, id)), null);
-  const v1 = { ...env, ver: 1 };
-  assert.equal(wire.decodeFrame(wire.encodeFrame(v1, id)), null,
-    "a validly signed ver=1 frame is refused");
-  const v3 = { ...env, ver: 3 };
-  assert.equal(wire.decodeFrame(wire.encodeFrame(v3, id)), null);
+  const v2 = { ...env, ver: 2 };
+  assert.equal(wire.decodeFrame(wire.encodeFrame(v2, id)), null,
+    "a validly signed ver=2 frame is refused");
+  const v4 = { ...env, ver: 4 };
+  assert.equal(wire.decodeFrame(wire.encodeFrame(v4, id)), null);
 });
 
 test("AgentCard and SpaceAdvertisement match Java (SPEC 6.1, 4.4)", () => {
