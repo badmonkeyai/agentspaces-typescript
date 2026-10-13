@@ -57,6 +57,57 @@ export const MAX_CLAIM_HOLD_MILLIS = 24 * 60 * 60 * 1000;
  */
 export const MAX_HLC_SKEW_MILLIS = 10 * 60 * 1000;
 
+/**
+ * How far in the past a frame's stamp may be before it is dropped as stale, and how many
+ * (sender, stamp) pairs the replay filter remembers (ROBUSTNESS.md §3.3, §3.4; the Java
+ * node's MAX_FRAME_AGE_MILLIS and its recent-frames cache).
+ */
+export const MAX_FRAME_AGE_MILLIS = 5 * 60 * 1000;
+export const FRAME_FILTER_CAPACITY = 4096;
+
+/**
+ * Admits each verified frame once, fresh: a stamp older than MAX_FRAME_AGE_MILLIS is stale,
+ * one further ahead than MAX_HLC_SKEW_MILLIS is refused, and a (sender, stamp) pair seen
+ * before is a replay. All three are dropped silently and counted: late, duplicated and
+ * replayed frames are the normal case on a network, not evidence of anything.
+ */
+export class FrameFilter {
+  private readonly seen = new Set<string>();
+  stale = 0;
+  ahead = 0;
+  replayed = 0;
+
+  constructor(private readonly capacity: number = FRAME_FILTER_CAPACITY) {}
+
+  admit(env: Dict, nowMillis: number): boolean {
+    const physical = Number(String(env["stamp"] ?? "").split(":")[0]);
+    if (!Number.isFinite(physical)) {
+      return false;
+    }
+    if (nowMillis - physical > MAX_FRAME_AGE_MILLIS) {
+      this.stale += 1;
+      return false;
+    }
+    if (physical - nowMillis > MAX_HLC_SKEW_MILLIS) {
+      this.ahead += 1;
+      return false;
+    }
+    const key = `${String(env["from"])}|${String(env["stamp"])}`;
+    if (this.seen.has(key)) {
+      this.replayed += 1;
+      return false;
+    }
+    this.seen.add(key);
+    if (this.seen.size > this.capacity) {
+      const eldest = this.seen.values().next().value;
+      if (eldest !== undefined) {
+        this.seen.delete(eldest);
+      }
+    }
+    return true;
+  }
+}
+
 const hlcState = new Map<string, [number, number]>();
 
 /**

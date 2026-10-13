@@ -208,6 +208,22 @@ worker that produced it. Its second act is the council: the Java
 voting, contributing to the push-sum epoch, answering the semantic query, and
 serving a remote action. Four runtimes, one space, no broker.
 
+## On a network
+
+The client is generous in what it accepts and cautious in what it sends
+(ROBUSTNESS.md). Every verified frame passes a `FrameFilter` first: a stamp
+older than five minutes is stale, one further ahead than the HLC drift bound is
+refused, and a sender-and-stamp pair seen before is a replay; all three are
+dropped without a reply and counted (`peer.frames.stale`, `.ahead`,
+`.replayed`). A kind this client does not speak is counted in
+`peer.ignoredKinds`, a body that does not decode in `peer.malformedFrames`, and
+the reader goes on. A lost socket is a hiccup, not the end: the peer re-dials
+the seed every `reconnectIntervalMs` (5 s) for `reconnectWindowMs` (10 min),
+one dial at a time, then introduces itself again and pulls again what it had
+pulled (revocations, advertisements, spaces), counting in `peer.reconnects`;
+`peer.connected()` says whether the link is up. `close()` by the owner is
+final. `test/robustness.test.ts` pins each case against a fake seed over TCP.
+
 ## Exact work selection and local snapshots
 
 `takeEntry` accepts an optional `exactEntryId` argument (before the template

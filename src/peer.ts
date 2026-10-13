@@ -75,6 +75,20 @@ export class Peer {
     this.revocations = new revocation.Registry(() => this.founderId(), () => this.group);
   }
 
+  // ROBUSTNESS.md: late, replayed and unknown frames are the normal case; count, never fail.
+  readonly frames = new wire.FrameFilter();
+  readonly ignoredKinds = new Map<string, number>();
+  malformedFrames = 0;
+  // A lost socket is reconnected to the seed and the peer re-introduced and re-pulled, every
+  // reconnectIntervalMs for reconnectWindowMs; a close() by the owner is final.
+  reconnects = 0;
+  reconnectIntervalMs = 5000;
+  reconnectWindowMs = 600_000;
+  private seed: { host: string; port: number } | null = null;
+  private running = false;
+  private readonly pulledSpaces = new Set<string>();
+  private pulledAds = false;
+
   private founderId(): string | null {
     if (this.founder !== null) {
       return this.founder;
@@ -85,9 +99,61 @@ export class Peer {
 
   /** Dials the seed and introduces this peer to the group. */
   async connect(host: string, port: number): Promise<void> {
+    this.seed = { host, port };
+    this.running = true;
     await this.dial(host, port);
     this.introduce();
     this.pullRevocations();
+  }
+
+  /** Whether the seed connection is up (a reconnect may be in progress while it is not). */
+  connected(): boolean {
+    return this.running && this.socket !== null;
+  }
+
+  /**
+   * After a lost socket: dials the seed again until the window runs out, then introduces this
+   * peer again and pulls what it had pulled before, so a network hiccup costs a few seconds
+   * rather than the membership (ROBUSTNESS.md §3.6).
+   */
+  private reconnecting = false;
+
+  private reconnect(deadline: number): void {
+    if (!this.running || this.seed === null) {
+      this.reconnecting = false;
+      return;
+    }
+    this.reconnecting = true;
+    this.dial(this.seed.host, this.seed.port).then(() => {
+      this.reconnecting = false;
+      this.reconnects += 1;
+      this.introduce();
+      this.pullRevocations();
+      if (this.pulledAds) {
+        this.pullAds();
+      }
+      for (const space of this.pulledSpaces) {
+        this.pullSpace(space);
+      }
+    }).catch(() => {
+      if (this.running && Date.now() < deadline) {
+        const timer = setTimeout(() => this.reconnect(deadline), this.reconnectIntervalMs);
+        timer.unref();
+      } else {
+        this.reconnecting = false;
+      }
+    });
+  }
+
+  private onSocketClosed(socket: Socket): void {
+    if (this.socket !== socket) {
+      return; // an old link, already replaced
+    }
+    this.socket = null;
+    this.pending = Buffer.alloc(0);
+    if (this.running && this.seed !== null && !this.reconnecting) {
+      this.reconnect(Date.now() + this.reconnectWindowMs);
+    }
   }
 
   /**
@@ -103,6 +169,8 @@ export class Peer {
   async joinByGroupId(host: string, port: number, groupId: string,
                       timeoutMillis = 10_000): Promise<Dict> {
     this.group = groupId;
+    this.seed = { host, port };
+    this.running = true;
     await this.dial(host, port);
     const founding = this.awaitFounding(groupId, timeoutMillis);
     // Unaddressed: the seed's PeerID is unknown until it answers (§9).
@@ -174,6 +242,7 @@ export class Peer {
   }
 
   close(): void {
+    this.running = false;
     this.socket?.destroy();
     this.socket = null;
   }
@@ -236,6 +305,7 @@ export class Peer {
 
   /** Anti-entropy pull of the `ads` stream (SPEC §6.2): the cards and capability advertisements the group holds. */
   pullAds(): void {
+    this.pulledAds = true;
     this.send("DIGEST", wire.digestBody({ ads: new Uint8Array() }));
   }
 
@@ -322,6 +392,7 @@ export class Peer {
    * a late joiner learns the group's revocations here.
    */
   pullSpace(space: string): void {
+    this.pulledSpaces.add(space);
     this.send("DIGEST", wire.digestBody({ [`space:${space}`]: new Uint8Array(),
       ...revocationDigests() }));
   }
@@ -507,14 +578,19 @@ export class Peer {
 
   private dial(host: string, port: number): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const socket = connect({ host, port }, () => resolve());
+      // The socket becomes this peer's link only once connected: a refused dial closes too,
+      // and that close must not start a second reconnect chain (one dial per interval).
+      const socket = connect({ host, port }, () => {
+        this.socket = socket;
+        resolve();
+      });
       socket.on("error", reject);
       socket.on("data", (chunk) => this.onData(typeof chunk === "string" ? Buffer.from(chunk) : chunk));
-      this.socket = socket;
+      socket.on("close", () => this.onSocketClosed(socket));
     });
   }
 
-  private send(kind: string, body: Buffer, to: string | null = null): void {
+  protected send(kind: string, body: Buffer, to: string | null = null): void {
     this.sendEnvelope(wire.envelope(this.group, kind, this.identity.peerId,
       wire.hlcNow(this.identity.peerId, this.now()), body, to));
   }
@@ -544,6 +620,9 @@ export class Peer {
       const frame = this.pending.subarray(4, 4 + length);
       this.pending = this.pending.subarray(4 + length);
       const env = wire.decodeFrame(Buffer.from(frame));
+      if (env === null) {
+        this.malformedFrames += 1;
+      }
       if (this.accepts(env)) {
         try {
           this.handle(env);
@@ -566,6 +645,9 @@ export class Peer {
   }
 
   private handle(env: Dict): void {
+    if (!this.frames.admit(env, this.now())) {
+      return; // stale, far ahead, or a replay: dropped and counted, nothing more
+    }
     wire.hlcObserve(this.identity.peerId, env["stamp"], this.now());
     const kind = env["kind"];
     const body = Buffer.from((env["body"] as Uint8Array) ?? new Uint8Array());
@@ -637,6 +719,10 @@ export class Peer {
           this.fold(dto as Dict);
         }
       }
+    } else {
+      // A kind this client does not speak (the hint-gated kinds of SPEC v0.1.17 are never
+      // sent to it, but a misconfigured peer could): ignored, counted, never fatal.
+      this.ignoredKinds.set(String(kind), (this.ignoredKinds.get(String(kind)) ?? 0) + 1);
     }
   }
 
