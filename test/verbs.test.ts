@@ -227,6 +227,7 @@ test("canonical map order sorts keys by UTF-8 length then bytes (wire version 3)
 
 import { Aggregate, Pipes } from "../src/capabilities/index.js";
 import { COMPLETED, Contribution, EXPIRED, REAPPEARED, WRITTEN } from "../src/space.js";
+import "../src/node/index.js";
 
 @agent("watcher")
 class Watcher {

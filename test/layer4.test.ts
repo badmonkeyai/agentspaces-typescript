@@ -33,6 +33,7 @@ import { Peer } from "../src/peer.js";
 import { Space, Template, entry } from "../src/space.js";
 import * as wire from "../src/wire.js";
 import type { Dict } from "../src/wire.js";
+import "../src/node/index.js";
 
 const GROUP = "zTypeScriptLayer4";
 

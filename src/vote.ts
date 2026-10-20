@@ -58,7 +58,7 @@ export function ballots(states: Map<string, Dict>, proposalId: string): Array<[D
     }
     let ballot: unknown;
     try {
-      ballot = loads(Buffer.from(record["payload"] as Uint8Array));
+      ballot = loads(record["payload"] as Uint8Array);
     } catch {
       continue;
     }
@@ -123,7 +123,7 @@ export function proposals(states: Map<string, Dict>): Map<string, Proposal> {
     }
     let proposal: unknown;
     try {
-      proposal = loads(Buffer.from(record["payload"] as Uint8Array));
+      proposal = loads(record["payload"] as Uint8Array);
     } catch {
       continue;
     }
@@ -189,3 +189,38 @@ export function decision(states: Map<string, Dict>, proposalId: string, granular
   })[0];
   return { proposalId, winner, tally: counts };
 }
+
+// ------------------------------------------------------------ MAJORITY_GOSSIP
+
+/** The push-sum epoch that carries one option's preference share (VoteCapability.epoch). */
+export function preferenceEpoch(voteId: string, option: string): string {
+  return `vote:${voteId}:${option}`;
+}
+
+/**
+ * VoteCapability.castPreference (JS-V-04): an approximate preference through
+ * push-sum, 1 to the chosen option's average and 0 to the others; every
+ * participant casts over the same aggregator and ticks it to convergence.
+ */
+export function castPreference(aggregate: { start(epochId: string, value: number): void }, voteId: string,
+                               options: string[], preference: string): void {
+  for (const option of options) {
+    aggregate.start(preferenceEpoch(voteId, option), option === preference ? 1 : 0);
+  }
+}
+
+/** VoteCapability.leader: the option with the highest estimated share, or null before any estimate. */
+export function leader(aggregate: { estimate(epochId: string): number | null }, voteId: string,
+                       options: string[]): string | null {
+  let best: string | null = null;
+  let bestShare = -1;
+  for (const option of options) {
+    const estimate = aggregate.estimate(preferenceEpoch(voteId, option));
+    if (estimate !== null && estimate > bestShare) {
+      bestShare = estimate;
+      best = option;
+    }
+  }
+  return best;
+}
+

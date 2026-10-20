@@ -37,6 +37,15 @@
  *
  *       @onDecision("decisions", { resultSpace: "ledger" })
  *       record(decision: Decision): Verdict { return new Verdict(decision.proposalId, decision.winner); }
+ *
+ *       @orderedTake(Payment, "payments", { lease: "30s" })
+ *       confirm(payment: Payment): Receipt { return new Receipt(payment.id); }   // completed once, fleet-wide
+ *
+ *       @spaceJoin("intake", "claimId", [part(Fraud), part(Coverage)], { mode: "LEASED" })
+ *       assemble(j: Joined): Assessment { return new Assessment(j.key, j.get(Fraud).score); }
+ *
+ *       @spaceReduce(Payment, Balance, "ledger", { key: "account" })
+ *       apply(balance: Balance | null, payment: Payment): Balance { return Balance.plus(balance, payment); }
  *     }
  *
  *     const bound = new Binder(peer, { agent: identity.renewingSubordinate("ts-worker", "PT24H") }).bind(new Researcher());
@@ -45,31 +54,45 @@
  * The return value is the next entry (`null` writes nothing, or abstains), a
  * `Tagged` written with its tags, an array of entries (the fork, each written
  * on its own), or a `Motion` opening a vote once per proposal id. `@propose`
- * opens a vote from a cue once per key; `@spaceJoin` (LOCAL mode) fires once
- * per key when every required part is present. A
- * take completes in its space with the result, where a remote caller awaits
- * it, or in `resultSpace`; a notify fires once per entry; a ballot casts once
- * per proposal; a decision fires once per proposal when the quorum closes;
- * the AgentCard, with the declared actions, is published on bind.
+ * opens a vote from a cue once per key; `@spaceJoin` fires once per key when
+ * every required part is present, in memory (LOCAL), through a leased
+ * `JoinTicket` (LEASED), or through a ticket the ordered log decides
+ * (ORDERED); `@orderedTake` is a take whose claim the ordered log commits, so
+ * the entry completes at most once fleet-wide; `@spaceReduce` folds elements
+ * per key into an accumulator entry beside them. A take completes in its
+ * space with the result, where a remote caller awaits it, or in
+ * `resultSpace`; a notify fires once per entry; a ballot casts once per
+ * proposal; a decision fires once per proposal when the quorum closes; the
+ * AgentCard, with the declared actions, is published on bind. A verb the
+ * host's residency cannot carry (JS-R-01) is refused at bind time, naming the
+ * verb, the residency, and the package that supplies a host that can.
  */
 
+import type { OrderedLog } from "./capabilities/ordered.js";
 import { AgentIdentity, instantIso } from "./identity.js";
+import { CommittedSource, JoinBinding, JoinMode, Joined, ResolvedPart, pause, takenOf } from "./join.js";
 import type { Peer } from "./peer.js";
+import { Residency, platform, requireResidency } from "./platform.js";
+import { ReduceBinding, ReduceMode } from "./reduce.js";
 import { COMPLETED, Class, Contribution, EntryType, EventKind, Motion, Space, SpaceEvent, TakeContext, Tagged, Template,
-  WRITTEN, durationMillis, fromPayload, schemaOf, toPayload } from "./space.js";
+  Taken, WRITTEN, durationMillis, fromPayload, schemaOf, toPayload } from "./space.js";
 import { Aggregate, Settle } from "./capabilities/aggregate.js";
 import * as votes from "./vote.js";
 import * as wire from "./wire.js";
 import type { Dict } from "./wire.js";
 
 export type { Decision, Proposal } from "./vote.js";
+export { Joined } from "./join.js";
+export type { JoinMode } from "./join.js";
+export type { ReduceMode } from "./reduce.js";
 
 // -------------------------------------------------------------- decorators
 
 const META = Symbol.for("agentspaces.binding");
 const SPEC = Symbol.for("agentspaces.spec");
 
-type Verb = "take" | "notify" | "bid" | "ballot" | "decision" | "estimate" | "propose" | "join";
+type Verb = "take" | "orderedTake" | "notify" | "bid" | "ballot" | "decision" | "estimate" | "propose" | "join"
+  | "reduce";
 type Binding = { verb: Verb; cue?: EntryType; space: string; produces?: EntryType | EntryType[]; [attr: string]: unknown };
 type Spec = { name: string; description: string; goals: string[] };
 type Method = (this: unknown, ...args: never[]) => unknown;
@@ -97,6 +120,21 @@ export type TakeOptions = { lease?: number | string; pollTimeout?: number | stri
 /** The kill-tolerant worker: take one matching entry under a lease, call, complete with the result. */
 export function spaceTake(cue: EntryType, space: string, options: TakeOptions = {}): MethodDecorator {
   return mark({ verb: "take", cue, space, lease: options.lease ?? "10m", pollTimeout: options.pollTimeout ?? "1s",
+    resultSpace: options.resultSpace, resultLease: options.resultLease ?? "1h", produces: options.produces,
+    tags: options.tags, where: options.where, description: options.description ?? "" });
+}
+
+/**
+ * The exactly-once worker (`@OrderedTake`): `@spaceTake`'s contract, with
+ * the take routed through the ordered log's Raft client instead of the
+ * space's own claim race, so the log's commit order decides every take
+ * identically on every member and each entry is completed at most once,
+ * fleet-wide. A take lost to a leader election is resubmitted on the next
+ * poll. Needs a `new Binder(peer, { ordered: new OrderedLog(new Pipes(peer)) })`;
+ * an attested agent's claims are signed with its own key, as its completions are.
+ */
+export function orderedTake(cue: EntryType, space: string, options: TakeOptions = {}): MethodDecorator {
+  return mark({ verb: "orderedTake", cue, space, lease: options.lease ?? "30s", pollTimeout: options.pollTimeout ?? "2s",
     resultSpace: options.resultSpace, resultLease: options.resultLease ?? "1h", produces: options.produces,
     tags: options.tags, where: options.where, description: options.description ?? "" });
 }
@@ -151,19 +189,79 @@ export function part(type: EntryType, options: Omit<PartSpec, "type"> = {}): Par
   return { type, ...options };
 }
 
-export type JoinOptions = { within?: number | string; resultSpace?: string; resultLease?: number | string;
-  maxOpen?: number; produces?: EntryType; description?: string };
+export type JoinOptions = { mode?: JoinMode; name?: string; within?: number | string; resultSpace?: string;
+  resultLease?: number | string; maxOpen?: number; produces?: EntryType; description?: string;
+  /** The part subscriptions' lease, renewed at half-lease while bound. */
+  lease?: number | string;
+  /** LEASED and ORDERED: the ticket's write lease. */
+  ticketLease?: number | string;
+  /** LEASED and ORDERED: the ticket's take lease; the firing must complete within it. */
+  takeLease?: number | string;
+  /** LEASED and ORDERED: how long one poll for a ticket waits. */
+  pollTimeout?: number | string };
 
 /**
- * The fan-in (`@SpaceJoin` in LOCAL mode): once per key, when every required
- * part is readable, the method receives a `Joined` and its return is
- * dispatched as a take's is. A key is forgotten after `within` if it never
- * completes; the fleet-wide LEASED and ORDERED modes are not available here.
+ * The fan-in (`@SpaceJoin`): once per key, when every required part is
+ * readable, the method receives a `Joined` and its return is dispatched as a
+ * take's is. A key is forgotten after `within` if it never completes, and
+ * found again in the space when its last part arrives. `mode` is the "once"
+ * rule: LOCAL keeps an in-memory set (once per joiner); LEASED writes a
+ * `JoinTicket` per key and takes it under a lease (once per lease race per
+ * ticket, at least once fleet-wide; needs a resident, service, or cell
+ * host); ORDERED takes the ticket through the ordered log, where the first
+ * committed ticket claim per key fires (needs `new Binder(peer, { ordered })`).
  */
 export function spaceJoin(space: string, key: string, parts: PartSpec[], options: JoinOptions = {}): MethodDecorator {
-  return mark({ verb: "join", space, key, parts, within: options.within ?? "1h", resultSpace: options.resultSpace,
-    resultLease: options.resultLease ?? "1h", maxOpen: options.maxOpen ?? 10_000, produces: options.produces,
-    description: options.description ?? "" });
+  const mode = options.mode ?? "LOCAL";
+  if (mode !== "LOCAL" && mode !== "LEASED" && mode !== "ORDERED") {
+    throw new Error(`@spaceJoin mode must be LOCAL, LEASED, or ORDERED: ${String(mode)}`);
+  }
+  for (const p of parts) {
+    if (p.key && p.keyTag) {
+      throw new Error(`part ${schemaOf(p.type)} names both key and keyTag; choose one`);
+    }
+  }
+  return mark({ verb: "join", space, key, parts, mode, name: options.name ?? "", within: options.within ?? "1h",
+    resultSpace: options.resultSpace, resultLease: options.resultLease ?? "1h", maxOpen: options.maxOpen ?? 10_000,
+    produces: options.produces, description: options.description ?? "", lease: options.lease ?? "1h",
+    ticketLease: options.ticketLease ?? "10m", takeLease: options.takeLease ?? "30s",
+    pollTimeout: options.pollTimeout ?? "1s" });
+}
+
+export type ReduceOptions = { name?: string; key?: string; keyTag?: string; where?: { [k: string]: unknown };
+  tags?: { [k: string]: unknown }; mode?: ReduceMode; lease?: number | string; pollTimeout?: number | string;
+  accumulatorLease?: number | string; subscriptionLease?: number | string; maxOpen?: number;
+  produces?: EntryType | EntryType[]; description?: string };
+
+/**
+ * The persistent accumulator (`@SpaceReduce`): a fold over an unbounded
+ * stream of elements per key, whose state is an entry in the elements'
+ * space. The method takes the current accumulator (`null` on a key's first
+ * step) and one element and returns the new accumulator; the binder takes
+ * the element under a lease, invokes the method, and completes the element
+ * with the new accumulator as the result, in one atomic step, so an element
+ * is never folded twice. The return is the accumulator, a `Tagged`
+ * accumulator, or an array holding exactly one accumulator and any side
+ * outputs, written after it; `null` consumes the element and leaves the
+ * accumulator as it was. `key` names the element's field carrying the key,
+ * `keyTag` its tag; neither folds every element into one accumulator. The
+ * accumulator's lease is the key's idle timeout. Needs a resident, service,
+ * or cell host; ORDERED needs `new Binder(peer, { ordered })`.
+ */
+export function spaceReduce(element: EntryType, accumulator: EntryType, space: string,
+                            options: ReduceOptions = {}): MethodDecorator {
+  if (options.key && options.keyTag) {
+    throw new Error("@spaceReduce names both key and keyTag; choose one");
+  }
+  const mode = options.mode ?? "LEASED";
+  if (mode !== "LEASED" && mode !== "ORDERED") {
+    throw new Error(`@spaceReduce mode must be LEASED or ORDERED: ${String(mode)}`);
+  }
+  return mark({ verb: "reduce", cue: element, space, accumulator, name: options.name ?? "", key: options.key ?? "",
+    keyTag: options.keyTag ?? "", where: options.where, tags: options.tags, mode, lease: options.lease ?? "30s",
+    pollTimeout: options.pollTimeout ?? "1s", accumulatorLease: options.accumulatorLease ?? "24h",
+    subscriptionLease: options.subscriptionLease ?? "1h", maxOpen: options.maxOpen ?? 10_000,
+    produces: options.produces, description: options.description ?? "" });
 }
 
 export type ProposeOptions = { prefix?: string; key?: string | string[]; keyTag?: string; lease?: number | string;
@@ -189,31 +287,6 @@ export function propose(cue: EntryType, space: string, vote: string, options: st
     description: extra.description ?? "" });
 }
 
-/** What a join method receives (`Joined` in Java): the key and the parts by class. */
-export class Joined {
-  constructor(readonly key: string, private readonly byType: Map<EntryType, unknown[]>) {}
-
-  get<T>(type: EntryType<T>): T {
-    const found = this.byType.get(type) ?? [];
-    if (found.length === 0) {
-      throw new Error(`no ${typeof type === "string" ? type : type.name} part for key '${this.key}'`);
-    }
-    return found[0] as T;
-  }
-
-  find<T>(type: EntryType<T>): T | null {
-    return (this.byType.get(type)?.[0] as T | undefined) ?? null;
-  }
-
-  all<T>(type: EntryType<T>): T[] {
-    return [...((this.byType.get(type) ?? []) as T[])];
-  }
-
-  has(type: EntryType): boolean {
-    return (this.byType.get(type)?.length ?? 0) > 0;
-  }
-}
-
 /** Reacts once when a proposal's quorum closes it. */
 export function onDecision(space: string, options: { prefix?: string; resultSpace?: string;
   resultLease?: number | string; produces?: EntryType } = {}): MethodDecorator {
@@ -223,12 +296,14 @@ export function onDecision(space: string, options: { prefix?: string; resultSpac
 
 // ------------------------------------------------------------------ binder
 
-/** A bound agent: its loops and watches, closed together. */
+/** A bound agent: its loops, watches, and join and reduce bindings, closed together. */
 export class Bound {
   card: Dict | null = null;
   running = true;
   readonly loops: Promise<void>[] = [];
   readonly subscriptions: Array<{ close(): void }> = [];
+  /** The join and reduce runtimes, by the name their tickets carry. */
+  readonly bindings: Array<JoinBinding | ReduceBinding> = [];
 
   constructor(readonly name: string) {}
 
@@ -237,17 +312,29 @@ export class Bound {
     for (const s of this.subscriptions) {
       s.close();
     }
+    await Promise.allSettled(this.bindings.map((b) => b.close()));
     await Promise.allSettled(this.loops);
   }
 }
 
 export type BinderOptions = { agent?: AgentIdentity | null; agentName?: string; publishCard?: boolean; cardTtl?: string;
-  aggregate?: Aggregate | null; voteSpace?: string | null };
+  aggregate?: Aggregate | null; voteSpace?: string | null;
+  /** The ordered log's Raft client, for `@orderedTake` and the ORDERED join and reduce modes. */
+  ordered?: OrderedLog | null;
+  /**
+   * On a voter host, the coordinator's committed-claim hook (`OrderedLogHost.onCommitted`), so
+   * ORDERED joins and reduces judge the first ticket per key in log order as Java's do.
+   */
+  committed?: CommittedSource | null;
+  /** The residency of the running host (§3.6); `platform().residency` when the host declares none. */
+  residency?: Residency };
 
 /**
  * Runs decorated agents over one peer. `agent` (an `AgentIdentity`) makes
  * every record the agent's own attested one; the peer-signed `agentName`
- * otherwise. `publishCard` sends the AgentCard on bind.
+ * otherwise. `publishCard` sends the AgentCard on bind. `ordered` is the
+ * Raft client the ordered verbs claim through; `residency` is what the host
+ * declares, judged at bind time against each verb (JS-R-01).
  */
 export class Binder {
   readonly agent: AgentIdentity | null;
@@ -257,6 +344,9 @@ export class Binder {
   readonly aggregate: Aggregate | null;
   /** Where a `Motion` naming no space is proposed. */
   readonly voteSpace: string | null;
+  readonly ordered: OrderedLog | null;
+  readonly committed: CommittedSource | null;
+  readonly residency: Residency;
   private readonly spaces = new Map<string, Space>();
 
   constructor(readonly peer: Peer, options: BinderOptions = {}) {
@@ -266,6 +356,9 @@ export class Binder {
     this.cardTtl = options.cardTtl ?? "PT10M";
     this.aggregate = options.aggregate ?? null;
     this.voteSpace = options.voteSpace ?? null;
+    this.ordered = options.ordered ?? null;
+    this.committed = options.committed ?? null;
+    this.residency = options.residency ?? platform().residency;
   }
 
   space(name: string): Space {
@@ -283,6 +376,11 @@ export class Binder {
       description: "", goals: [] };
     const bound = new Bound(spec.name);
     const methods = bindings(instance);
+    // Refusals first (JS-R-01): a verb this host cannot carry, or one wired
+    // without what it needs, fails before any loop starts.
+    for (const [name, , binding] of methods) {
+      this.judge(bound, name, binding);
+    }
     const consumes: string[] = [];
     const produces: string[] = [];
     const spaceBindings: Dict = {};
@@ -294,6 +392,20 @@ export class Binder {
         this.space(binding.space).bidFunction = (payload) => Number(method.call(instance, fromPayload(cue, payload) as never));
       }
     }
+    try {
+      this.start(bound, instance, methods, consumes, produces, spaceBindings, actions);
+    } catch (e) {
+      void bound.close(); // a refusal leaves nothing of the agent running
+      throw e;
+    }
+    if (this.publishCard) {
+      bound.card = this.publish(spec, consumes, produces, spaceBindings, actions);
+    }
+    return bound;
+  }
+
+  private start(bound: Bound, instance: object, methods: Array<[string, Method, Binding]>, consumes: string[],
+                produces: string[], spaceBindings: Dict, actions: Dict[]): void {
     for (const [name, method, binding] of methods) {
       if (binding.verb === "bid") {
         continue;
@@ -308,6 +420,27 @@ export class Binder {
         actions.push(wire.cardAction(name, String(binding["description"] ?? ""), parts.map((p) => schemaOf(p.type)),
           produced, "join", binding.space));
         this.startJoin(bound, instance, method, binding);
+        continue;
+      }
+      if (binding.verb === "reduce") {
+        const schema = schemaOf(binding.cue!);
+        const produced = [schemaOf(binding.accumulator as EntryType), ...producedSchemas(binding.produces)];
+        consumes.push(schema);
+        produces.push(...produced);
+        actions.push(wire.cardAction(name, String(binding["description"] ?? ""), [schema], [...new Set(produced)],
+          "reduce", binding.space));
+        this.startReduce(bound, instance, method, binding);
+        continue;
+      }
+      if (binding.verb === "orderedTake") {
+        const schema = schemaOf(binding.cue!);
+        const produced = producedSchemas(binding.produces);
+        consumes.push(schema);
+        produces.push(...produced);
+        spaceBindings[schema] = binding.space;
+        actions.push(wire.cardAction(name, String(binding["description"] ?? ""), [schema], produced,
+          "ordered-take", binding.space));
+        this.startOrderedTake(bound, instance, method, binding);
         continue;
       }
       if (binding.verb === "propose") {
@@ -342,10 +475,44 @@ export class Binder {
         this.startEstimate(bound, instance, method, binding);
       }
     }
-    if (this.publishCard) {
-      bound.card = this.publish(spec, consumes, produces, spaceBindings, actions);
+  }
+
+  /**
+   * The bind-time refusals of the ordered and fleet-wide verbs: the residency
+   * table of §3.6 (JS-R-01), the ordered log a verb claims through, and the
+   * attributes the Java binder rejects.
+   */
+  private judge(bound: Bound, name: string, binding: Binding): void {
+    const label = `${bound.name}.${name}`;
+    if (binding.verb === "orderedTake") {
+      this.requireOrdered("@orderedTake", label);
+    } else if (binding.verb === "join") {
+      const mode = binding.mode as JoinMode;
+      if (mode !== "LOCAL") {
+        requireResidency(this.residency, "keeper", `@spaceJoin ${mode} at ${label}`);
+      }
+      if (mode === "ORDERED") {
+        this.requireOrdered("@spaceJoin ORDERED", label);
+      }
+    } else if (binding.verb === "reduce") {
+      const mode = binding.mode as ReduceMode;
+      requireResidency(this.residency, "keeper", `@spaceReduce ${mode} at ${label}`);
+      if (mode === "ORDERED") {
+        this.requireOrdered("@spaceReduce ORDERED", label);
+      }
+      if (durationMillis(binding.accumulatorLease as number | string) < durationMillis(binding.lease as number | string)) {
+        throw new Error(`@spaceReduce at ${label}: accumulatorLease ${String(binding.accumulatorLease)} is shorter`
+          + ` than the take lease ${String(binding.lease)}`);
+      }
     }
-    return bound;
+  }
+
+  private requireOrdered(what: string, label: string): OrderedLog {
+    if (this.ordered === null) {
+      throw new Error(`${what} at ${label} needs an ordered log: new Binder(peer, { ordered: new OrderedLog(`
+        + `new Pipes(peer)) }), with a log advertised in the group`);
+    }
+    return this.ordered;
   }
 
   // ----------------------------------------------------------------- card
@@ -432,27 +599,67 @@ export class Binder {
         if (taken === null) {
           continue;
         }
-        let result: unknown;
+        await this.finishTake(bound, instance, method, binding, space, taken);
+      }
+    };
+    bound.loops.push(loop());
+  }
+
+  /** The action and the completion of one taken entry, shared by `@spaceTake` and `@orderedTake`. */
+  private async finishTake(bound: Bound, instance: object, method: Method, binding: Binding, space: Space,
+                           taken: Taken<unknown>): Promise<void> {
+    let result: unknown;
+    try {
+      result = await TakeContext.run(taken, () => method.call(instance, taken.value as never));
+    } catch {
+      return; // the lease lapses and the entry reappears for another worker
+    }
+    try {
+      if (result === null || result === undefined || result instanceof Motion || result instanceof Contribution
+          || Array.isArray(result) || binding.resultSpace) {
+        // The take is finished first: a failed open or fork cannot make a
+        // completed task reappear (ISSUE-Motion FR-4).
+        taken.complete(null);
+        this.writeResult(result, binding, space, `${bound.name}.${method.name}`);
+      } else if (result instanceof Tagged) {
+        taken.complete(result.value, (binding.resultLease as number | string) ?? "1h", result.tags);
+      } else {
+        taken.complete(result as object, (binding.resultLease as number | string) ?? "1h");
+      }
+    } catch {
+      // the completion is retried by nobody: the lease lapses
+    }
+  }
+
+  /**
+   * The `@orderedTake` loop (AgentBinder.startOrderedTakeLoop): `@spaceTake`'s
+   * loop with the claim submitted through the ordered log and adopted only
+   * when the log committed this holder's claim for the generation it asked
+   * for (OrderedTakes.take); the holder signs the claim with its own key when
+   * the binder runs as an attested agent.
+   */
+  private startOrderedTake(bound: Bound, instance: object, method: Method, binding: Binding): void {
+    const ordered = this.requireOrdered("@orderedTake", `${bound.name}.${method.name}`);
+    const space = this.space(binding.space);
+    const template = new Template(binding.cue!, (binding.where as Dict) ?? {}, (binding.tags as Dict) ?? {});
+    const leaseMillis = durationMillis(binding.lease as number | string);
+    const pollMillis = durationMillis(binding.pollTimeout as number | string);
+    const loop = async () => {
+      while (bound.running) {
+        let entryId: string | null;
         try {
-          result = await TakeContext.run(taken, () => method.call(instance, taken.value as never));
+          entryId = await ordered.take(space.name, template.schema, space.agentName, leaseMillis, pollMillis,
+            space.agent, (payload, tags) => template.matches(payload, tags));
         } catch {
-          continue; // the lease lapses and the entry reappears for another worker
+          await pause(this.peer, 200); // a leader election in flight: the next poll resubmits
+          continue;
         }
-        try {
-          if (result === null || result === undefined || result instanceof Motion || result instanceof Contribution
-              || Array.isArray(result) || binding.resultSpace) {
-            // The take is finished first: a failed open or fork cannot make a
-            // completed task reappear (ISSUE-Motion FR-4).
-            taken.complete(null);
-            this.writeResult(result, binding, space, `${bound.name}.${method.name}`);
-          } else if (result instanceof Tagged) {
-            taken.complete(result.value, (binding.resultLease as number | string) ?? "1h", result.tags);
-          } else {
-            taken.complete(result as object, (binding.resultLease as number | string) ?? "1h");
-          }
-        } catch {
-          // the completion is retried by nobody: the lease lapses
+        if (entryId === null) {
+          continue;
         }
+        // The crash idiom, exactly once: no complete, the take lease lapses,
+        // and the log's next committed claim reassigns the entry.
+        await this.finishTake(bound, instance, method, binding, space, takenOf(space, entryId, template, leaseMillis));
       }
     };
     bound.loops.push(loop());
@@ -462,7 +669,9 @@ export class Binder {
     const space = this.space(binding.space);
     const template = new Template(binding.cue!, (binding.where as Dict) ?? {}, (binding.tags as Dict) ?? {});
     const wanted = new Set(binding.on as EventKind[]);
-    bound.subscriptions.push(space.watch(template, (event: SpaceEvent<unknown>) => {
+    // A leased subscription the binder renews at half-lease (JS-V-01), as the Java binder does.
+    const notifyLease = durationMillis((binding.lease as number | string) ?? "1h");
+    const subscription = space.notify(template, (event: SpaceEvent<unknown>) => {
       if (!wanted.has(event.kind)) {
         return;
       }
@@ -474,7 +683,10 @@ export class Binder {
           // a failed reaction writes nothing
         }
       });
-    }));
+    }, notifyLease);
+    const renewal = this.peer.every(Math.max(250, Math.floor(notifyLease / 2)), () => subscription.renew());
+    subscription.on("close", () => renewal.stop());
+    bound.subscriptions.push(subscription);
   }
 
   private startBallot(bound: Bound, instance: object, method: Method, binding: Binding): void {
@@ -593,79 +805,60 @@ export class Binder {
     }));
   }
 
+  /** Resolves a `@spaceJoin` and starts its binding (AgentBinder.startJoin). */
   private startJoin(bound: Bound, instance: object, method: Method, binding: Binding): void {
     const joinSpace = this.space(binding.space);
-    const parts = binding.parts as PartSpec[];
-    const withinMillis = durationMillis(binding.within as number | string);
-    const maxOpen = Number(binding.maxOpen ?? 10_000);
-    type KeyState = { parts: Map<EntryType, unknown[]>; seen: Set<string>; since: number };
-    const state = new Map<string, KeyState>();
-    const fired = new Set<string>();
     const label = `${bound.name}.${method.name}`;
-    const keyOf = (p: PartSpec, value: unknown, tags: Dict): string | null => {
-      if (p.keyTag) {
-        return tags[p.keyTag] === undefined ? null : String(tags[p.keyTag]);
-      }
-      const field = p.key ?? String(binding.key);
-      const v = toPayload(value as object)[field];
-      return v === undefined || v === null ? null : String(v);
-    };
-    const complete = (st: KeyState): boolean =>
-      parts.every((p) => p.optional || (st.parts.get(p.type)?.length ?? 0) >= Math.max(1, p.atLeast ?? 1));
-    const fire = (key: string) => {
-      const st = state.get(key);
-      state.delete(key);
-      if (st === undefined) {
-        return;
-      }
-      void Promise.resolve().then(async () => {
-        try {
-          this.writeResult(await method.call(instance, new Joined(key, st.parts) as never), binding, joinSpace, label);
-        } catch {
-          fired.delete(key); // the next part fires it again
-        }
-      });
-    };
-    for (const p of parts) {
-      const space = p.space ? this.space(p.space) : joinSpace;
-      const template = new Template(p.type, (p.where as Dict) ?? {}, (p.tags as Dict) ?? {});
-      bound.subscriptions.push(space.watch(template, (event: SpaceEvent<unknown>) => {
-        if (event.kind !== WRITTEN) {
-          return;
-        }
-        const key = keyOf(p, event.entry.value, event.entry.tags);
-        if (key === null || fired.has(key)) {
-          return;
-        }
-        const now = this.peer.now();
-        for (const [k, st] of [...state]) {
-          if (now - st.since > withinMillis) {
-            state.delete(k); // a key that never completed within the window is forgotten
-          }
-        }
-        let st = state.get(key);
-        if (st === undefined) {
-          if (state.size >= maxOpen) {
-            state.delete(state.keys().next().value!);
-          }
-          st = { parts: new Map(), seen: new Set(), since: now };
-          state.set(key, st);
-        }
-        if (st.seen.has(event.entry.entryId)) {
-          return;
-        }
-        st.seen.add(event.entry.entryId);
-        let list = st.parts.get(p.type);
-        if (list === undefined) {
-          list = [];
-          st.parts.set(p.type, list);
-        }
-        list.push(event.entry.value);
-        if (complete(st)) {
-          fired.add(key);
-          fire(key);
-        }
-      }));
+    const mode = binding.mode as JoinMode;
+    const name = String(binding.name ?? "") || label;
+    this.requireUniqueName(bound, name, "@spaceJoin", label);
+    const parts: ResolvedPart[] = (binding.parts as PartSpec[]).map((p) => ({
+      type: p.type, space: p.space ? this.space(p.space) : joinSpace, where: (p.where as Dict) ?? {},
+      tags: (p.tags as Dict) ?? {}, keyField: p.keyTag ? null : (p.key ?? String(binding.key)),
+      keyTag: p.keyTag ?? null, optional: p.optional ?? false, atLeast: Math.max(1, p.atLeast ?? 1) }));
+    const joined = new JoinBinding({ name, mode, space: joinSpace, parts,
+      withinMillis: durationMillis(binding.within as number | string), maxOpen: Number(binding.maxOpen ?? 10_000),
+      subscriptionLeaseMillis: durationMillis((binding.lease as number | string) ?? "1h"),
+      ticketLeaseMillis: durationMillis((binding.ticketLease as number | string) ?? "10m"),
+      takeLeaseMillis: durationMillis((binding.takeLease as number | string) ?? "30s"),
+      pollTimeoutMillis: durationMillis((binding.pollTimeout as number | string) ?? "1s"),
+      ordered: mode === "ORDERED" ? this.ordered : null, committed: mode === "ORDERED" ? this.committed : null },
+    (bag: Joined) => method.call(instance, bag as never),
+    (result: unknown) => this.writeResult(result, binding, joinSpace, label));
+    joined.start();
+    bound.bindings.push(joined);
+  }
+
+  /** Resolves a `@spaceReduce` and starts its binding (AgentBinder.startReduce). */
+  private startReduce(bound: Bound, instance: object, method: Method, binding: Binding): void {
+    const space = this.space(binding.space);
+    const label = `${bound.name}.${method.name}`;
+    const mode = binding.mode as ReduceMode;
+    const name = String(binding.name ?? "") || label;
+    this.requireUniqueName(bound, name, "@spaceReduce", label);
+    const accumulatorLease = (binding.accumulatorLease as number | string) ?? "24h";
+    const reduce = new ReduceBinding({ name, mode, space, elementType: binding.cue!,
+      elementWhere: (binding.where as Dict) ?? {}, elementTags: (binding.tags as Dict) ?? {},
+      accumulatorType: binding.accumulator as EntryType, keyField: String(binding.key ?? "") || null,
+      keyTag: String(binding.keyTag ?? "") || null,
+      takeLeaseMillis: durationMillis((binding.lease as number | string) ?? "30s"),
+      pollTimeoutMillis: durationMillis((binding.pollTimeout as number | string) ?? "1s"),
+      accumulatorLeaseMillis: durationMillis(accumulatorLease),
+      subscriptionLeaseMillis: durationMillis((binding.subscriptionLease as number | string) ?? "1h"),
+      maxOpen: Number(binding.maxOpen ?? 10_000), ordered: mode === "ORDERED" ? this.ordered : null,
+      committed: mode === "ORDERED" ? this.committed : null },
+    (accumulator: unknown, element: unknown) => method.call(instance, accumulator as never, element as never),
+    (other: unknown) => this.writeResult(other, { ...binding, resultSpace: undefined, resultLease: accumulatorLease },
+      space, label));
+    reduce.start();
+    bound.bindings.push(reduce);
+  }
+
+  /** A join and a reduce of one name on one agent would share tickets: refused, as the Java binder refuses it. */
+  private requireUniqueName(bound: Bound, name: string, what: string, label: string): void {
+    if (bound.bindings.some((b) => b.name === name)) {
+      throw new Error(`${what} at ${label} is named '${name}' like another join or reduce on this agent;`
+        + " tickets would collide, name one of them");
     }
   }
 

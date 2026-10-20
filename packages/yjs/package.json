@@ -1,0 +1,33 @@
+{
+  "name": "@agentspaces/yjs",
+  "version": "0.4.0",
+  "description": "Yjs provider over an AgentSpaces fleet (srad/agentspaces-js.md JS-S-02, JS-S-03): y-protocols sync and awareness as signed PIPE_DATA frames of aspace:cap/yjs.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "build/src/index.js",
+  "types": "build/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./build/src/index.d.ts",
+      "default": "./build/src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test build/test/*.test.js"
+  },
+  "dependencies": {
+    "@agentspaces/client": "file:../..",
+    "lib0": "^0.2.119",
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.33"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}

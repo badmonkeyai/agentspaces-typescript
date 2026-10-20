@@ -41,6 +41,8 @@
  * </ul>
  */
 
+import { compare, concat, fromUtf8, utf8 } from "./bytes.js";
+
 /** Wraps a number that must encode as a CBOR double (e.g. an AUCTION bid). */
 export class CborDouble {
   constructor(readonly value: number) {}
@@ -57,28 +59,28 @@ export type CborValue =
   | CborValue[]
   | { [key: string]: CborValue };
 
-function head(major: number, value: number): Buffer {
+function head(major: number, value: number): Uint8Array {
   if (value < 24) {
-    return Buffer.from([(major << 5) | value]);
+    return Uint8Array.of((major << 5) | value);
   }
   if (value < 0x100) {
-    return Buffer.from([(major << 5) | 24, value]);
+    return Uint8Array.of((major << 5) | 24, value);
   }
   if (value < 0x10000) {
-    const b = Buffer.alloc(3);
+    const b = new Uint8Array(3);
     b[0] = (major << 5) | 25;
-    b.writeUInt16BE(value, 1);
+    new DataView(b.buffer).setUint16(1, value, false);
     return b;
   }
   if (value < 0x100000000) {
-    const b = Buffer.alloc(5);
+    const b = new Uint8Array(5);
     b[0] = (major << 5) | 26;
-    b.writeUInt32BE(value, 1);
+    new DataView(b.buffer).setUint32(1, value, false);
     return b;
   }
-  const b = Buffer.alloc(9);
+  const b = new Uint8Array(9);
   b[0] = (major << 5) | 27;
-  b.writeBigUInt64BE(BigInt(value), 1);
+  new DataView(b.buffer).setBigUint64(1, BigInt(value), false);
   return b;
 }
 
@@ -86,16 +88,16 @@ const UINT64_MAX = (1n << 64n) - 1n;
 const SAFE_MAX = BigInt(Number.MAX_SAFE_INTEGER);
 
 /** A minimal-width head for an unsigned argument up to 2^64 - 1. */
-function headBig(major: number, value: bigint): Buffer {
+function headBig(major: number, value: bigint): Uint8Array {
   if (value <= SAFE_MAX) {
     return head(major, Number(value));
   }
   if (value > UINT64_MAX) {
     throw new RangeError(`integer does not fit in 64 bits: ${value}`);
   }
-  const b = Buffer.alloc(9);
+  const b = new Uint8Array(9);
   b[0] = (major << 5) | 27;
-  b.writeBigUInt64BE(value, 1);
+  new DataView(b.buffer).setBigUint64(1, value, false);
   return b;
 }
 
@@ -114,8 +116,8 @@ function integer(value: bigint): number | bigint {
  */
 export function canonicalMap(value: { [key: string]: CborValue }): { [key: string]: CborValue } {
   const entries = Object.entries(value).map(([key, item]) =>
-    ({ key, item, bytes: Buffer.from(key, "utf8") }));
-  entries.sort((a, b) => a.bytes.length - b.bytes.length || Buffer.compare(a.bytes, b.bytes));
+    ({ key, item, bytes: utf8(key) }));
+  entries.sort((a, b) => a.bytes.length - b.bytes.length || compare(a.bytes, b.bytes));
   const out: { [key: string]: CborValue } = {};
   for (const { key, item } of entries) {
     out[key] = item;
@@ -123,23 +125,29 @@ export function canonicalMap(value: { [key: string]: CborValue }): { [key: strin
   return out;
 }
 
-export function dumps(value: CborValue): Buffer {
-  const parts: Buffer[] = [];
+export function dumps(value: CborValue): Uint8Array {
+  const parts: Uint8Array[] = [];
   encode(value, parts);
-  return Buffer.concat(parts);
+  return concat(...parts);
 }
 
-function encode(value: CborValue, out: Buffer[]): void {
+const NULL = Uint8Array.of(0xf6);
+const TRUE = Uint8Array.of(0xf5);
+const FALSE = Uint8Array.of(0xf4);
+const MAP_START = Uint8Array.of(0xbf);
+const BREAK = Uint8Array.of(0xff);
+
+function encode(value: CborValue, out: Uint8Array[]): void {
   if (value === null || value === undefined) {
-    out.push(Buffer.from([0xf6]));
+    out.push(NULL);
   } else if (value === true) {
-    out.push(Buffer.from([0xf5]));
+    out.push(TRUE);
   } else if (value === false) {
-    out.push(Buffer.from([0xf4]));
+    out.push(FALSE);
   } else if (value instanceof CborDouble) {
-    const b = Buffer.alloc(9);
+    const b = new Uint8Array(9);
     b[0] = 0xfb;
-    b.writeDoubleBE(value.value, 1);
+    new DataView(b.buffer).setFloat64(1, value.value, false);
     out.push(b);
   } else if (typeof value === "bigint") {
     // int64 beyond the safe range (an aggregate roster token, a Java long).
@@ -150,9 +158,9 @@ function encode(value: CborValue, out: Buffer[]): void {
     }
     out.push(value >= 0 ? head(0, value) : head(1, -1 - value));
   } else if (value instanceof Uint8Array) {
-    out.push(head(2, value.length), Buffer.from(value));
+    out.push(head(2, value.length), value);
   } else if (typeof value === "string") {
-    const encoded = Buffer.from(value, "utf-8");
+    const encoded = utf8(value);
     out.push(head(3, encoded.length), encoded);
   } else if (Array.isArray(value)) {
     // Definite-length arrays: the canonical form as of wire v2, matching the
@@ -168,12 +176,12 @@ function encode(value: CborValue, out: Buffer[]): void {
     // encoder cannot sort. A map-valued field (tags, costHints, ...) is put in
     // canonical order by canonicalMap where it is built (wire v3,
     // ISSUE-CanonicalMaps).
-    out.push(Buffer.from([0xbf]));
+    out.push(MAP_START);
     for (const [key, item] of Object.entries(value)) {
       encode(key, out);
       encode(item, out);
     }
-    out.push(Buffer.from([0xff]));
+    out.push(BREAK);
   }
 }
 
@@ -181,15 +189,16 @@ function encode(value: CborValue, out: Buffer[]): void {
  * Decodes exactly one CBOR item; trailing bytes are refused so malformed or
  * smuggled input is loud, never silently tolerated (ASF-042).
  */
-export function loads(data: Buffer): CborValue {
-  const [value, end] = decode(data, 0);
+export function loads(data: Uint8Array): CborValue {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const [value, end] = decode(data, view, 0);
   if (end !== data.length) {
     throw new RangeError(`trailing bytes after CBOR item at offset ${end}`);
   }
   return value;
 }
 
-function need(data: Buffer, offset: number, count: number): void {
+function need(data: Uint8Array, offset: number, count: number): void {
   if (offset + count > data.length) {
     throw new RangeError("truncated CBOR item");
   }
@@ -198,7 +207,7 @@ function need(data: Buffer, offset: number, count: number): void {
 /** Deepest container nesting accepted; hostile deep nesting overflows the stack. */
 const MAX_DEPTH = 64;
 
-function decode(data: Buffer, offset: number, depth = 0): [CborValue, number] {
+function decode(data: Uint8Array, view: DataView, offset: number, depth = 0): [CborValue, number] {
   if (depth > MAX_DEPTH) {
     throw new RangeError("CBOR nesting too deep");
   }
@@ -222,11 +231,13 @@ function decode(data: Buffer, offset: number, depth = 0): [CborValue, number] {
         return [null, offset];
       case 26:
         // Re-encoded as float64; Java never emits float32 on this wire.
-        return [new CborDouble(data.readFloatBE(offset)), offset + 4];
+        need(data, offset, 4);
+        return [new CborDouble(view.getFloat32(offset, false)), offset + 4];
       case 27:
         // Preserved as CborDouble so re-encoding stays byte-identical, which
         // signature verification of decoded claims depends on.
-        return [new CborDouble(data.readDoubleBE(offset)), offset + 8];
+        need(data, offset, 8);
+        return [new CborDouble(view.getFloat64(offset, false)), offset + 8];
       default:
         throw new RangeError(`unsupported CBOR simple value 0x${initial.toString(16)}`);
     }
@@ -238,17 +249,20 @@ function decode(data: Buffer, offset: number, depth = 0): [CborValue, number] {
   } else if (info < 24) {
     length = info;
   } else if (info === 24) {
+    need(data, offset, 1);
     length = data[offset];
     offset += 1;
   } else if (info === 25) {
-    length = data.readUInt16BE(offset);
+    need(data, offset, 2);
+    length = view.getUint16(offset, false);
     offset += 2;
   } else if (info === 26) {
-    length = data.readUInt32BE(offset);
+    need(data, offset, 4);
+    length = view.getUint32(offset, false);
     offset += 4;
   } else if (info === 27) {
     need(data, offset, 8);
-    const big = data.readBigUInt64BE(offset);
+    const big = view.getBigUint64(offset, false);
     offset += 8;
     if (major === 0) {
       return [integer(big), offset];
@@ -272,24 +286,25 @@ function decode(data: Buffer, offset: number, depth = 0): [CborValue, number] {
       return [-1 - (length as number), offset];
     case 2:
       need(data, offset, length as number);
+      // A plain copy even when the caller passed a Node Buffer (whose slice is a view).
       return [Uint8Array.prototype.slice.call(data, offset, offset + (length as number)),
         offset + (length as number)];
     case 3:
       need(data, offset, length as number);
-      return [data.toString("utf-8", offset, offset + (length as number)),
+      return [fromUtf8(data, offset, offset + (length as number)),
         offset + (length as number)];
     case 4: {
       const items: CborValue[] = [];
       if (length === null) {
         while (data[offset] !== 0xff) {
-          const [item, next] = decode(data, offset, depth + 1);
+          const [item, next] = decode(data, view, offset, depth + 1);
           items.push(item);
           offset = next;
         }
         return [items, offset + 1];
       }
       for (let i = 0; i < length; i++) {
-        const [item, next] = decode(data, offset, depth + 1);
+        const [item, next] = decode(data, view, offset, depth + 1);
         items.push(item);
         offset = next;
       }
@@ -300,8 +315,8 @@ function decode(data: Buffer, offset: number, depth = 0): [CborValue, number] {
       // own properties instead of prototype pollution (ASF-034).
       const result: { [key: string]: CborValue } = Object.create(null);
       const entry = (): void => {
-        const [key, afterKey] = decode(data, offset, depth + 1);
-        const [item, afterValue] = decode(data, afterKey, depth + 1);
+        const [key, afterKey] = decode(data, view, offset, depth + 1);
+        const [item, afterValue] = decode(data, view, afterKey, depth + 1);
         result[String(key)] = item;
         offset = afterValue;
       };

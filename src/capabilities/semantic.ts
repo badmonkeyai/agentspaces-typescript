@@ -156,7 +156,7 @@ export class Semantic {
   private onFrame(from: string, payload: Uint8Array): void {
     let frame: Dict;
     try {
-      frame = loads(Buffer.from(payload)) as Dict;
+      frame = loads(payload) as Dict;
     } catch {
       return;
     }

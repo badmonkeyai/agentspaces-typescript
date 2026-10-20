@@ -34,6 +34,7 @@ import { COMPLETED, Space, TAKEN, TakeContext, Template, WRITTEN, contains, entr
 import * as vote from "../src/vote.js";
 import * as wire from "../src/wire.js";
 import type { Dict } from "../src/wire.js";
+import "../src/node/index.js";
 
 const GROUP = "zTypeScriptLayer34";
 

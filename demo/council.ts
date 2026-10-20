@@ -29,6 +29,7 @@ import { Binder, agent, ballot, onDecision, spaceTake } from "../src/agents.js";
 import type { Decision, Proposal } from "../src/agents.js";
 import { Aggregate, Pipes, Semantic, Settle } from "../src/capabilities/index.js";
 import { Identity, groupIdFromFounding } from "../src/identity.js";
+import "../src/node/index.js";                       // registers the tcp dialer on Node (the portable core dials ws/http only)
 import { Peer } from "../src/peer.js";
 import { entry } from "../src/space.js";
 

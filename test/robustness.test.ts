@@ -12,6 +12,7 @@ import { Identity } from "../src/identity.js";
 import { Peer } from "../src/peer.js";
 import * as wire from "../src/wire.js";
 import type { Dict } from "../src/wire.js";
+import "../src/node/index.js";
 
 const GROUP = "zTsRobust";
 
@@ -38,8 +39,9 @@ class CapturingPeer extends Peer {
     (this as unknown as { handle(env: Dict): void }).handle(env);
   }
 
-  feed(chunk: Buffer): void {
-    (this as unknown as { onData(chunk: Buffer): void }).onData(chunk);
+  /** One length-prefixed frame, as the tcp channel hands it on: the prefix stripped. */
+  feed(chunk: Uint8Array): void {
+    (this as unknown as { onFrame(frame: Uint8Array): void }).onFrame(chunk.subarray(4));
   }
 }
 
@@ -54,7 +56,7 @@ function stamp(ms: number, logical = 0, node = "other"): string {
   return `${ms}:${logical}:${node}`;
 }
 
-function lengthPrefixed(payload: Buffer): Buffer {
+function lengthPrefixed(payload: Uint8Array): Buffer {
   const header = Buffer.alloc(4);
   header.writeInt32BE(payload.length, 0);
   return Buffer.concat([header, payload]);
@@ -99,7 +101,8 @@ test("unknown kinds are ignored and counted, never fatal (ROBUSTNESS.md §3.5)",
   const peer = new CapturingPeer();
   const other = Identity.generate();
   const now = peer.now();
-  const kinds = ["HAVE", "GRAFT", "PRUNE", "BATCH", "SESSION_HELLO", "FUTURE_KIND"];
+  // SESSION_HELLO is spoken since 0.4.0 (a malformed one is ignored, neither counted nor fatal).
+  const kinds = ["HAVE", "GRAFT", "PRUNE", "BATCH", "FUTURE_KIND"];
   kinds.forEach((kind, i) => {
     peer.drive(frame(other, kind, dumps({ anything: i }), peer.identity.peerId, stamp(now, i)));
   });

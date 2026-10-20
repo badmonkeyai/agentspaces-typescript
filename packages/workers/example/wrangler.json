@@ -1,0 +1,23 @@
+{
+  "$schema": "https://developers.cloudflare.com/workers/wrangler/configuration/",
+  "name": "inventory",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "INVENTORY", "class_name": "Inventory" },
+      { "name": "FLEET", "class_name": "Fleet" },
+      { "name": "ADJUSTER", "class_name": "Adjuster" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Inventory", "Fleet", "Adjuster"] }
+  ],
+  "triggers": { "crons": ["* * * * *"] },
+  "vars": {
+    "AGENTSPACES_GROUP": "ops.example",
+    "AGENTSPACES_SEEDS": "wss://fleet.example.com:443/aspace",
+    "AGENTSPACES_INVITE": "",
+    "AGENTSPACES_PROFILE": "attested"
+  }
+}

@@ -21,7 +21,26 @@
  * deterministic (RFC 8032), so signatures must match exactly too.
  */
 
-import assert from "node:assert/strict";
+import strict from "node:assert/strict";
+
+/** Bytes compare by content: a Node Buffer and a plain Uint8Array of the same bytes are equal. */
+function plain(value: unknown): unknown {
+  if (value instanceof Uint8Array) {
+    return new Uint8Array(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map(plain);
+  }
+  if (value !== null && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, plain(v)]));
+  }
+  return value;
+}
+const assert: typeof strict = Object.assign(
+  (value: unknown, message?: string) => strict(value, message),
+  strict,
+  { deepEqual: (a: unknown, b: unknown, m?: string) => strict.deepEqual(plain(a), plain(b), m) },
+) as typeof strict;
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -51,13 +70,15 @@ import * as vote from "../src/vote.js";
 import * as revocation from "../src/revocation.js";
 import * as wire from "../src/wire.js";
 import type { Dict } from "../src/wire.js";
+import "../src/node/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const GOLDEN: { [key: string]: string } = JSON.parse(readFileSync(
   join(here, "..", "..", "test", "golden.json"), "utf-8"));
 
-function hex(name: string): Buffer {
-  return Buffer.from(GOLDEN[name], "hex");
+/** A golden byte string as a plain Uint8Array, the type the portable core returns. */
+function hex(name: string): Uint8Array {
+  return new Uint8Array(Buffer.from(GOLDEN[name], "hex"));
 }
 
 function identity(): Identity {

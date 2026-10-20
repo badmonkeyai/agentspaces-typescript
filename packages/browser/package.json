@@ -1,0 +1,40 @@
+{
+  "name": "@agentspaces/browser",
+  "version": "0.4.0",
+  "description": "The resident host of the AgentSpaces JavaScript client (srad/agentspaces-js.md JS-R-02): a SharedWorker or Worker holding one peer per identity per origin, pages attached over MessagePorts, keys and state in IndexedDB.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "build/src/index.js",
+  "types": "build/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./build/src/index.d.ts",
+      "default": "./build/src/index.js"
+    },
+    "./worker": {
+      "types": "./build/src/worker.d.ts",
+      "default": "./build/src/worker.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test build/test/*.test.js"
+  },
+  "dependencies": {
+    "@agentspaces/client": "file:../.."
+  },
+  "devDependencies": {
+    "@agentspaces/node": "file:../node",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.28.2",
+    "playwright": "^1.64.1",
+    "typescript": "^5.5.0"
+  },
+  "sideEffects": [
+    "./build/src/worker.js"
+  ]
+}

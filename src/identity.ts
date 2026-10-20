@@ -15,8 +15,9 @@
  */
 
 /**
- * Layer 0 in TypeScript (spec §4): Ed25519 identity over Node's built-in
- * crypto, and the self-certifying derivations. A PeerID is multibase
+ * Layer 0 in TypeScript (spec §4): Ed25519 identity over the installed
+ * crypto port (noble by default, srad/agentspaces-js.md JS-P-02), and the
+ * self-certifying derivations. A PeerID is multibase
  * base58btc of sha-256 over the raw 32-byte public key; GroupIDs and SpaceIDs
  * derive the same way from their founding bytes (§4.4). The group founding
  * of §5.1 lives here too: the founding fields, the founder's signature, the
@@ -24,28 +25,20 @@
  * joiner applies to every GROUP_AD it is served.
  */
 
-import {
-  KeyObject,
-  createHash,
-  createPrivateKey,
-  createPublicKey,
-  generateKeyPairSync,
-  randomBytes,
-  sign as nodeSign,
-  verify as nodeVerify,
-} from "node:crypto";
-import {
-  closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync,
-} from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { concat, equals, fromHex, toHex, utf8 } from "./bytes.js";
 import { CborDouble, CborValue, dumps, loads } from "./cbor.js";
+import { cryptoPort } from "./crypto.js";
 
 type Dict = { [key: string]: CborValue };
 
 const ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 /** The 12-byte X.509 SubjectPublicKeyInfo prefix for an Ed25519 public key. */
-const SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
+export const SPKI_PREFIX = fromHex("302a300506032b6570032100");
+/** The 16-byte PKCS#8 PrivateKeyInfo prefix wrapping a raw Ed25519 seed (RFC 8410). */
+export const PKCS8_PREFIX = fromHex("302e020100300506032b657004220420");
+/** The Ed25519 algorithm identifier inside a PKCS#8 PrivateKeyInfo (RFC 8410). */
+const ED25519_ALGORITHM = fromHex("300506032b6570");
 
 /** Base58 (Bitcoin alphabet) with leading-zero preservation. */
 export function base58btc(data: Uint8Array): string {
@@ -53,7 +46,7 @@ export function base58btc(data: Uint8Array): string {
   while (zeros < data.length && data[zeros] === 0) {
     zeros++;
   }
-  let n = BigInt("0x" + (Buffer.from(data).toString("hex") || "0"));
+  let n = BigInt("0x" + (toHex(data) || "0"));
   let encoded = "";
   while (n > 0n) {
     encoded = ALPHABET[Number(n % 58n)] + encoded;
@@ -69,7 +62,7 @@ export function multibase(data: Uint8Array): string {
 
 /** multibase(sha-256(material)): PeerIDs, GroupIDs, and SpaceIDs alike. */
 export function deriveId(material: Uint8Array): string {
-  return multibase(createHash("sha256").update(material).digest());
+  return multibase(cryptoPort().sha256(material));
 }
 
 /**
@@ -77,7 +70,7 @@ export function deriveId(material: Uint8Array): string {
  * whose members share a founding string as configuration (§10.1 `founding`).
  */
 export function groupIdFromFounding(founding: Uint8Array | string): string {
-  return deriveId(typeof founding === "string" ? Buffer.from(founding) : founding);
+  return deriveId(typeof founding === "string" ? utf8(founding) : founding);
 }
 
 // ------------------------------------------------------- group founding (§5.1)
@@ -160,7 +153,7 @@ export function verifySignedGroupAd(signed: CborValue | Uint8Array): string | nu
   let value: CborValue = signed;
   if (signed instanceof Uint8Array) {
     try {
-      value = loads(Buffer.from(signed));
+      value = loads(signed);
     } catch {
       return null;
     }
@@ -196,7 +189,7 @@ export function verifySignedGroupAd(signed: CborValue | Uint8Array): string | nu
 
 /** SpaceId.local, in TypeScript: the hash of 'local:' + name. */
 export function spaceIdLocal(name: string): string {
-  return deriveId(Buffer.from("local:" + name, "utf-8"));
+  return deriveId(utf8("local:" + name));
 }
 
 /** An Ed25519 peer identity with the Java-compatible PeerID. */
@@ -433,28 +426,56 @@ export class AgentIdentity {
   }
 }
 
+/**
+ * The 32-byte RFC 8032 seed inside an Ed25519 PKCS#8 PrivateKeyInfo, version 1
+ * (the 48-byte form Java's keystore and Node write) or version 2 with the
+ * public key appended (RFC 5958 OneAsymmetricKey). Anything else is refused.
+ */
+export function seedFromPkcs8(pkcs8: Uint8Array): Uint8Array {
+  if (pkcs8.length >= 48 && equals(pkcs8.subarray(0, 16), PKCS8_PREFIX)) {
+    return pkcs8.slice(16, 48);
+  }
+  // v2: 30 len 02 01 01 30 05 06 03 2b 65 70 04 22 04 20 <seed> [a1 ... public key]
+  const algorithmAt = 5;
+  if (pkcs8.length >= 48 && pkcs8[0] === 0x30 && pkcs8[2] === 0x02 && pkcs8[3] === 0x01
+      && (pkcs8[4] === 0x00 || pkcs8[4] === 0x01)
+      && equals(pkcs8.subarray(algorithmAt, algorithmAt + 7), ED25519_ALGORITHM)
+      && pkcs8[12] === 0x04 && pkcs8[13] === 0x22 && pkcs8[14] === 0x04 && pkcs8[15] === 0x20) {
+    return pkcs8.slice(16, 48);
+  }
+  throw new Error("not an Ed25519 PKCS#8 private key");
+}
+
 export class Identity {
   readonly publicRaw: Uint8Array;
   readonly peerId: string;
 
-  private constructor(private readonly privateKey: KeyObject) {
-    const spki = createPublicKey(privateKey).export({ type: "spki", format: "der" });
-    this.publicRaw = Uint8Array.prototype.slice.call(spki, SPKI_PREFIX.length);
+  private constructor(private readonly seed: Uint8Array) {
+    this.publicRaw = cryptoPort().ed25519PublicKey(seed);
     this.peerId = deriveId(this.publicRaw);
   }
 
   static generate(): Identity {
-    return new Identity(generateKeyPairSync("ed25519").privateKey);
+    return new Identity(cryptoPort().randomBytes(32));
   }
 
   static fromPkcs8(pkcs8: Uint8Array): Identity {
-    return new Identity(createPrivateKey({
-      key: Buffer.from(pkcs8), format: "der", type: "pkcs8",
-    }));
+    return new Identity(seedFromPkcs8(pkcs8));
+  }
+
+  /**
+   * Ed25519.fromSeed: the identity whose private key is the RFC 8032 32-byte
+   * seed (an HKDF output, for instance); the public key follows from it.
+   */
+  static fromSeed(seed: Uint8Array): Identity {
+    if (seed.length !== 32) {
+      throw new Error(`an Ed25519 seed is 32 bytes, not ${seed.length}`);
+    }
+    return new Identity(new Uint8Array(seed));
   }
 
   sign(message: Uint8Array): Uint8Array {
-    return new Uint8Array(nodeSign(null, Buffer.from(message), this.privateKey));
+    return cryptoPort().ed25519Sign(this.seed, message);
   }
 
   /** The AgentID string form: '<peerId>/<localName>'. */
@@ -486,94 +507,22 @@ export class Identity {
       this, ttl, clock, encryptionPublicKey);
   }
 
-  /** The private key as PKCS#8 DER, the form Java's keystore writes. */
+  /** The private key as PKCS#8 DER (version 1, 48 bytes), the form Java's keystore writes. */
   pkcs8(): Uint8Array {
-    return new Uint8Array(this.privateKey.export({ type: "pkcs8", format: "der" }));
+    return concat(PKCS8_PREFIX, this.seed);
   }
 
-  /**
-   * Writes the private key as PKCS#8 DER to `path`: an atomic replace,
-   * owner-only (0600), as FileKeystore writes `peer.key`.
-   */
-  savePkcs8(path: string): void {
-    writeKeyFile(path, this.pkcs8(), true);
-  }
-
-  /**
-   * FileKeystore.loadOrCreate (SPEC §4.1, v0.1.13): `peer.key` (PKCS#8 DER,
-   * mode 0600) and `peer.pub` (raw 32 bytes) in `directory`, minted when
-   * absent. A half-written pair, a wrong-size public file, or a private key
-   * that does not sign for the public one is refused, naming the files.
-   */
-  static loadOrCreate(directory: string, privateName = "peer.key",
-                      publicName = "peer.pub"): Identity {
-    const privatePath = join(directory, privateName);
-    const publicPath = join(directory, publicName);
-    const hasPrivate = existsSync(privatePath);
-    const hasPublic = existsSync(publicPath);
-    if (hasPrivate !== hasPublic) {
-      const [present, missing] = hasPrivate ? [privatePath, publicPath] : [publicPath, privatePath];
-      throw new Error(`corrupt keystore: ${present} exists but ${missing} does not`);
-    }
-    if (!hasPrivate) {
-      const identity = Identity.generate();
-      writeKeyFile(privatePath, identity.pkcs8(), true);
-      writeKeyFile(publicPath, identity.publicRaw, false);
-      return identity;
-    }
-    const identity = Identity.fromPkcs8(new Uint8Array(readFileSync(privatePath)));
-    const pub = new Uint8Array(readFileSync(publicPath));
-    if (pub.length !== 32) {
-      throw new Error(`corrupt keystore: ${publicPath} is not a raw Ed25519 public key`);
-    }
-    const probe = new Uint8Array(randomBytes(32));
-    if (!Identity.verify(pub, probe, identity.sign(probe))) {
-      throw new Error(`corrupt keystore: ${privatePath} does not belong to the public key in ${publicPath}`);
-    }
-    return identity;
-  }
-
-  /** AgentKeystore.signingKeys: `<dir>/<peer-id>/<local-name>/agent.key` and `agent.pub`. */
-  static agentKeys(directory: string, peerId: string, localName: string): Identity {
-    for (const [name, what] of [[peerId, "peer id"], [localName, "agent name"]]) {
-      if (!SAFE_NAME.test(name) || name === "." || name === "..") {
-        throw new Error(`${what} '${name}' is not a safe file name`);
-      }
-    }
-    return Identity.loadOrCreate(join(directory, peerId, localName), "agent.key", "agent.pub");
+  /** The public key as X.509 SubjectPublicKeyInfo DER. */
+  spki(): Uint8Array {
+    return concat(SPKI_PREFIX, this.publicRaw);
   }
 
   static verify(publicRaw: Uint8Array, message: Uint8Array,
                 signature: Uint8Array): boolean {
-    try {
-      const spki = Buffer.concat([SPKI_PREFIX, Buffer.from(publicRaw)]);
-      const key = createPublicKey({ key: spki, format: "der", type: "spki" });
-      return nodeVerify(null, Buffer.from(message), key, Buffer.from(signature));
-    } catch {
+    if (!(publicRaw instanceof Uint8Array) || !(message instanceof Uint8Array)
+        || !(signature instanceof Uint8Array)) {
       return false;
     }
-  }
-}
-
-const SAFE_NAME = /^[A-Za-z0-9._-]{1,64}$/;
-
-/** KeyFiles.write: atomic replace through a temp file in the same directory, 0600 for a secret. */
-export function writeKeyFile(path: string, data: Uint8Array, secret: boolean): void {
-  const directory = dirname(resolve(path));
-  mkdirSync(directory, { recursive: true });
-  const temp = join(directory, `.${secret ? "key" : "pub"}-${process.pid}-${randomBytes(4).toString("hex")}.tmp`);
-  const descriptor = openSync(temp, "wx", secret ? 0o600 : 0o644);
-  try {
-    writeSync(descriptor, data);
-    fsyncSync(descriptor);
-  } finally {
-    closeSync(descriptor);
-  }
-  try {
-    renameSync(temp, path);
-  } finally {
-    if (existsSync(temp)) {
-      rmSync(temp);
-    }
+    return cryptoPort().ed25519Verify(publicRaw, message, signature);
   }
 }

@@ -9,7 +9,19 @@
     "rootDir": ".",
     "types": [
       "node"
-    ]
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@agentspaces/client": [
+        "./src/index.ts"
+      ],
+      "@agentspaces/client/node": [
+        "./src/node/index.ts"
+      ],
+      "@agentspaces/ordered": [
+        "./packages/ordered/src/index.ts"
+      ]
+    }
   },
   "include": [
     "src/**/*.ts",

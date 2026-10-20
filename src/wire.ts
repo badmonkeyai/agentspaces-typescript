@@ -21,7 +21,8 @@
  * signatures cover the canonical CBOR and byte order is meaning.
  */
 
-import { createHash, randomUUID } from "node:crypto";
+import { equals, randomUuid, utf8 } from "./bytes.js";
+import { cryptoPort } from "./crypto.js";
 import { CborDouble, CborValue, canonicalMap, dumps, loads } from "./cbor.js";
 import {
   AgentIdentity, Identity, deriveId, spaceIdLocal, verifyAgentCertificateAt,
@@ -192,12 +193,21 @@ export function groupAdWantEnvelope(group: string, sender: string, stamp: string
 }
 
 /** The GROUP_AD body: the SignedGroupAdvertisement's canonical CBOR (§9). */
-export function groupAdBody(signed: Dict): Buffer {
+export function groupAdBody(signed: Dict): Uint8Array {
   return dumps(signed);
 }
 
+/**
+ * The body of a `RELAY_FRAME` (SPEC §5.4; SRAD srad/agentspaces-js.md JS-W-03): a peerID `target`
+ * and the origin's fully signed inner `frame`, which a RELAY-role member forwards verbatim to the
+ * target. Byte-identical to Java's `Bodies.RelayFrame(target, frame)` record (component order).
+ */
+export function relayFrameBody(target: string, frame: Uint8Array): Uint8Array {
+  return dumps({ target, frame });
+}
+
 /** Signs and encodes an envelope into a frame (WireCodec.Signed). */
-export function encodeFrame(env: Dict, identity: Identity): Buffer {
+export function encodeFrame(env: Dict, identity: Identity): Uint8Array {
   const canonical = dumps(env);
   return dumps({
     envelope: env,
@@ -206,8 +216,37 @@ export function encodeFrame(env: Dict, identity: Identity): Buffer {
   });
 }
 
-/** Decodes and verifies a frame; returns the envelope or null. */
-export function decodeFrame(frame: Buffer): Dict | null {
+/** The Signed wrapper of a frame decoded without any verification (tests and diagnostics). */
+export function loadsSigned(frame: Uint8Array): CborValue {
+  return loads(frame);
+}
+
+/** The crypto port in use, re-exported for callers that already import the wire. */
+export { cryptoPort } from "./crypto.js";
+
+/** How a decoded frame was authenticated (WireCodec.Auth). */
+export type Auth = "SIGNED" | "ATTESTED" | "SESSION";
+
+/** An established session on one connection: the peer it attests and the key its frames carry a tag under. */
+export type EstablishedSession = { peer: string; key: Uint8Array };
+
+/** What a connection knows about its remote end, for the decoder. */
+export type Channel = { attestedPeer?: string | null; session?: EstablishedSession | null };
+
+/** Decodes and verifies a fully signed frame; returns the envelope or null. */
+export function decodeFrame(frame: Uint8Array): Dict | null {
+  const decoded = decodeFrameDetailed(frame, {});
+  return decoded === null ? null : decoded.env;
+}
+
+/**
+ * WireCodec.decodeDetailed: a frame with a key and a signature verifies under
+ * the key; one with neither is accepted when the channel attested its sender;
+ * one with no key and a 32-byte tag is a session frame, accepted when the
+ * channel's session names its sender and the tag verifies under the session
+ * key (SPEC §5.6, v0.1.17). A hello is accepted only fully signed.
+ */
+export function decodeFrameDetailed(frame: Uint8Array, channel: Channel): { env: Dict; auth: Auth } | null {
   let signed: CborValue;
   try {
     signed = loads(frame);
@@ -229,6 +268,21 @@ export function decodeFrame(frame: Buffer): Dict | null {
   if ((env as Dict)["ver"] !== WIRE_VERSION) {
     return null;
   }
+  const kind = (env as Dict)["kind"];
+  const hello = kind === "SESSION_HELLO" || kind === "CHANNEL_HELLO";
+  if (key == null && signature == null) {
+    const attested = channel.attestedPeer ?? null;
+    return !hello && attested !== null && attested === (env as Dict)["from"]
+      ? { env: env as Dict, auth: "ATTESTED" } : null;
+  }
+  if (key == null && signature instanceof Uint8Array) {
+    const session = channel.session ?? null;
+    if (hello || session === null || signature.length !== 32 || session.peer !== (env as Dict)["from"]) {
+      return null;
+    }
+    const expected = cryptoPort().hmacSha256(session.key, dumps(env as Dict));
+    return equals(expected, signature) ? { env: env as Dict, auth: "SESSION" } : null;
+  }
   if (!(key instanceof Uint8Array) || key.length !== 32) {
     return null;
   }
@@ -239,31 +293,36 @@ export function decodeFrame(frame: Buffer): Dict | null {
       signature instanceof Uint8Array ? signature : new Uint8Array())) {
     return null;
   }
-  return env as Dict;
+  return { env: env as Dict, auth: "SIGNED" };
 }
 
 // -------------------------------------------------------------------- bodies
 
-export function pingBody(nonce: number | bigint): Buffer {
+export function pingBody(nonce: number | bigint): Uint8Array {
   return dumps({ nonce });
 }
 
-export function ackBody(nonce: number | bigint): Buffer {
+export function ackBody(nonce: number | bigint): Uint8Array {
   return dumps({ nonce, onBehalf: null });
 }
 
 export function rumorBody(streamId: string, itemId: string, hops: number,
-                          payload: Uint8Array): Buffer {
+                          payload: Uint8Array): Uint8Array {
   return dumps({ streamId, itemId, hopsRemaining: hops, payload });
 }
 
-export function digestBody(digests: Dict): Buffer {
+export function digestBody(digests: Dict): Uint8Array {
   return dumps({ digests });
 }
 
-/** A PeerAdvertisement with no endpoints: the dial-only NAT posture. */
+/**
+ * A PeerAdvertisement with no endpoints: the dial-only NAT posture. The
+ * resource hints are the free-form string map every member reads
+ * (`aspace:join` carries a join credential, SPEC §5.1/§6.1).
+ */
 export function peerAdvertisement(group: string, identity: Identity,
-                                  issuedIso: string, ttlIso = "PT10M"): Dict {
+                                  issuedIso: string, ttlIso = "PT10M",
+                                  resourceHints: { [key: string]: string } = {}): Dict {
   return {
     id: `aspace://${group}/peer/${identity.peerId}`,
     issuer: identity.peerId,
@@ -272,12 +331,12 @@ export function peerAdvertisement(group: string, identity: Identity,
     ttl: ttlIso,
     endpoints: [],
     roles: [],
-    resourceHints: {},
+    resourceHints: { ...resourceHints },
   };
 }
 
 /** The 'peers' stream payload: PeerNode.SignedPeerAd. */
-export function signedPeerAd(ad: Dict, identity: Identity): Buffer {
+export function signedPeerAd(ad: Dict, identity: Identity): Uint8Array {
   const adBytes = dumps(ad);
   return dumps({
     adBytes,
@@ -306,7 +365,7 @@ export function agentCard(group: string, identity: Identity, localName: string,
     produces, costHints: canonicalMap(costHints), spaceBindings: canonicalMap(spaceBindings) };
   if (agentCertificate !== null && (agentPublicKey === null
       || agentCertificate["agent"] !== agent
-      || !Buffer.from(agentCertificate["agentPublicKey"] as Uint8Array).equals(Buffer.from(agentPublicKey)))) {
+      || !equals(agentCertificate["agentPublicKey"] as Uint8Array, agentPublicKey))) {
     throw new Error("a card's certificate must certify its agent and agentPublicKey");
   }
   if (agentPublicKey !== null) {
@@ -370,7 +429,8 @@ export function storedAd(adType: string, ad: Dict, identity: Identity): Dict {
  * bigint because the value is generally outside the safe-integer range.
  */
 export function rosterToken(peerId: string): bigint {
-  return createHash("sha256").update(peerId, "utf-8").digest().readBigInt64BE(0);
+  const digest = cryptoPort().sha256(utf8(peerId));
+  return new DataView(digest.buffer, digest.byteOffset, 8).getBigInt64(0, false);
 }
 
 function doubles(values: number[]): CborDouble[] {
@@ -417,9 +477,10 @@ export function learnExchange(modelId: string, token: number | bigint, kind: str
 }
 
 /** WeightAveraging.encode: a model vector as big-endian IEEE-754 doubles. */
-export function encodeModel(weights: number[]): Buffer {
-  const b = Buffer.alloc(weights.length * 8);
-  weights.forEach((w, i) => b.writeDoubleBE(w, i * 8));
+export function encodeModel(weights: number[]): Uint8Array {
+  const b = new Uint8Array(weights.length * 8);
+  const view = new DataView(b.buffer);
+  weights.forEach((w, i) => view.setFloat64(i * 8, w, false));
   return b;
 }
 
@@ -584,8 +645,8 @@ export function entryDelta(spaceName: string, group: string, typeName: string,
                            agentName: string, leaseMillis: number,
                            agent: AgentIdentity | null = null, nowMillis?: number,
                            tags: Dict = {}):
-    { entryId: string; body: Buffer } {
-  const entryId = randomUUID();
+    { entryId: string; body: Uint8Array } {
+  const entryId = randomUuid();
   const spaceId = spaceIdLocal(`${group}/${spaceName}`);
   const issuer = agent !== null ? agent.agentId : identity.agent(agentName);
   const issued = hlcNow(issuer, nowMillis);
@@ -700,7 +761,7 @@ export function verifyClaimProof(signed: Dict, nowMillis: number): boolean {
 }
 
 /** A claim-only Delta, as tryTakeOnce publishes it. */
-export function claimDelta(entryId: string, signed: Dict): Buffer {
+export function claimDelta(entryId: string, signed: Dict): Uint8Array {
   return dumps({ state: null, claimEntry: entryId, claim: signed });
 }
 

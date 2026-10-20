@@ -34,6 +34,7 @@ import { Peer } from "../src/peer.js";
 import * as revocation from "../src/revocation.js";
 import * as wire from "../src/wire.js";
 import type { Dict } from "../src/wire.js";
+import { agentKeys, loadOrCreateIdentity, savePkcs8 } from "../src/node/index.js";
 
 const GROUP = "zTypeScriptAgents";
 const T0 = parseInstantMillis("2026-03-01T00:00:00Z");
@@ -46,13 +47,13 @@ class Clock {
   }
 }
 
-function deltaState(body: Buffer): Dict {
+function deltaState(body: Uint8Array): Dict {
   const rumor = loads(body) as Dict;
   return (loads(Buffer.from(rumor["payload"] as Uint8Array)) as Dict)["state"] as Dict;
 }
 
 type Folding = { fold(dto: Dict): void; foldClaim(entryId: string, signed: Dict): void;
-  handle(env: Dict): void; send(kind: string, body: Buffer): void };
+  handle(env: Dict): void; send(kind: string, body: Uint8Array): void };
 const internals = (peer: Peer): Folding => peer as unknown as Folding;
 
 test("an agent-signed write folds at another peer as the agent's own", () => {
@@ -173,32 +174,32 @@ test("only the agent's peer or the founder may revoke it", () => {
 test("the keystore matches Java's layout and refuses damage", () => {
   const dir = mkdtempSync(join(tmpdir(), "aspace-keys-"));
   try {
-    const first = Identity.loadOrCreate(dir);
-    assert.equal(Identity.loadOrCreate(dir).peerId, first.peerId);
+    const first = loadOrCreateIdentity(dir);
+    assert.equal(loadOrCreateIdentity(dir).peerId, first.peerId);
     assert.equal(statSync(join(dir, "peer.key")).mode & 0o777, 0o600);
     assert.deepEqual(readFileSync(join(dir, "peer.pub")), Buffer.from(first.publicRaw));
-    const agent = Identity.agentKeys(join(dir, "agents"), first.peerId, "planner");
+    const agent = agentKeys(join(dir, "agents"), first.peerId, "planner");
     assert.equal(existsSync(join(dir, "agents", first.peerId, "planner", "agent.key")), true);
-    assert.deepEqual(Buffer.from(Identity.agentKeys(join(dir, "agents"), first.peerId, "planner")
+    assert.deepEqual(Buffer.from(agentKeys(join(dir, "agents"), first.peerId, "planner")
       .publicRaw), Buffer.from(agent.publicRaw));
-    assert.throws(() => Identity.agentKeys(join(dir, "agents"), first.peerId, "../escape"));
+    assert.throws(() => agentKeys(join(dir, "agents"), first.peerId, "../escape"));
     writeFileSync(join(dir, "peer.pub"), Identity.generate().publicRaw);
-    assert.throws(() => Identity.loadOrCreate(dir), /does not belong/);
+    assert.throws(() => loadOrCreateIdentity(dir), /does not belong/);
     rmSync(join(dir, "peer.pub"));
-    assert.throws(() => Identity.loadOrCreate(dir), /does not/);
+    assert.throws(() => loadOrCreateIdentity(dir), /does not/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 /** Records what a socketless peer would send, as [kind, body] pairs. */
-function capture(peer: Peer): [string, Buffer][] {
-  const sent: [string, Buffer][] = [];
+function capture(peer: Peer): [string, Uint8Array][] {
+  const sent: [string, Uint8Array][] = [];
   internals(peer).send = (kind, body) => { sent.push([kind, body]); };
   return sent;
 }
 
-function digestStreams(body: Buffer): string[] {
+function digestStreams(body: Uint8Array): string[] {
   return Object.keys((loads(body) as Dict)["digests"] as Dict).sort();
 }
 
@@ -223,7 +224,7 @@ test("a pull names the revocation streams, and a join pulls them once", async ()
     await new Promise((resolve) => server.close(resolve));
   }
   assert.deepEqual(sent.filter(([kind]) => kind === "DIGEST").map(([, body]) => digestStreams(body)),
-    [["credential-revocations", "revocations"]]);
+    [["credential-revocations", "revocations", "view"]]); // the membership view rides the same pull
 });
 
 test("a pull response carrying a credential revocation applies it", () => {
@@ -348,10 +349,10 @@ test("savePkcs8 writes the key owner-only", () => {
   try {
     const identity = Identity.generate();
     const path = join(dir, "keys", "peer.key");
-    identity.savePkcs8(path);
+    savePkcs8(identity, path);
     assert.equal(statSync(path).mode & 0o777, 0o600);
     assert.equal(Identity.fromPkcs8(new Uint8Array(readFileSync(path))).peerId, identity.peerId);
-    Identity.generate().savePkcs8(path); // an atomic replace
+    savePkcs8(Identity.generate(), path); // an atomic replace
     assert.notEqual(Identity.fromPkcs8(new Uint8Array(readFileSync(path))).peerId, identity.peerId);
     assert.deepEqual(readdirSync(join(dir, "keys")), ["peer.key"], "no temporary file is left");
   } finally {

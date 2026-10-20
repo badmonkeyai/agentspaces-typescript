@@ -1,0 +1,37 @@
+{
+  "name": "@agentspaces/node",
+  "version": "0.4.0",
+  "description": "The Node service host of the AgentSpaces client (srad/agentspaces-js.md JS-R-04): the tcp and ws listeners, the file key and log stores, the node:crypto port, a multi-connection member that serves anti-entropy, and the agentspaces-node CLI.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "build/src/index.js",
+  "types": "build/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./build/src/index.d.ts",
+      "default": "./build/src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test build/test/*.test.js"
+  },
+  "dependencies": {
+    "@agentspaces/client": "file:../..",
+    "@agentspaces/ordered": "file:../ordered",
+    "ws": "^8.18.0",
+    "yaml": "^2.8.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.12"
+  },
+  "bin": {
+    "agentspaces-node": "build/src/cli.js"
+  }
+}

@@ -18,8 +18,8 @@
  * The AgentSpace, TypeScript-shaped (L3L4-COVERAGE.md §6.5): entry classes
  * bound to their wire schema, templates over fields and tags with the Java
  * `Matchers` semantics, a `Space` with the layer-3 verbs over a `Peer`,
- * events as an `EventEmitter` and as an async iterator, and the in-flight
- * take in `AsyncLocalStorage`.
+ * events as an emitter and as an async iterator, and the in-flight take in a
+ * context store (AsyncLocalStorage on Node, a synchronous scope elsewhere).
  *
  *     @entry("com.acme.Task#v1")
  *     class Task { constructor(public topic = "", public priority = 0) {} }
@@ -31,8 +31,7 @@
  *     taken?.complete(new Finding(taken.value.topic, "done"));
  */
 
-import { AsyncLocalStorage } from "node:async_hooks";
-import { EventEmitter } from "node:events";
+import { Emitter, contextStore } from "./emitter.js";
 
 import { CborDouble, CborValue, loads } from "./cbor.js";
 import { AgentIdentity, spaceIdLocal } from "./identity.js";
@@ -167,10 +166,15 @@ export class Template<T = unknown> {
   readonly where: Array<[string, Matcher]>;
   readonly tags: Array<[string, Matcher]>;
 
+  /**
+   * @param filters clauses of the portable grammar (`"priority>=3"`, `"region in eu,us"`),
+   *                judged as Java and Python judge them (JS-V-03)
+   */
   constructor(readonly type: EntryType<T>, where: { [field: string]: Condition } = {},
-              tags: { [tag: string]: Condition } = {}) {
+              tags: { [tag: string]: Condition } = {}, filters: string[] = []) {
     this.schema = schemaOf(type);
-    this.where = Object.entries(where).map(([k, v]) => [k, matcher(v)]);
+    this.where = [...Object.entries(where).map(([k, v]): [string, Matcher] => [k, matcher(v)]),
+      ...filters.map(parseFilter)];
     this.tags = Object.entries(tags).map(([k, v]) => [k, matcher(v)]);
   }
 
@@ -186,6 +190,81 @@ export class Template<T = unknown> {
   decode(payload: Dict): T {
     return fromPayload(this.type, payload);
   }
+}
+
+// ------------------------------------------------------ the portable filter grammar
+
+const FILTER_OPS = ["!=", "<=", ">=", "=", "<", ">", " in "]; // as they appear in a clause
+const NUMBER = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+
+/** The string form a value compares under, as Java's String.valueOf and Python's str give it for the wire's types. */
+function filterForm(value: unknown): string {
+  if (value instanceof CborDouble) {
+    return filterForm(value.value);
+  }
+  if (typeof value === "number" || typeof value === "bigint") {
+    return String(value);
+  }
+  return String(value);
+}
+
+/** Numeric when both sides are decimal numbers, else the strings' code-unit order (FieldFilter.compare). */
+export function filterCompare(form: string, literal: string): number {
+  const f = form.trim();
+  const l = literal.trim();
+  if (NUMBER.test(f) && NUMBER.test(l)) {
+    const a = Number(f);
+    const b = Number(l);
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+  return form < literal ? -1 : form > literal ? 1 : 0;
+}
+
+/**
+ * One clause of the portable field filter grammar (SPEC §7.2; Java
+ * `FieldFilter`): `field op literal` with `=`, `!=`, `<`, `<=`, `>`, `>=`, or
+ * `field in a,b,c`. A null value matches `!=` alone; numbers compare
+ * numerically; everything else by its string form.
+ */
+export function parseFilter(clause: string): [string, Matcher] {
+  const text = clause.trim();
+  // The earliest operator in the clause is the operator; at a tie the longest (so "<="
+  // beats "<"), and "!=x" is malformed rather than the field "!".
+  let best = -1;
+  let bestOp = "";
+  for (const op of FILTER_OPS) {
+    const at = text.indexOf(op);
+    if (at >= 0 && (best < 0 || at < best || (at === best && op.length > bestOp.length))) {
+      best = at;
+      bestOp = op;
+    }
+  }
+  if (best <= 0) {
+    throw new Error(`malformed field filter '${clause}'; use "field=value", "field!=value", "field<value",`
+      + ` "field<=value", "field>value", "field>=value", or "field in a,b,c"`);
+  }
+  const field = text.substring(0, best).trim();
+  const literal = text.substring(best + bestOp.length).trim();
+  const op = bestOp.trim();
+  if (op === "in") {
+    const elements = literal.split(",").map((e) => e.trim());
+    return [field, (value) => value !== null && value !== undefined
+      && elements.some((e) => filterCompare(filterForm(value), e) === 0)];
+  }
+  return [field, (value) => {
+    if (value === null || value === undefined) {
+      return op === "!=";
+    }
+    const c = filterCompare(filterForm(value), literal);
+    switch (op) {
+      case "=": return c === 0;
+      case "!=": return c !== 0;
+      case "<": return c < 0;
+      case "<=": return c <= 0;
+      case ">": return c > 0;
+      default: return c >= 0;
+    }
+  }];
 }
 
 // --------------------------------------------------------------- the entries
@@ -267,7 +346,7 @@ export class Motion {
   }
 }
 
-const currentTake = new AsyncLocalStorage<Taken<unknown>>();
+const currentTake = contextStore<Taken<unknown>>();
 
 /**
  * The take a worker method runs under: the binder runs the call inside it,
@@ -275,7 +354,7 @@ const currentTake = new AsyncLocalStorage<Taken<unknown>>();
  */
 export const TakeContext = {
   current<T = unknown>(): Taken<T> | null {
-    return (currentTake.getStore() as Taken<T> | undefined) ?? null;
+    return (currentTake.get() as Taken<T> | undefined) ?? null;
   },
   run<R>(taken: Taken<unknown>, fn: () => R): R {
     return currentTake.run(taken, fn);
@@ -286,15 +365,57 @@ export const TakeContext = {
 
 type Watcher = { template: Template<unknown>; delivered: Set<string>; emit: (event: SpaceEvent<unknown>) => void };
 
-/** A watch handle: an `EventEmitter` of `"event"`, closed with `close()`. */
-export class Subscription<T> extends EventEmitter {
+/**
+ * A watch handle: an emitter of `"event"`, closed with `close()`. A leased
+ * subscription (`Space.notify`, JS-V-01) closes itself when its lease lapses
+ * unless `renew` extends it; the binder renews at half-lease on the agent's
+ * behalf, the shape of the Java `Subscription`.
+ */
+export class Subscription<T> extends Emitter {
+  private expiry: unknown = null;
+  private leaseMillis: number | null = null;
+  private closed = false;
+
   constructor(private readonly space: Space, private readonly key: number) {
     super();
   }
 
-  close(): void {
+  /** Whether the subscription is still delivering. */
+  get open(): boolean {
+    return !this.closed;
+  }
+
+  /** Extends the lease (the same length again when none is given); a lapsed subscription stays closed. */
+  renew(lease: number | string | null = null): void {
+    if (this.closed) {
+      return;
+    }
+    const millis = lease === null ? this.leaseMillis : durationMillis(lease);
+    if (millis === null) {
+      return; // a watch without a lease never lapses
+    }
+    this.leaseMillis = millis;
+    const timers = this.space.peer.timers;
+    if (this.expiry !== null) {
+      timers.clearTimeout(this.expiry);
+    }
+    this.expiry = timers.setTimeout(() => {
+      this.expiry = null;
+      this.close("lapsed");
+    }, millis);
+  }
+
+  close(reason = "closed"): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    if (this.expiry !== null) {
+      this.space.peer.timers.clearTimeout(this.expiry);
+      this.expiry = null;
+    }
     this.space.unwatch(this.key);
-    this.emit("close");
+    this.emit("close", reason);
   }
 
   /** The events as an async iterator: `for await (const e of space.events(t))`. */
@@ -360,7 +481,7 @@ export class Space {
       if (expires <= now) {
         continue;
       }
-      const payload = loads(Buffer.from((record["payload"] as Uint8Array) ?? new Uint8Array([0xf6]))) as Dict;
+      const payload = loads((record["payload"] as Uint8Array) ?? new Uint8Array([0xf6])) as Dict;
       const tags = (record["tags"] as Dict | undefined) ?? {};
       if (!template.matches(payload, tags)) {
         continue;
@@ -410,7 +531,7 @@ export class Space {
       return null;
     }
     const record = this.peer.states.get(entryId)!["record"] as Dict;
-    const payload = loads(Buffer.from((record["payload"] as Uint8Array) ?? new Uint8Array([0xf6]))) as Dict;
+    const payload = loads((record["payload"] as Uint8Array) ?? new Uint8Array([0xf6])) as Dict;
     return new Taken(this, entryId, template.decode(payload), millis);
   }
 
@@ -434,6 +555,18 @@ export class Space {
     return this.watch(template);
   }
 
+  /**
+   * The leased push subscription of the Java space (JS-V-01): events reach
+   * `listener` as they fold, and the subscription lapses after `lease` unless
+   * renewed. A watch that outlives its owner never leaks: the lease ends it.
+   */
+  notify<T>(template: Template<T>, listener: (event: SpaceEvent<T>) => void,
+            lease: number | string = "1h"): Subscription<T> {
+    const subscription = this.watch(template, listener);
+    subscription.renew(lease);
+    return subscription;
+  }
+
   unwatch(key: number): void {
     this.watchers.delete(key);
   }
@@ -443,7 +576,7 @@ export class Space {
   private deliver(dto: Dict, kind: EventKind, markSuffix: string = kind): void {
     const record = (dto["record"] as Dict | undefined) ?? {};
     const entryId = String(record["entryId"]);
-    const payload = loads(Buffer.from((record["payload"] as Uint8Array) ?? new Uint8Array([0xf6]))) as Dict;
+    const payload = loads((record["payload"] as Uint8Array) ?? new Uint8Array([0xf6])) as Dict;
     const tags = (record["tags"] as Dict | undefined) ?? {};
     for (const { template, delivered, emit } of [...this.watchers.values()]) {
       if (record["type"] !== template.schema || !template.matches(payload, tags)) {
@@ -522,7 +655,7 @@ function install(peer: Peer): Space[] {
     };
     // EXPIRED and REAPPEARED are judged by the clock, not by a fold; the timer
     // never keeps the process alive on its own.
-    setInterval(() => {
+    peer.every(250, () => {
       for (const s of [...spaces]) {
         try {
           s.sweep();
@@ -530,7 +663,7 @@ function install(peer: Peer): Space[] {
           // a watcher that throws does not stop the sweep
         }
       }
-    }, 250).unref();
+    });
   }
   return holder.agentspacesSpaces;
 }

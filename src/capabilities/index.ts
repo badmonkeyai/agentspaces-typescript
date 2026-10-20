@@ -28,3 +28,5 @@ export { HashingEmbedder, Semantic, cosine, javaHash, textOf } from "./semantic.
 export type { Match } from "./semantic.js";
 export { actions, invoke, sharedFields } from "./remote.js";
 export type { RemoteAction } from "./remote.js";
+export { OrderedLog, ORDERED_LOG_TYPE, claimCommand, clientSubmitFrame } from "./ordered.js";
+export type { LogMember } from "./ordered.js";

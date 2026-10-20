@@ -1,0 +1,30 @@
+{
+  "name": "@agentspaces/connect",
+  "version": "0.4.0",
+  "description": "The connector runtime of the AgentSpaces JavaScript client (srad/agentspaces-js.md \u00a74.7): AssetProvider, ConnectorRuntime, DataQueryClient, and the asset-invoke capability, byte-identical to agentspaces-connect-core.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "build/src/index.js",
+  "types": "build/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./build/src/index.d.ts",
+      "default": "./build/src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test build/test/*.test.js"
+  },
+  "dependencies": {
+    "@agentspaces/client": "file:../.."
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0"
+  }
+}

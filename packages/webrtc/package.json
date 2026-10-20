@@ -1,0 +1,33 @@
+{
+  "name": "@agentspaces/webrtc",
+  "version": "0.4.0",
+  "description": "The webrtc dialer and acceptor of the AgentSpaces JavaScript client (srad/agentspaces-js.md §3.4, §3.5, §4.3): RTCPeerConnection data channels with signalling over aspace:cap/rtc-signal and attestation by signed fingerprint.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "build/src/index.js",
+  "types": "build/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./build/src/index.d.ts",
+      "default": "./build/src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test build/test/*.test.js"
+  },
+  "dependencies": {
+    "@agentspaces/client": "file:../.."
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  },
+  "optionalDependencies": {
+    "node-datachannel": "^0.33.4"
+  }
+}

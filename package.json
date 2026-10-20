@@ -1,20 +1,50 @@
 {
   "name": "@agentspaces/client",
-  "version": "0.2.0",
-  "description": "Wire-compatible AgentSpaces peer in TypeScript: joins Java fleets over TCP, writes signed entries, takes under the claim lattice, reads spaces through anti-entropy.",
+  "version": "0.4.0",
+  "description": "Wire-compatible AgentSpaces peer in TypeScript: a portable core that loads in browsers, Workers, Deno, Bun, and Node; joins Java fleets, writes signed entries, takes under the claim lattice, reads spaces through anti-entropy.",
   "license": "Apache-2.0",
   "type": "module",
   "main": "build/src/index.js",
   "types": "build/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./build/src/index.d.ts",
+      "default": "./build/src/index.js"
+    },
+    "./node": {
+      "types": "./build/src/node/index.d.ts",
+      "node": "./build/src/node/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": [
+    "./build/src/node/index.js",
+    "./build/src/transport/defaults.js"
+  ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node --test build/test/golden.test.js build/test/agents.test.js build/test/layer34.test.js build/test/layer4.test.js build/test/verbs.test.js build/test/robustness.test.js"
+    "test": "tsc && node --test build/test/golden.test.js build/test/agents.test.js build/test/layer34.test.js build/test/layer4.test.js build/test/verbs.test.js build/test/robustness.test.js build/test/social.test.js build/test/beacon.test.js build/test/portable.test.js build/test/session.test.js build/test/verbs-residency.test.js build/test/filters.test.js build/test/serving.test.js build/test/framing.test.js build/test/host-links.test.js build/test/verbs-join.test.js build/test/verbs-reduce.test.js build/test/verbs-ordered.test.js build/test/browser.test.js build/test/runtimes.test.js",
+    "size": "tsc && node tools/size.mjs",
+    "test:packages": "npm test --workspaces --if-present",
+    "build:packages": "npm run build --workspaces --if-present"
+  },
+  "dependencies": {
+    "@noble/curves": "^2.4.0",
+    "@noble/hashes": "^2.4.0"
   },
   "devDependencies": {
+    "@types/node": "^22.0.0",
+    "bun": "^1.4.3",
+    "deno": "^2.9.6",
+    "esbuild": "^0.28.2",
+    "playwright": "^1.64.1",
     "typescript": "^5.5.0",
-    "@types/node": "^22.0.0"
-  }
+    "workerd": "^1.20261018.1"
+  },
+  "workspaces": [
+    "packages/*"
+  ]
 }

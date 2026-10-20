@@ -1,0 +1,30 @@
+{
+  "name": "@agentspaces/ordered",
+  "version": "0.4.0",
+  "description": "The ordered log for long-running JavaScript hosts (srad/agentspaces-js.md phase 4): a Raft voter with a durable LogStore, the ordered-takes coordinator, and the fleet-wide LEASED and ORDERED joins and the @spaceReduce keeper, for the service residency.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "build/src/index.js",
+  "types": "build/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./build/src/index.d.ts",
+      "default": "./build/src/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "tsc -p . && node --test build/test/*.test.js"
+  },
+  "dependencies": {
+    "@agentspaces/client": "file:../.."
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0"
+  }
+}

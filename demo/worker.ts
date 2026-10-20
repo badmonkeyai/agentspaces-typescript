@@ -24,6 +24,7 @@
 
 import { loads } from "../src/cbor.js";
 import { Identity, groupIdFromFounding } from "../src/identity.js";
+import "../src/node/index.js";                       // registers the tcp dialer on Node (the portable core dials ws/http only)
 import { Peer } from "../src/peer.js";
 import type { Dict } from "../src/wire.js";
 

@@ -24,7 +24,8 @@
  * peer), then the newer `issued`, then the larger SHA-256 of the signed bytes.
  */
 
-import { createHash } from "node:crypto";
+import { toHex } from "./bytes.js";
+import { cryptoPort } from "./crypto.js";
 import { CborValue, loads } from "./cbor.js";
 import { Identity, deriveId, parseInstantMillis } from "./identity.js";
 
@@ -43,7 +44,7 @@ const MAX_RETAINED = 4096;
 
 type Held = { rank: number; issued: number; hash: string; ad: Dict; signed: Dict };
 
-const hex = (bytes: Uint8Array): string => Buffer.from(bytes).toString("hex");
+const hex = (bytes: Uint8Array): string => toHex(bytes);
 
 /** CredentialRevocation.Target.canonical: the target's text within its kind. */
 export function canonicalTarget(target: Dict): string {
@@ -97,7 +98,7 @@ export class Registry {
     }
     let signed: CborValue;
     try {
-      signed = loads(Buffer.from(payload));
+      signed = loads(payload);
     } catch {
       return false;
     }
@@ -129,7 +130,7 @@ export class Registry {
     let ad: Dict;
     let issued: number;
     try {
-      ad = loads(Buffer.from(adBytes)) as Dict;
+      ad = loads(adBytes) as Dict;
       issued = parseInstantMillis(ad["issued"]);
     } catch {
       return false;
@@ -141,7 +142,7 @@ export class Registry {
         || (group !== null && ad["group"] !== group)) {
       return false;
     }
-    const hash = createHash("sha256").update(adBytes).digest("hex");
+    const hash = toHex(cryptoPort().sha256(adBytes));
     if (stream === PEER_STREAM) {
       const founder = this.founder();
       // Founder-rooted only: a CA-rooted record is not trusted here.
@@ -199,7 +200,7 @@ export class Registry {
       return true;
     }
     if (agentKey instanceof Uint8Array) {
-      const fingerprint = createHash("sha256").update(agentKey).digest("hex");
+      const fingerprint = toHex(cryptoPort().sha256(agentKey));
       const one = this.credentials.get(`AGENT_KEY:${agentId}#${fingerprint}`);
       if (one !== undefined && refusesAt(one.ad, signingMillis)) {
         return true;
