@@ -37,6 +37,9 @@ import { AssetManifest, ManifestAsset, OBJECT_PARAM, OP_PARAM, OperationSpec, Ro
   routeMode, routeName, validateManifest } from "./manifest.js";
 import type { CellEnv, D1DatabaseLike, DurableObjectNamespaceLike, FetcherLike, KVNamespaceLike, QueueLike,
   R2BucketLike, R2ObjectLike, WorkflowLike } from "./workers-types.js";
+import { R2PieceStore, publishR2Object } from "./content.js";
+import type { capabilities } from "@agentspaces/client";
+type Content = capabilities.Content;
 
 type Dict = wire.Dict;
 
@@ -50,6 +53,12 @@ export type WorkersProviderOptions = {
   maxInlineResultBytes?: number;
   /** The page size of a `list` when the request names none; default 100. A per-request size, not a cap. */
   listLimit?: number;
+  /**
+   * The content swarm of the cell's peer with an `R2PieceStore` over the same bucket binding
+   * (srad/large-networks-bulk-data.md LB-C-05): an R2 `get` above `maxInlineResultBytes` is then
+   * published as an artifact and answered with its root instead of an error.
+   */
+  artifacts?: { content: Content; store: R2PieceStore; pieceSize?: number } | null;
 };
 
 /** A refusal, before anything runs: the appendix F code, the rule, and the detail. */
@@ -109,12 +118,14 @@ export class WorkersAssetProvider implements AssetProvider {
   private readonly fetcher: (input: string | URL, init?: RequestInit) => Promise<Response>;
   private readonly maxInlineResultBytes: number;
   private readonly listLimit: number;
+  private readonly artifacts: { content: Content; store: R2PieceStore; pieceSize?: number } | null;
 
   constructor(private readonly env: CellEnv, manifest: AssetManifest, options: WorkersProviderOptions = {}) {
     this.manifest = validateManifest(manifest);
     this.fetcher = options.fetch ?? ((input, init) => fetch(input, init));
     this.maxInlineResultBytes = options.maxInlineResultBytes ?? INLINE_PAYLOAD_LIMIT;
     this.listLimit = options.listLimit ?? 100;
+    this.artifacts = options.artifacts ?? null;
     this.assets = new Map(assetsOf(this.manifest).map((a) => [a.asset, a]));
   }
 
@@ -234,8 +245,14 @@ export class WorkersAssetProvider implements AssetProvider {
             return [];
           }
           if (object.size > this.maxInlineResultBytes) {
+            if (this.artifacts !== null && this.artifacts.store.bucket === r2) {
+              // LB-C-05: the object becomes an artifact the fleet fetches piece by piece from this cell.
+              const manifest = await publishR2Object(this.artifacts.content, this.artifacts.store, key,
+                { pieceSize: this.artifacts.pieceSize });
+              return [{ ...r2Row(object), root: String(manifest["root"]), pieces: String(manifest["pieces"]) }];
+            }
             throw new Error(`object ${key} of ${object.size} bytes exceeds the ${this.maxInlineResultBytes}-byte inline `
-              + "limit (maxInlineResultBytes); use head and fetch the body out of band");
+              + "limit (maxInlineResultBytes); use head and fetch the body out of band, or give the provider artifacts");
           }
           return [{ ...r2Row(object), body: bytes.toBase64(new Uint8Array(await object.arrayBuffer())) }];
         }

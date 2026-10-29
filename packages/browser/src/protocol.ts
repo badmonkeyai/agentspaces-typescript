@@ -70,7 +70,42 @@ export type HostConfig = {
   snapshotMillis?: number;
   /** Pages silent for this long are dropped as gone; three beats by default. */
   pageTimeoutMillis?: number;
+  /**
+   * The content swarm in the host (srad/large-networks-bulk-data.md LB-C-06): present turns it
+   * on, so a fetch runs in the worker over the origin private file system and reports progress
+   * to the pages; absent leaves it off.
+   */
+  content?: ContentConfig;
 };
+
+/** The host's content swarm. */
+export type ContentConfig = {
+  /** `opfs` (the default, falling back to memory where the origin private file system cannot be written) or `memory`. */
+  store?: "opfs" | "memory";
+  /** The OPFS directory; `agentspaces-content:<group>` by default. */
+  storeName?: string;
+  /** The space manifests and holdings live in; `content` by default. */
+  space?: string;
+  /** The publisher's piece size; 1 MiB by default. */
+  pieceSize?: number;
+  /** Payload bytes above which the host's spaces escalate a write to an artifact; 4 MiB by default. */
+  escalateAbove?: number;
+};
+
+/** A fetch's progress as it crosses the port. */
+export type WireProgress = {
+  root: string;
+  piecesVerified: number;
+  pieces: number;
+  bytesReceived: number;
+  /** Bytes verified per source, by PeerID. */
+  bySource: { [peerId: string]: number };
+  done: boolean;
+  failure: string | null;
+};
+
+/** An artifact as a page sees it: the manifest's identity and size. */
+export type WireManifest = { root: string; name: string | null; size: number; pieces: number; mediaType: string | null };
 
 /** What the host reports about itself. */
 export type HostState = {
@@ -91,6 +126,8 @@ export type HostState = {
   activePages: number;
   /** The reason for the last pause, when paused. */
   reason: string | null;
+  /** The content swarm's store kind (`opfs` or `memory`), or null when the swarm is off. */
+  contentStore?: string | null;
 };
 
 /** An entry as it crosses the port: the record's own payload and tag bytes, with its metadata. */
@@ -110,7 +147,9 @@ export type WireEvent = { ev: "event"; sub: number; kind: EventKind; entry: Wire
 export type WireClosed = { ev: "closed"; sub: number; reason: string };
 /** The host's state changed (paused, resumed, connected, pages). */
 export type WireState = { ev: "state"; state: HostState };
-export type Push = WireEvent | WireClosed | WireState;
+/** A fetch the page asked for made progress, completed, or failed. */
+export type WireContent = { ev: "content"; progress: WireProgress };
+export type Push = WireEvent | WireClosed | WireState | WireContent;
 
 /** A result the page writes with a completion, in port form. */
 export type WireResult = { space: string; schema: string; payload: Uint8Array; leaseMillis: number; tags: Uint8Array };
@@ -134,7 +173,12 @@ export type Request =
   | { t: "renewEntry"; space: string; entryId: string; leaseMillis: number }
   | { t: "watch"; space: string; schema: string }
   | { t: "watchLease"; sub: number; leaseMillis: number }
-  | { t: "unwatch"; sub: number };
+  | { t: "unwatch"; sub: number }
+  | { t: "contentPublish"; bytes: Uint8Array; name: string | null; mediaType: string | null; pieceSize: number | null }
+  | { t: "contentFetch"; root: string }
+  | { t: "contentRead"; root: string }
+  | { t: "contentList" }
+  | { t: "contentDescribe"; root: string };
 
 export type Envelope = Request & { id: number };
 export type Answer = { id: number; ok: true; value: unknown } | { id: number; ok: false; error: string };

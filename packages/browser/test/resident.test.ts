@@ -38,7 +38,9 @@ import { dirname, extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { Identity } from "@agentspaces/client";
+import { createHash } from "node:crypto";
+
+import { Identity, Space, capabilities } from "@agentspaces/client";
 import { ServiceHost } from "@agentspaces/node";
 
 import { TASK } from "./browser/harness.js";
@@ -327,6 +329,52 @@ for (const engine of ["chromium", "firefox", "webkit"] as const) {
           await until(() => hub.peer.inbound.size === base, "detaching the only page ends the dedicated host");
         } finally {
           await fresh.close();
+        }
+      });
+
+      await t.test("a fetch runs in the resident worker and reports progress to the page; the page publishes back (LB-C-06)", async () => {
+        const hubContent = new capabilities.Content(new capabilities.Pipes(hub.peer), new Space(hub.peer, "content"),
+          new capabilities.MemoryStore(), { pieceSize: 64 * 1024 });
+        hubContent.run(100);
+        const data = new Uint8Array(5 * 64 * 1024 + 77).map((_, i) => (i * 7 + 1) & 0xff);
+        const manifest = hubContent.publish(data, { name: "model.bin" });
+        const fresh = await browser.newContext();
+        try {
+          const tab = await openTab(fresh, `${origin}/?tab=s`, errors);
+          const s = await call(tab, "connect", "s", { ...options, content: { pieceSize: 64 * 1024 } });
+          assert.ok(s.ok, `the swarm host connects: ${s.ok ? "" : s.error}`);
+          const got = await call(tab, "contentFetch", "s", String(manifest["root"]));
+          assert.ok(got.ok, `the worker fetches: ${got.ok ? "" : got.error}`);
+          assert.equal(got.size, data.length);
+          assert.equal(got.sha256, createHash("sha256").update(data).digest("hex"), "the bytes are the hub's");
+          assert.ok(got.pushes >= 1, "progress reached the page as pushes");
+          assert.deepEqual(got.sources, [hub.peer.identity.peerId]);
+          t.diagnostic(`${engine}: content store ${got.store}, ${got.pushes} progress pushes`);
+          const pub = await call(tab, "contentPublish", "s", 3 * 64 * 1024 + 11, 5);
+          assert.ok(pub.ok, `the page publishes: ${pub.ok ? "" : pub.error}`);
+          assert.ok(pub.listed, "the host lists what it published");
+          await until(() => hubContent.manifestOf(pub.root) !== null, "the hub hears the page's manifest");
+          const back = hubContent.fetch(pub.root);
+          assert.ok(await back.await(30_000), back.trace.join("\n"));
+          assert.equal(createHash("sha256").update(back.readBytes()).digest("hex"), pub.sha256, "the hub fetched from the worker");
+          await call(tab, "close", "s");
+        } finally {
+          hubContent.stop();
+          await fresh.close();
+        }
+      });
+
+      await t.test("the OPFS piece store writes, reads by range, and resumes after a reopen (LB-C-01)", async (tt) => {
+        const tab = await openTab(context, `${origin}/`, errors);
+        try {
+          const outcome = await call(tab, "opfsStore");
+          if (!outcome.ok && outcome.error === "unavailable") {
+            tt.skip(`${engine} offers no origin private file system here`);
+            return;
+          }
+          assert.ok(outcome.ok, `opfs store: ${outcome.ok ? "" : outcome.error}`);
+        } finally {
+          await tab.close({ runBeforeUnload: false });
         }
       });
 

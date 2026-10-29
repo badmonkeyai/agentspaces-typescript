@@ -22,7 +22,8 @@
   },
   "scripts": {
     "build": "tsc -p .",
-    "test": "tsc -p . && node --test build/test/*.test.js"
+    "test": "tsc -p . && node --test build/test/*.test.js",
+    "demo:swarm": "tsc -p . && node build/demo/swarm.js"
   },
   "dependencies": {
     "@agentspaces/client": "file:../.."

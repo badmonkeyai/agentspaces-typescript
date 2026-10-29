@@ -24,10 +24,11 @@
  * script. Neither entry imports a Node module.
  */
 
-export { connect, BrowserHost, RemoteSpace, RemoteTaken, RemoteSubscription } from "./page.js";
+export { connect, BrowserHost, RemoteContent, RemoteSpace, RemoteTaken, RemoteSubscription } from "./page.js";
 export type { ConnectOptions, RemoteTakeOptions } from "./page.js";
 export { IndexedDbKeyStore, openDatabase, closeDatabase, deleteDatabase, KEYS_STORE, STATE_STORE } from "./idb.js";
 export { LockElection } from "./lock.js";
+export { OpfsStore, opfsAvailable } from "./opfs.js";
 export type { Held } from "./lock.js";
 export {
   ResidentHost, DEFAULT_TICK_MILLIS, DEFAULT_LOCK_WAIT_MILLIS, DEFAULT_SNAPSHOT_MILLIS, DEFAULT_PAGE_TIMEOUT_MILLIS,
@@ -35,4 +36,4 @@ export {
 } from "./host.js";
 export type { ResidentHostOptions } from "./host.js";
 export { lockName, identityLockName, databaseName, agentKeyName, packMap, unpackMap, PEER_KEY, PEER_PUB, SNAPSHOT } from "./protocol.js";
-export type { HostConfig, HostState, WireEntry, PortLike, Request, Answer, Push } from "./protocol.js";
+export type { ContentConfig, HostConfig, HostState, WireEntry, WireManifest, WireProgress, PortLike, Request, Answer, Push } from "./protocol.js";

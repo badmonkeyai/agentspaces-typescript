@@ -481,7 +481,11 @@ export class Space {
       if (expires <= now) {
         continue;
       }
-      const payload = loads((record["payload"] as Uint8Array) ?? new Uint8Array([0xf6])) as Dict;
+      const raw = this.peer.payloadOf(dto);
+      if (raw === null) {
+        continue; // a block or artifact still on its way: its transfer has started
+      }
+      const payload = loads(raw) as Dict;
       const tags = (record["tags"] as Dict | undefined) ?? {};
       if (!template.matches(payload, tags)) {
         continue;
@@ -530,8 +534,7 @@ export class Space {
     if (entryId === null) {
       return null;
     }
-    const record = this.peer.states.get(entryId)!["record"] as Dict;
-    const payload = loads((record["payload"] as Uint8Array) ?? new Uint8Array([0xf6])) as Dict;
+    const payload = loads(this.peer.payloadOf(this.peer.states.get(entryId)!) ?? new Uint8Array([0xf6])) as Dict;
     return new Taken(this, entryId, template.decode(payload), millis);
   }
 
@@ -576,7 +579,11 @@ export class Space {
   private deliver(dto: Dict, kind: EventKind, markSuffix: string = kind): void {
     const record = (dto["record"] as Dict | undefined) ?? {};
     const entryId = String(record["entryId"]);
-    const payload = loads((record["payload"] as Uint8Array) ?? new Uint8Array([0xf6])) as Dict;
+    const raw = this.peer.payloadOf(dto);
+    if (raw === null) {
+      return; // a referenced payload not here yet: the event waits for a later fold or read
+    }
+    const payload = loads(raw) as Dict;
     const tags = (record["tags"] as Dict | undefined) ?? {};
     for (const { template, delivered, emit } of [...this.watchers.values()]) {
       if (record["type"] !== template.schema || !template.matches(payload, tags)) {

@@ -35,6 +35,8 @@ export type { AssetKind, AssetManifest, D1QuerySpec, D1Spec, DurableObjectSpec, 
 export { DEFAULT_ONCE_RETENTION, ONCE_TABLE, once, prune, recorded, recordedCount } from "./once.js";
 export type { OnceOptions, OnceStorage } from "./once.js";
 export { INVOCATION_HEADER, WorkersAssetProvider, rowOf, rowsOf, stringOf } from "./providers.js";
+export { R2PieceStore, publishR2Object } from "./content.js";
+export type { R2PublishOptions } from "./content.js";
 export type { WorkersProviderOptions } from "./providers.js";
 export type { CellEnv, CellStateLike, CellStorageLike, D1DatabaseLike, DurableObjectNamespaceLike, DurableObjectStubLike,
   FetcherLike, KVNamespaceLike, QueueLike, R2BucketLike, R2ObjectLike, SqlCursorLike, SqlStorageLike, SqlValue,

@@ -36,3 +36,4 @@ installContextStores(<T>(): ContextStore<T> => {
 export { TcpChannel, TcpDialer, TcpListener } from "./tcp.js";
 export { FileKeyStore, agentKeys, loadOrCreateIdentity, savePkcs8, writeKeyFile } from "./keystore.js";
 export { nodeCrypto } from "./crypto.js";
+export { FileStore } from "./content-store.js";

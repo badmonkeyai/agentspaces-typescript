@@ -91,6 +91,17 @@ export type InviteJoined = {
  */
 export type Link = { channel: FrameChannel; session: Session | null; readonly peers: Set<string> };
 
+/**
+ * The content swarm's seam on a peer (SPEC §7.1 group E): a payload above `escalateAbove` is
+ * published as an artifact and the record carries its root; a read resolves the root here.
+ */
+export interface BulkPayloads {
+  readonly escalateAbove: number;
+  publishOpaque(payload: Uint8Array, leaseMillis: number): string;
+  local(root: string): Uint8Array | null;
+  ensure(root: string): void;
+}
+
 export class Peer {
   readonly states = new Map<string, Dict>();
   readonly claims = new Map<string, Dict>();
@@ -207,6 +218,24 @@ export class Peer {
    * credential rides under `aspace:join`. Set before `connect`, or call `introduce()` again.
    */
   readonly resourceHints: { [key: string]: string } = {};
+  /**
+   * SPEC v0.1.23 §5.4 (srad/large-networks-bulk-data.md): the seed's PeerID, learned from the
+   * first frame it addresses to this peer on the dialed channel. A dial-only peer reaches the
+   * seed directly and every other member through it (a `RELAY_FRAME` the seed forwards), and
+   * declares the seed as its relay in the `relay.via` hint so members reach it the same way back.
+   */
+  seedPeer: string | null = null;
+  /** The longest path a relayed frame of this peer's names (LB-R-03). */
+  maxPathHops = 4;
+  /** Frames this peer sent through its seed. */
+  relayedFrames = 0;
+  /** The last unreachable signals relays sent back (`aspace:cap/relay-signal`). */
+  readonly relaySignals: Dict[] = [];
+  /** Block-stored payloads (SPEC §7.1, `z` references): put here or fetched, by id. */
+  readonly blocks = new Map<string, Uint8Array>();
+  private readonly blockAsked = new Map<string, number>();
+  /** The content swarm attached to this peer (`capabilities/content`): resolves `b` references and takes payloads above its bound. */
+  content: BulkPayloads | null = null;
   private running = false;
   private readonly pulledSpaces = new Set<string>();
   private pulledAds = false;
@@ -669,8 +698,19 @@ export class Peer {
     if (agent !== null && this.revocations.refuses(agent.agentId, agent.publicRaw, null)) {
       throw new Error(`${agent.agentId} is revoked in this group`);
     }
+    let payload: Uint8Array | null = dumps(value);
+    let payloadRef: string | null = null;
+    if (this.content !== null && this.content.escalateAbove > 0 && payload.length > this.content.escalateAbove) {
+      // SPEC §7.1 group E: above the bound the payload becomes an artifact of the content swarm
+      // and the record carries its root.
+      payloadRef = this.content.publishOpaque(payload, leaseMillis);
+      payload = null;
+    } else if (payload.length > wire.INLINE_PAYLOAD_LIMIT) {
+      payloadRef = this.putBlock(payload);
+      payload = null;
+    }
     const { entryId, body } = wire.entryDelta(space, this.group, typeName,
-      dumps(value), this.identity, agentName, leaseMillis, agent, this.now(), tags);
+      payload, this.identity, agentName, leaseMillis, agent, this.now(), tags, payloadRef);
     // The writer holds its own entry too, folded into the verified local
     // replica before transport, so a local read sees it at once.
     this.foldDelta(loads((loads(body) as Dict)["payload"] as Uint8Array) as Dict);
@@ -760,9 +800,105 @@ export class Peer {
     return [...this.ads.values()].filter((e) => e.type === "AgentCard" && e.expires > now).map((e) => e.ad);
   }
 
-  /** One capability frame to a member (CapabilityPipes.send): a PIPE_DATA envelope addressed to it. */
-  sendPipe(to: string, capability: string, payload: Uint8Array): void {
-    this.send("PIPE_DATA", dumps({ capability, payload }), to);
+  /**
+   * One capability frame to a member (CapabilityPipes.send): a PIPE_DATA envelope addressed to
+   * it. A dial-only peer's seed carries it when `to` is any other member (SPEC §5.4); `via` (the
+   * relays the member declared) extends the path past the seed.
+   */
+  sendPipe(to: string, capability: string, payload: Uint8Array, via: string[] | null = null): void {
+    this.sendAddressed("PIPE_DATA", dumps({ capability, payload }), to, via);
+  }
+
+  /**
+   * The relay an addressed frame to `to` goes through, or null for a direct send: for a peer
+   * that only dialed (no accepted links), the seed for everyone but the seed itself.
+   */
+  relayFor(to: string): string | null {
+    if (this.channel === null || this.inbound.size > 0 || this.seedPeer === null || to === this.seedPeer) {
+      return null;
+    }
+    return this.seedPeer;
+  }
+
+  /**
+   * Sends an addressed frame directly or, when the seed must carry it, wrapped in a
+   * `RELAY_FRAME` to the seed (the one-hop form), extended to a path `[seed, via...]` when
+   * `via` names other relays (v0.1.23).
+   */
+  sendAddressed(kind: string, body: Uint8Array, to: string, via: string[] | null = null): void {
+    const relay = this.relayFor(to);
+    if (relay === null) {
+      this.send(kind, body, to);
+      return;
+    }
+    const inner = wire.encodeFrame(wire.envelope(this.group, kind, this.identity.peerId,
+      wire.hlcNow(this.identity.peerId, this.now()), body, to), this.identity);
+    const path = [relay, ...(via ?? []).filter((v) => v !== relay && v !== to)].slice(0, Math.max(1, this.maxPathHops));
+    this.relayedFrames += 1;
+    this.send("RELAY_FRAME", path.length > 1 ? wire.relayFrameBody(to, inner, path, 0)
+      : wire.relayFrameBody(to, inner), relay);
+    this.noteRelayed(to);
+  }
+
+  /**
+   * The payload bytes of an entry's record: inline, or resolved from a block (`z`) or a content
+   * root (`b`) held here. A reference not yet held starts its transfer and returns null; reads
+   * never block on the network (SPEC §7.2). A null payload with no reference is the CBOR null.
+   */
+  payloadOf(dto: Dict): Uint8Array | null {
+    const record = (dto["record"] as Dict | undefined) ?? {};
+    const payload = record["payload"];
+    if (payload instanceof Uint8Array) {
+      return payload;
+    }
+    const ref = record["payloadRef"];
+    if (typeof ref !== "string" || ref.length === 0) {
+      return new Uint8Array([0xf6]);
+    }
+    if (ref.startsWith("b")) {
+      if (this.content === null) {
+        return null;
+      }
+      const data = this.content.local(ref);
+      if (data === null) {
+        this.content.ensure(ref);
+      }
+      return data;
+    }
+    const block = this.blocks.get(ref);
+    if (block === undefined) {
+      this.wantBlock(ref, dto);
+    }
+    return block ?? null;
+  }
+
+  /** Asks the entry's issuing peer (and the seed) for a block, at most once a second. */
+  wantBlock(cid: string, dto: Dict | null = null): void {
+    const now = Date.now();
+    if (now - (this.blockAsked.get(cid) ?? Number.NEGATIVE_INFINITY) < 1000) {
+      return;
+    }
+    this.blockAsked.set(cid, now);
+    const targets: string[] = [];
+    const key = dto?.["issuerPublicKey"];
+    if (key instanceof Uint8Array) {
+      targets.push(deriveId(key));
+    }
+    if (this.seedPeer !== null && !targets.includes(this.seedPeer)) {
+      targets.push(this.seedPeer);
+    }
+    for (const target of targets) {
+      if (target !== this.identity.peerId) {
+        this.sendAddressed("BLOCK_WANT", wire.blockWantBody(cid), target);
+      }
+    }
+  }
+
+  /** Stores a block here and returns its id; served to any member that asks. */
+  putBlock(data: Uint8Array): string {
+    const cid = wire.contentId(data);
+    this.blocks.set(cid, data);
+    return cid;
   }
 
   /** The members whose advertisement declares the RELAY role (SPEC §5.4). */
@@ -784,7 +920,7 @@ export class Peer {
    * it verbatim and the target verifies the origin. Returns whether a route was found.
    */
   sendPipeOrRelay(to: string, capability: string, payload: Uint8Array): boolean {
-    if (this.reachable.has(to)) {
+    if (this.reachable.has(to) || this.relayFor(to) !== null) {
       this.sendPipe(to, capability, payload);
       return true;
     }
@@ -1008,7 +1144,10 @@ export class Peer {
     for (const dto of this.states.values()) {
       const record = dto["record"] as Dict | undefined;
       if (record && record["type"] === typeName && !dto["completed"]) {
-        results.push(loads(record["payload"] as Uint8Array) as Dict);
+        const payload = this.payloadOf(dto);
+        if (payload !== null) {
+          results.push(loads(payload) as Dict);
+        }
       }
     }
     return results;
@@ -1052,7 +1191,11 @@ export class Peer {
           continue;
         }
         // A template narrows the candidates; a bid function prices the claim (AUCTION).
-        const payload = loads((record["payload"] as Uint8Array) ?? new Uint8Array([0xf6])) as Dict;
+        const raw = this.payloadOf(dto);
+        if (raw === null) {
+          continue; // its block or artifact is still on its way
+        }
+        const payload = loads(raw) as Dict;
         if (matches !== null && !matches(payload ?? {}, (record["tags"] as Dict) ?? {})) {
           continue;
         }
@@ -1351,6 +1494,7 @@ export class Peer {
     if (!this.frames.admit(env, this.now())) {
       return; // stale, far ahead, or a replay: dropped and counted, nothing more
     }
+    let reintroduce = false;
     wire.hlcObserve(this.identity.peerId, env["stamp"], this.now());
     const kind = env["kind"];
     const body = (env["body"] as Uint8Array) ?? new Uint8Array();
@@ -1369,6 +1513,14 @@ export class Peer {
       if (!relayed) {
         this.reachable.add(sender);
         (link === null ? this.dialPeers : link.peers).add(sender);
+        if (link === null && this.channel !== null && env["to"] === this.identity.peerId
+            && this.seedPeer !== sender) {
+          // On the dialed channel an addressed frame is the seed's own; it is the relay this peer
+          // declares, so members behind other seeds reach it through the seed (SPEC §5.4).
+          this.seedPeer = sender;
+          this.resourceHints["relay.via"] = sender;
+          reintroduce = true; // after this frame's own answer, so a probe's ACK stays first
+        }
       }
       if (kind !== "RUMOR" && kind !== "SESSION_HELLO" && !relayed) {
         this.maybeSessionHello(sender, link); // a frame past the introduction proves the member admitted us
@@ -1386,6 +1538,14 @@ export class Peer {
       this.onAck(String(sender), loads(body) as Dict);
     } else if (kind === "PIPE_DATA") {
       const frame = loads(body) as Dict;
+      if (typeof frame === "object" && frame !== null && frame["capability"] === wire.RELAY_SIGNAL_CAPABILITY) {
+        const signal = loads((frame["payload"] as Uint8Array) ?? new Uint8Array([0xf6]));
+        if (typeof signal === "object" && signal !== null) {
+          this.relaySignals.push(signal as Dict);
+          this.relaySignals.splice(0, Math.max(0, this.relaySignals.length - 64));
+        }
+        return;
+      }
       const handler = typeof frame === "object" && frame !== null
         ? this.pipeHandlers.get(String(frame["capability"])) : undefined;
       if (handler !== undefined) {
@@ -1412,6 +1572,19 @@ export class Peer {
         this.foldDelta(delta);
       }
       this.forwardRumor(rumor, link);
+    } else if (kind === "BLOCK_WANT") {
+      const want = loads(body) as Dict;
+      const data = typeof want === "object" && want !== null ? this.blocks.get(String(want["cid"])) : undefined;
+      if (data !== undefined) {
+        this.sendAddressed("BLOCK", wire.blockBody(String(want["cid"]), data), String(sender));
+      }
+    } else if (kind === "BLOCK") {
+      const block = loads(body) as Dict;
+      if (typeof block === "object" && block !== null && block["bytes"] instanceof Uint8Array
+          && this.blockAsked.has(String(block["cid"])) && wire.contentId(block["bytes"]) === block["cid"]) {
+        this.blocks.set(String(block["cid"]), block["bytes"]);
+        this.wakeFoldWaiters();
+      }
     } else if (kind === "PULL_RESP") {
       const resp = loads(body) as Dict;
       const deltas = (resp["deltas"] as Dict) ?? {};
@@ -1457,6 +1630,9 @@ export class Peer {
       // A kind this client does not speak (the hint-gated kinds of SPEC v0.1.17 are never
       // sent to it, but a misconfigured peer could): ignored, counted, never fatal.
       this.ignoredKinds.set(String(kind), (this.ignoredKinds.get(String(kind)) ?? 0) + 1);
+    }
+    if (reintroduce) {
+      this.introduce();
     }
   }
 
@@ -1696,6 +1872,9 @@ export class Peer {
   /** Relayed frames unwrapped for this peer, and forwarded on toward a linked target. */
   relayedIn = 0;
   relayedForwarded = 0;
+  /** Path frames refused as malformed and frames no hop could deliver (SPEC v0.1.23 §5.4). */
+  relayedDroppedBadPath = 0;
+  relayedDroppedUnreachable = 0;
 
   /**
    * A `RELAY_FRAME` (SPEC §5.4; PeerNode.onRelayFrame): addressed to this peer, the inner frame is
@@ -1732,12 +1911,35 @@ export class Peer {
       }
       return;
     }
-    const route = this.linkFor(target);
-    if (route === null && !this.dialPeers.has(target)) {
-      return; // not linked here: a relay forwards only to a member it can reach
+    const path = Array.isArray(body["path"]) ? (body["path"] as unknown[]).map(String) : null;
+    const hop = typeof body["hop"] === "number" ? body["hop"] : -1;
+    if (path !== null && (hop < 0 || hop >= path.length || path[hop] !== this.identity.peerId
+        || path.length > this.maxPathHops || path.includes(target))) {
+      this.relayedDroppedBadPath += 1;
+      return; // a path frame names this relay at its hop (LB-R-03); anything else is malformed
     }
-    this.relayedForwarded += 1;
-    this.sendOn(route, "RELAY_FRAME", dumps({ target, frame }), target);
+    const route = this.linkFor(target);
+    if (route !== null || this.dialPeers.has(target)) {
+      this.relayedForwarded += 1;
+      this.sendOn(route, "RELAY_FRAME", path === null ? dumps({ target, frame })
+        : wire.relayFrameBody(target, frame, path, hop), target);
+      return;
+    }
+    // Not deliverable from here: the next relay on the path carries it, once (LB-R-08).
+    if (path !== null && hop + 1 < path.length) {
+      const next = path[hop + 1];
+      const link = this.linkFor(next);
+      if (link !== null || this.dialPeers.has(next)) {
+        this.relayedForwarded += 1;
+        this.sendOn(link, "RELAY_FRAME", wire.relayFrameBody(target, frame, path, hop + 1), next);
+        return;
+      }
+      const origin = wire.decodeFrame(frame)?.["from"];
+      if (typeof origin === "string") {
+        this.sendAddressed("PIPE_DATA", wire.relaySignalBody(target, next), origin);
+      }
+    }
+    this.relayedDroppedUnreachable += 1;
   }
 
   /**

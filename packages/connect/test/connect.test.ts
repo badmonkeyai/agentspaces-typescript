@@ -30,7 +30,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { Identity, MemoryNetwork, Peer, Space, Template, eq, settle } from "@agentspaces/client";
+import { Identity, MemoryNetwork, Peer, Space, Template, capabilities, eq, settle } from "@agentspaces/client";
 import type { wire } from "@agentspaces/client";
 import { AssetChange, AssetInvocation, AssetInvocationResult, ConnectorRuntime, DataQueryClient, TableAssetProvider,
   assetCards, invoke, scopeAuthorizer } from "../src/index.js";
@@ -301,4 +301,38 @@ test("a receiver ignores fields it does not know on the asset-invoke entries (JS
     result: { reserved: "1" }, error: null, cost: "3" });
   assert.deepEqual(Object.keys(result), ["v", "invocationId", "asset", "operation", "ok", "result", "error"]);
   assert.equal(result.ok, true);
+});
+
+test("a result above the inline limit travels as a block or an artifact when the swarm is attached (LB-E-05)", async () => {
+  const rows: StringMap[] = [];
+  for (let i = 0; i < 2_000; i++) {
+    rows.push({ id: String(i), region: "eu", payload: "x".repeat(200) });
+  }
+  const provider = new TableAssetProvider("orders", "postgres://ops/public.orders", "Bulk order export",
+    "com.example.OrderRow#v1", "PT5M", rows);
+  const { hub, members: [agent], stop } = await fleet(provider, 1);
+  const swarm = (peer: Peer) => new capabilities.Content(new capabilities.Pipes(peer), new Space(peer, "content"),
+    new capabilities.MemoryStore(), { pieceSize: 64 * 1024, escalateAbove: 256 * 1024 });
+  const hubSwarm = swarm(hub);
+  const agentSwarm = swarm(agent);
+  hubSwarm.run(50);
+  agentSwarm.run(50);
+  try {
+    agent.pullSpace("content");
+    const client = new DataQueryClient(agent, { requester: "analyst", trustedConnectors: new Set([hub.identity.peerId]) });
+    const fetched = await client.fetch("orders", { region: "eu" }, 30_000);
+    assert.ok(fetched !== null, "the bulk result arrived");
+    assert.equal(fetched!.result.rows.length, 2_000);
+    assert.deepEqual(fetched!.result.rows[1999], rows[1999]);
+    assert.equal(fetched!.result.error, null);
+    const refs = [...hub.states.values()]
+      .map((d) => String((d["record"] as Dict)["payloadRef"] ?? ""))
+      .filter((r) => r.startsWith("b"));
+    assert.equal(refs.length, 1, "the completion carries an artifact root");
+    assert.equal(hubSwarm.listManifests().length, 1);
+  } finally {
+    hubSwarm.stop();
+    agentSwarm.stop();
+    await stop();
+  }
 });

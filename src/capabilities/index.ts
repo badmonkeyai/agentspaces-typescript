@@ -30,3 +30,8 @@ export { actions, invoke, sharedFields } from "./remote.js";
 export type { RemoteAction } from "./remote.js";
 export { OrderedLog, ORDERED_LOG_TYPE, claimCommand, clientSubmitFrame } from "./ordered.js";
 export type { LogMember } from "./ordered.js";
+export { Content, Fetch, MemoryStore, TYPE as CONTENT_TYPE, MANIFEST_TYPE, HOLDING_TYPE, DEFAULT_PIECE_SIZE, HASH_BYTES,
+  INLINE_TABLE_PIECES, piecesOf, pieceLength, verifies, base32Lower, contentRoot,
+  hashPieces, isRoot, manifest, manifestViolation, holding, encodeHave, decodeHave, pieceWant, piece, haveMessage,
+  cancel, reject, manifestWant, manifestReply } from "./content.js";
+export type { PieceStore, ContentOptions, PublishOptions, Progress } from "./content.js";

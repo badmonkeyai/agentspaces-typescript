@@ -549,13 +549,56 @@ the cards on the `ads` stream declare, invoked through the task space with
 the shared-fields correlation), `OrderedLog` (the Raft client: a signed
 `ClaimCommand` submitted to the advertised leader, the committed claim seen
 as the space folds it), and `vote.castPreference`/`leader` (MAJORITY_GOSSIP
-over push-sum shares, agreeing with Java's `VoteCapability`). A dial-only
-peer sends frames to the members it can reach (the seed it dialed), never
-to a member it only heard of; a peer that accepts connections
-(`peer.acceptChannel`, the `@agentspaces/node` service host) serves
-anti-entropy in Java's digest formats, relays rumors between its links, and
-keeps one session per link. Not here: the gossip-learning exchange (its
-payload is encoded and golden-pinned); the Raft voter is `@agentspaces/ordered`.
+over push-sum shares, agreeing with Java's `VoteCapability`), and `Content`
+(the content swarm, below). A dial-only peer sends frames to its seed
+directly and to every other member through it: the seed carries a
+`RELAY_FRAME` when it holds the `RELAY` role (SPEC §5.4), and the peer's
+`relay.via` hint tells members to reach it the same way back. A peer that
+accepts connections (`peer.acceptChannel`, the `@agentspaces/node` service
+host) serves anti-entropy in Java's digest formats, relays rumors between
+its links, forwards relayed frames to the members on its links or to the
+next relay a frame's path names, and keeps one session per link. Not here:
+the gossip-learning exchange (its payload is encoded and golden-pinned); the
+Raft voter is `@agentspaces/ordered`.
+
+### Large artifacts: the content swarm
+
+`capabilities/content` is `aspace:cap/content-swarm` (SPEC v0.1.23 §7.1, §8,
+annex G): an artifact of any size is hashed in fixed pieces, its signed
+`Manifest` (a CIDv1 root) and each holder's leased `Holding` live in the
+group's `content` space, and the pieces move from every holder at once,
+verified before they are stored or served.
+
+```ts
+import { Content, Pipes } from "@agentspaces/client";
+import { FileStore } from "@agentspaces/client/node";
+
+const content = new Content(new Pipes(peer), new Space(peer, "content"), new FileStore("/var/lib/aspace/content"));
+content.run();                                        // ticks the scheduler on the peer's timers
+const manifest = content.publish(bytes, { name: "weights.bin" });
+const fetch = content.fetch(String(manifest["root"])); // from the seed and, through it, every other holder
+if (await fetch.await(600_000)) {
+  const data = fetch.readBytes();
+}
+console.log(fetch.progress(), fetch.trace.slice(-3), content.describe(String(manifest["root"])));
+```
+
+A `FileStore` (Node) resumes after a restart and republishes what it holds;
+a `MemoryStore` runs anywhere, the browser included. With a `Content`
+attached, every `Space` over the peer escalates a payload above
+`escalateAbove` (4 MiB) to an artifact and one above 64 KiB to a block
+(`BLOCK_WANT`/`BLOCK` are spoken here now), and a read of either kind of
+entry returns it once its bytes are here (`peer.payloadOf`: never a block on
+the network). A holding's `via` names the relay a holder sits behind; the
+scheduler orders sources by hops. `test/content.test.ts` pins the golden
+vectors and runs the swarm in process; `test/workers/content-worker.ts` is
+the worker the Java `TypeScriptContentClientTest` (agentspaces-content)
+spawns against a Java relay and a Java mirror. `@agentspaces/browser`
+adds `OpfsStore`, a store over the origin private file system that resumes
+after a reload; `@agentspaces/workers` adds `R2PieceStore` and
+`publishR2Object`, so a cell serves an R2 object's pieces by ranged `get`
+and its connector answers an over-limit `get` with an artifact root. A
+`PieceStore.read` may answer later, which is how a remote backend serves.
 
 `demo/council.ts` is the whole of it against the Java `CouncilFleet`
 coordinator; `test/layer34.test.ts`, `test/layer4.test.ts`, and

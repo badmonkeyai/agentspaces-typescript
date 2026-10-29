@@ -202,8 +202,36 @@ export function groupAdBody(signed: Dict): Uint8Array {
  * and the origin's fully signed inner `frame`, which a RELAY-role member forwards verbatim to the
  * target. Byte-identical to Java's `Bodies.RelayFrame(target, frame)` record (component order).
  */
-export function relayFrameBody(target: string, frame: Uint8Array): Uint8Array {
-  return dumps({ target, frame });
+export function relayFrameBody(target: string, frame: Uint8Array, path: string[] | null = null,
+                               hop: number | null = null): Uint8Array {
+  if (path === null) {
+    return dumps({ target, frame });
+  }
+  // SPEC v0.1.23 §5.4: `path` is the relays to traverse and `hop` the index of the relay this
+  // envelope is addressed to; both absent in the one-hop form (Java writes them NON_NULL).
+  return dumps({ target, frame, path: [...path], hop: hop ?? 0 });
+}
+
+/** The capability a relay signals an origin on when the next hop of a path could not carry its frame. */
+export const RELAY_SIGNAL_CAPABILITY = "aspace:cap/relay-signal";
+
+/** The PIPE_DATA body of an unreachable signal (SPEC v0.1.23 §5.4). */
+export function relaySignalBody(target: string, failedHop: string, reason = "unreachable"): Uint8Array {
+  return dumps({ capability: RELAY_SIGNAL_CAPABILITY,
+    payload: dumps({ target, failedHop, reason }) });
+}
+
+/** Payloads above this travel as a block or an artifact and the record carries a reference (SPEC §7.1). */
+export const INLINE_PAYLOAD_LIMIT = 64 * 1024;
+
+/** A BLOCK_WANT body: one block by id. */
+export function blockWantBody(cid: string): Uint8Array {
+  return dumps({ cid });
+}
+
+/** A BLOCK body: the bytes under their id. */
+export function blockBody(cid: string, bytes: Uint8Array): Uint8Array {
+  return dumps({ cid, bytes });
 }
 
 /** Signs and encodes an envelope into a frame (WireCodec.Signed). */
@@ -497,11 +525,12 @@ export function contentId(block: Uint8Array): string {
  * a content-key epoch from 1, so other records sign the same bytes.
  */
 export function signView(entryId: string, spaceId: string, typeName: string,
-                         payload: Uint8Array, issuer: string,
+                         payload: Uint8Array | null, issuer: string,
                          issued: string, keyEpoch: number | null = null,
-                         tags: Dict = {}): Dict {
-  // SPEC §7.1: the tags are part of the signed record, canonical on the wire.
-  const view: Dict = { entryId, spaceId, type: typeName, payload, payloadRef: null,
+                         tags: Dict = {}, payloadRef: string | null = null): Dict {
+  // SPEC §7.1: the tags are part of the signed record, canonical on the wire; `payloadRef`
+  // names a block (`z`) or a content root (`b`) when the payload travels outside the record.
+  const view: Dict = { entryId, spaceId, type: typeName, payload, payloadRef,
     issuer, issued, tags: canonicalMap(tags) };
   if (keyEpoch !== null) {
     view["keyEpoch"] = keyEpoch;
@@ -641,16 +670,16 @@ export function signState(dto: Dict, identity: Identity, agent: AgentIdentity | 
  * certificate covering its stamp attached, and the state agent-signed.
  */
 export function entryDelta(spaceName: string, group: string, typeName: string,
-                           payload: Uint8Array, identity: Identity,
+                           payload: Uint8Array | null, identity: Identity,
                            agentName: string, leaseMillis: number,
                            agent: AgentIdentity | null = null, nowMillis?: number,
-                           tags: Dict = {}):
+                           tags: Dict = {}, payloadRef: string | null = null):
     { entryId: string; body: Uint8Array } {
   const entryId = randomUuid();
   const spaceId = spaceIdLocal(`${group}/${spaceName}`);
   const issuer = agent !== null ? agent.agentId : identity.agent(agentName);
   const issued = hlcNow(issuer, nowMillis);
-  const view = signView(entryId, spaceId, typeName, payload, issuer, issued, null, tags);
+  const view = signView(entryId, spaceId, typeName, payload, issuer, issued, null, tags, payloadRef);
   let certificate: Dict | null = null;
   if (agent !== null) {
     certificate = agent.certificateCovering(hlcPhysical(issued));
@@ -662,7 +691,7 @@ export function entryDelta(spaceName: string, group: string, typeName: string,
   const expires = (nowMillis ?? Date.now()) + leaseMillis;
   const lease: Dict = { holder: issuer, expiresAtMillis: expires, kind: "WRITE" };
   const record: Dict = {
-    entryId, spaceId, type: typeName, payload, payloadRef: null, issuer,
+    entryId, spaceId, type: typeName, payload, payloadRef, issuer,
     issued, lease, tags: view["tags"], sig: signature,
   };
   const adds = [{ replica: identity.peerId, counter: 1 }];

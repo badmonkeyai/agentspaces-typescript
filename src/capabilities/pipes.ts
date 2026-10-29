@@ -30,8 +30,12 @@ export class Pipes {
     this.peer.pipeHandlers.set(capabilityType, handler);
   }
 
-  send(to: string, capabilityType: string, payload: Uint8Array): void {
-    this.peer.sendPipe(to, capabilityType, payload);
+  /**
+   * One frame to a member; `via` names the relays the member declared (its holding's `via` or
+   * its `relay.via` hint), extending the path a dial-only peer's seed carries it along (SPEC §5.4).
+   */
+  send(to: string, capabilityType: string, payload: Uint8Array, via: string[] | null = null): void {
+    this.peer.sendPipe(to, capabilityType, payload, via);
   }
 
   /**

@@ -142,6 +142,8 @@ the worker; the fleet sees one member whatever the number of tabs.
 | File | What it is |
 | --- | --- |
 | `src/page.ts` | The page side: `connect(options)` starts or joins the worker, says hello, asks `navigator.storage.persist()`, and returns a `BrowserHost` (`peerId`, `shared`, `instance`, `state`, `"state"` events) whose `space(name)` carries `write`, `entries`, `readAll`, `read`, `take`, `watch`, `events`, `notify`, and `renew` over the port; `RemoteTaken` (`complete`, `renew`) and `RemoteSubscription` (`"event"`, `"close"`, the async iterator, `renew`, `close`). Templates stay the core's `Template`, function matchers included: the host filters by schema, the page judges fields and tags, and a take claims the exact entry the page chose. |
+| `demo/swarm.ts`, `demo/swarm-page.ts` | The swarm demo (LB-C-06): a hub and two server peers hold one artifact; the page fetches it through its worker from all three, the hub directly and the servers through the hub as a relay, and draws the bytes from each. `npm run demo:swarm` prints the URL; `node build/demo/swarm.js --check` runs the page in headless Chromium and prints the outcome. |
+| `src/opfs.ts` | `OpfsStore`, the content swarm's piece store over the origin private file system (SPEC v0.1.23 §8): one directory per root with the pieces at their offsets, the verified bitfield, and the manifest, so a fetch resumes after a reload and a browser that holds an artifact serves it; reads answer later (the API is asynchronous on a page) and writes queue behind a memory copy that serves meanwhile; `OpfsStore.open(name)` reads every root back and throws where the API is absent, so a caller falls back to the core's `MemoryStore`. Build the swarm as `new Content(new Pipes(peer), new Space(peer, "content"), await OpfsStore.open())`. |
 | `src/worker.ts` | The worker entry (`@agentspaces/browser/worker`): detects its scope, builds one `ResidentHost`, serves each `onconnect` port of a SharedWorker or the own scope of a dedicated Worker, and closes a dedicated Worker once its page detaches. A custom worker script imports `ResidentHost` instead and calls `startResidentHost`, then `host.bind(agent)` for agents whose code lives in the worker. |
 | `src/host.ts` | `ResidentHost`: identity and agent key bootstrap under the identity lock, the Web Lock election, the peer with `js.residency=resident` in its hints, the snapshot restore, the port protocol, the pause rule, the drift rule (`observeCadence`, JS-R-06), and the tick (the cadence, lapsed members, anti-entropy, the advertisement, the EXPIRED and REAPPEARED sweep, keep-alive renewal of held claims at half-lease, the silent-page sweep, the periodic snapshot). |
 | `src/lock.ts` | `LockElection`: `acquire(name, waitMillis)` holds a lock for the host's life and refuses after the wait naming the lock; `withLock` is the bootstrap's critical section. The browser releases a lock when its holder's global dies, so the next tab's host takes over without a message. |
@@ -210,6 +212,27 @@ Options: `shared: false` forces a dedicated Worker (one page, its own host); `lo
 | JS-P-08 | Identity persistence through the `KeyStore` port, IndexedDB here | `host.test.ts` "mints its identity once" (`peer.key`, `peer.pub`, the agent key); `resident.test.ts` "keys persist across a reload" |
 | JS-P-01 | Neither entry imports a Node module | `portable.test.ts` |
 | JS-K-03 | This README | — |
+
+## The content swarm in the worker
+
+Connect with a `content` block and the resident host runs the content swarm
+(SPEC v0.1.23 §8) in its worker: pieces go to the origin private file system
+where the thread can write it and to memory otherwise, a fetch runs in the
+worker however many tabs watch it, and progress reaches each page as pushes.
+The bytes cross the port only when a page reads them.
+
+```ts
+const host = await connect({ group, seeds, worker: "/worker.js", content: { pieceSize: 256 * 1024 } });
+const final = await host.content.fetch(root, (p) => drawProgress(p.bytesReceived, p.bySource));
+const bytes = await host.content.read(root);
+const mine = await host.content.publish(bytes, { name: "notes.bin" });   // served from this worker
+```
+
+`host.content.list()` and `describe(root)` read the group's manifests;
+`(await host.status()).contentStore` says where the pieces live. The
+resident test runs a fetch from the hub and a publish back to it in every
+engine; Chromium and Firefox store on OPFS, Playwright's WebKit worker on
+memory.
 
 ## Run it
 

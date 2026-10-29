@@ -44,7 +44,8 @@ No Node module is imported under `src/`, so the package loads in browsers, Worke
   (`agentspaces-connect-core` `TypeScriptConnectorTest`) spawns `build/test/workers/connector-worker.js`
   and skips when it is absent unless `-Dtsclient.required=true`.
 - A result over `maxInlineResultBytes` (default the Java 64 KiB inline limit) is answered with an
-  error naming the limit: the TypeScript core carries no block exchange yet, so the content-addressed
+  error naming the limit: the connector runtime does not yet hand large results to the core's block
+  exchange or content swarm (`@agentspaces/client` speaks both since v0.1.23), so the content-addressed
   path of SPEC §6.1a is pending here; an all-TypeScript fleet may raise the option up to the frame cap.
 - Every bound is an option: `pollTimeout`, `queryLease`, `invokeLease`, `errorLease`,
   `maxInlineResultBytes`, `invocationRetention` (how long an answered invocation is remembered so a

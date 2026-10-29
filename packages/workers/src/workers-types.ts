@@ -95,7 +95,8 @@ export interface R2BucketLike {
   head(key: string): Promise<R2ObjectLike | null>;
   list(options?: { prefix?: string; limit?: number; cursor?: string }): Promise<{
     objects: R2ObjectLike[]; truncated: boolean; cursor?: string }>;
-  get(key: string): Promise<(R2ObjectLike & { arrayBuffer(): Promise<ArrayBuffer> }) | null>;
+  /** With `range`, the body is that slice of the object (the content swarm's piece reads, LB-C-05). */
+  get(key: string, options?: { range?: { offset: number; length: number } }): Promise<(R2ObjectLike & { arrayBuffer(): Promise<ArrayBuffer> }) | null>;
 }
 
 /** A Queue producer binding. */

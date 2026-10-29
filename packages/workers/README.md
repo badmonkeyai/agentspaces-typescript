@@ -131,6 +131,51 @@ example's type check), the root's `workerd` and `esbuild`.
   rows are bounded by the platform's per-value size, which is why the snapshot is chunked. Not run
   here: no account; `wrangler deploy` of `example/wrangler.json` is the documented path.
 
+## Artifacts from R2
+
+A cell can hold large objects in R2 and serve them to the fleet as artifacts of the content swarm
+(`aspace:cap/content-swarm`). The object stays in the bucket; the cell hashes it piece by piece
+through ranged gets, publishes a manifest, and answers each piece request with one ranged `get`.
+Members fetch the pieces through the hub like any other artifact, and verify every piece against
+the manifest's root.
+
+Bind the bucket in `wrangler.json`:
+
+```json
+"r2_buckets": [{ "binding": "MODELS", "bucket_name": "models" }]
+```
+
+Give the provider the swarm and a store over the same binding:
+
+```ts
+import { R2PieceStore } from "@agentspaces/workers";
+import { Space, capabilities } from "@agentspaces/client";
+
+export class Fleet extends AgentSpacesConnectorCell<Env> {
+  protected override providerOptions(env: Env) {
+    const store = new R2PieceStore(env.MODELS);
+    const content = new capabilities.Content(new capabilities.Pipes(this.peer),
+      new Space(this.peer, "content"), store, { pieceSize: 4 * 1024 * 1024 });
+    content.run(); // ticks the swarm on the peer's timer, as the Node test below does
+    return { artifacts: { content, store, pieceSize: 4 * 1024 * 1024 } };
+  }
+}
+```
+
+An R2 `get` whose body exceeds `maxInlineResultBytes` is then answered with the artifact's `root`
+and `pieces` instead of an error (the provider is built after the cell's peer, so `this.peer` is
+set), and `publishR2Object(content, store, key)` publishes an object
+directly. Choose the piece size so the object fits in 64 pieces: the table travels inline, so a
+4 MiB piece bounds an object at 256 MiB.
+
+To check it against a real `workerd`, deploy with `npx wrangler dev` (it runs `workerd` with a
+local R2), upload an object with `npx wrangler r2 object put models/checkpoint.bin --file ./ckpt.bin
+--local`, and point a Java or Node member at the hub the cell joins. The Java test
+`WorkersR2HolderTest` in `examples/example-29-content-swarm` runs the same store under Node over a
+bucket that answers ranged gets as R2 does (`build/test/workers/r2-holder.js`): the cell joins a
+Java hub on `ws`, publishes 3 MiB, and a Java member on `tcp` fetches every byte through the hub.
+It skips without `npm run build` here unless `-Dtsclient.required=true`.
+
 ## Notes
 
 - Build order: `npm run build` at the client root, then `packages/connect`, `packages/node`, then
@@ -144,7 +189,11 @@ example's type check), the root's `workerd` and `esbuild`.
 - `DataQueryClient` is pull-once: a result still inside its freshness window answers the identical
   query from the space; query another instance card, or wait the window, to force execution.
 - A result over `maxInlineResultBytes` (R2 `get`, a large read) is answered with an error naming
-  the limit: the TypeScript core carries no block exchange yet (as in `@agentspaces/connect`).
+  the limit, unless the provider is given `artifacts: { content, store }` with an `R2PieceStore`
+  over the same bucket: the object is then hashed piece by piece through ranged gets, published as
+  an artifact of the content swarm (`publishR2Object`), and the row carries its `root` and `pieces`;
+  members fetch the pieces from the cell, which serves each by a ranged `get` (LB-C-05, SPEC
+  v0.1.23 §8). The cell's own peer needs a `Content` over its `Pipes` and a `content` space.
 - Every bound is an option: `tickMillis`, `idleMillis`, `reconnectMillis`, `snapshotMillis`,
   `introduceMillis`, `busyWindowMillis`, `listLimit`, `maxInlineResultBytes`, the `once` retention,
   the runtime's leases and `invocationRetention`. No fleet-size cap exists.

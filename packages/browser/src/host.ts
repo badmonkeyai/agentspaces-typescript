@@ -34,13 +34,15 @@
  */
 
 import {
-  Binder, HttpDialer, Identity, Peer, Space, Template, WsDialer, bytes, cbor, parseSeed, platform,
+  Binder, HttpDialer, Identity, Peer, Space, Template, WsDialer, bytes, capabilities, cbor, parseSeed, platform,
 } from "@agentspaces/client";
 import type { AgentIdentity, BinderOptions, Bound, Repeating, Residency, Seed, SpaceEvent, Subscription } from "@agentspaces/client";
 import { IndexedDbKeyStore, STATE_STORE } from "./idb.js";
 import { Held, LockElection } from "./lock.js";
+import { OpfsStore } from "./opfs.js";
 import {
-  Answer, Envelope, HostConfig, HostState, PortLike, Push, Request, WireEntry, agentKeyName, databaseName,
+  Answer, ContentConfig, Envelope, HostConfig, HostState, PortLike, Push, Request, WireEntry, WireManifest, WireProgress,
+  agentKeyName, databaseName,
   identityLockName, lockName, packMap, PEER_KEY, PEER_PUB, SNAPSHOT, token, unpackMap,
 } from "./protocol.js";
 
@@ -137,6 +139,11 @@ export class ResidentHost {
   private readonly spaces = new Map<string, Space>();
   private readonly subscriptions = new Map<number, { subscription: Subscription<unknown>; port: PortLike }>();
   private readonly holds = new Map<string, Hold>();
+  /** The content swarm (LB-C-06), when the config asked for it; built at boot over OPFS or memory. */
+  content: capabilities.Content | null = null;
+  contentStore: string | null = null;
+  /** The fetches pages asked for, with the pages to tell. */
+  private readonly contentFetches = new Map<string, { fetch: capabilities.Fetch; ports: Set<PortLike>; lastPushed: number }>();
   /** The agents bound in this worker (`bind`), and those a drift suspended. */
   readonly bindings: Binding[] = [];
   readonly suspended: Binding[] = [];
@@ -309,6 +316,37 @@ export class ResidentHost {
       case "unwatch":
         this.subscriptions.get(request.sub)?.subscription.close("closed");
         return null;
+      case "contentPublish": {
+        this.requireRunning();
+        const manifest = this.requireContent().publish(request.bytes, { name: request.name, mediaType: request.mediaType,
+          pieceSize: request.pieceSize ?? undefined });
+        this.markDirty();
+        return ResidentHost.manifestOf(manifest);
+      }
+      case "contentFetch": {
+        const content = this.requireContent();
+        const fetch = content.fetch(request.root);
+        if (!fetch.done) {
+          let tracked = this.contentFetches.get(request.root);
+          if (tracked === undefined) {
+            tracked = { fetch, ports: new Set(), lastPushed: -1 };
+            this.contentFetches.set(request.root, tracked);
+          }
+          tracked.ports.add(port);
+        }
+        return this.progressOf(fetch);
+      }
+      case "contentRead": {
+        const store = this.requireContent().store;
+        return store instanceof OpfsStore ? await store.readArtifact(request.root) : store.readAll(request.root);
+      }
+      case "contentList":
+        return this.requireContent().listManifests().map((m) => ResidentHost.manifestOf(m));
+      case "contentDescribe": {
+        const described = this.requireContent().describe(request.root);
+        return described === null ? null : { manifest: ResidentHost.manifestOf(described["manifest"] as { [key: string]: unknown }),
+          completeHolders: described["completeHolders"], partialHolders: described["partialHolders"], held: described["held"] };
+      }
       default:
         throw new Error(`unknown request ${String((request as { t: unknown }).t)}`);
     }
@@ -382,6 +420,9 @@ export class ResidentHost {
     peer.timers = platform({ residency: "resident", keys: this.keys }).timers;
     peer.resourceHints["js.residency"] = "resident"; // JS-R-07: what this host is, for operators; never trusted for safety
     this.peer = peer;
+    if (config.content !== undefined) {
+      await this.buildContent(config.content, config.group, peer);
+    }
     await this.restoreSnapshot();
     this.started = true;
     this.reason = "no active page";
@@ -544,6 +585,10 @@ export class ResidentHost {
     for (const space of this.spaces.values()) {
       space.sweep();
     }
+    if (this.content !== null) {
+      this.content.tick();
+      this.pushContentProgress();
+    }
     this.renewHolds(now);
     this.sweepPages(now);
     const snapshotMillis = this.config?.snapshotMillis ?? DEFAULT_SNAPSHOT_MILLIS;
@@ -689,7 +734,66 @@ export class ResidentHost {
       peerId: this.identity?.peerId ?? "", group: this.config?.group ?? "", shared: this.shared,
       instance: this.instance, residency: this.residency, drifts: this.drifts, paused: this.paused,
       connected: this.connected, pages: pages.length, activePages: pages.filter((p) => p.active).length, reason: this.reason,
+      contentStore: this.contentStore,
     };
+  }
+
+  // ------------------------------------------------------------------ content (LB-C-06)
+
+  /** The swarm over OPFS where this thread can write it, over memory otherwise; ticked by the host. */
+  private async buildContent(config: ContentConfig, group: string, peer: Peer): Promise<void> {
+    let store: capabilities.PieceStore;
+    if ((config.store ?? "opfs") === "opfs") {
+      try {
+        store = await OpfsStore.open(config.storeName ?? `agentspaces-content:${group}`);
+        this.contentStore = "opfs";
+      } catch (e) {
+        this.log(`content store: OPFS unavailable (${e instanceof Error ? e.message : String(e)}); holding pieces in memory`);
+        store = new capabilities.MemoryStore();
+        this.contentStore = "memory";
+      }
+    } else {
+      store = new capabilities.MemoryStore();
+      this.contentStore = "memory";
+    }
+    this.content = new capabilities.Content(new capabilities.Pipes(peer), this.space(config.space ?? "content"), store, {
+      pieceSize: config.pieceSize, escalateAbove: config.escalateAbove });
+    this.log(`content swarm on ${this.contentStore}, ${store.roots().size} roots held`);
+  }
+
+  private requireContent(): capabilities.Content {
+    if (this.content === null) {
+      throw new Error("the content swarm is off in this host; connect with a content block");
+    }
+    return this.content;
+  }
+
+  private progressOf(fetch: capabilities.Fetch): WireProgress {
+    const p = fetch.progress();
+    return { root: fetch.root, piecesVerified: p.piecesVerified, pieces: p.pieces, bytesReceived: p.bytesReceived,
+      bySource: { ...p.bytesBySource }, done: fetch.done, failure: fetch.failure };
+  }
+
+  private static manifestOf(m: { [key: string]: unknown }): WireManifest {
+    return { root: String(m["root"]), name: (m["name"] as string | null) ?? null, size: Number(m["size"]),
+      pieces: Number(m["pieces"]), mediaType: (m["mediaType"] as string | null) ?? null };
+  }
+
+  /** On the tick: progress to the pages that asked, a final push and a forget once a fetch ends. */
+  private pushContentProgress(): void {
+    for (const [root, tracked] of this.contentFetches) {
+      const progress = this.progressOf(tracked.fetch);
+      if (!progress.done && progress.piecesVerified === tracked.lastPushed) {
+        continue; // nothing new: no push
+      }
+      tracked.lastPushed = progress.piecesVerified;
+      for (const port of tracked.ports) {
+        this.push(port, { ev: "content", progress });
+      }
+      if (progress.done) {
+        this.contentFetches.delete(root);
+      }
+    }
   }
 
   private broadcastState(): void {

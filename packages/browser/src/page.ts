@@ -30,7 +30,8 @@
 import { Emitter, Template, cbor, durationMillis, groupIdFromFounding, schemaOf, toPayload } from "@agentspaces/client";
 import type { Entry, EventKind, Residency, SpaceEvent } from "@agentspaces/client";
 import {
-  Answer, Envelope, HostConfig, HostState, PortLike, Push, Request, WireEntry, packMap, token, unpackMap,
+  Answer, Envelope, HostConfig, HostState, PortLike, Push, Request, WireEntry, WireManifest, WireProgress, packMap, token,
+  unpackMap,
 } from "./protocol.js";
 
 type Dict = { [key: string]: cbor.CborValue };
@@ -125,6 +126,9 @@ export class BrowserHost extends Emitter {
   private nextId = 1;
   private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
   private readonly subscriptions = new Map<number, RemoteSubscription<unknown>>();
+  /** The fetches this page waits on, by root (LB-C-06). */
+  private readonly contentWaiters = new Map<string, ContentWaiter[]>();
+  private remoteContent: RemoteContent | null = null;
   private readonly config: HostConfig;
   private active = true;
   private beat: unknown = null;
@@ -253,6 +257,9 @@ export class BrowserHost extends Emitter {
         this.state = push.state;
         this.emit("state", push.state);
         break;
+      case "content":
+        this.settleContent(push.progress);
+        break;
       default:
         break;
     }
@@ -297,6 +304,42 @@ export class BrowserHost extends Emitter {
 
   space(name: string): RemoteSpace {
     return new RemoteSpace(this, name);
+  }
+
+  /** The host's content swarm (LB-C-06); the host must have been connected with a `content` block. */
+  get content(): RemoteContent {
+    if (this.remoteContent === null) {
+      this.remoteContent = new RemoteContent(this);
+    }
+    return this.remoteContent;
+  }
+
+  /** @internal a waiter for a fetch's pushes. */
+  waitContent(root: string, waiter: ContentWaiter): void {
+    const list = this.contentWaiters.get(root) ?? [];
+    list.push(waiter);
+    this.contentWaiters.set(root, list);
+  }
+
+  /** @internal a progress push or answer: tell the waiters, settle them once the fetch ended. */
+  settleContent(progress: WireProgress): void {
+    const waiters = this.contentWaiters.get(progress.root);
+    if (waiters === undefined) {
+      return;
+    }
+    for (const waiter of waiters) {
+      waiter.onProgress?.(progress);
+    }
+    if (progress.done) {
+      this.contentWaiters.delete(progress.root);
+      for (const waiter of waiters) {
+        if (progress.failure === null) {
+          waiter.resolve(progress);
+        } else {
+          waiter.reject(new Error(`fetch of ${progress.root} failed: ${progress.failure}`));
+        }
+      }
+    }
   }
 
   /** @internal */
@@ -593,4 +636,54 @@ function decodeEntry<T>(template: Template<T>, wire: WireEntry): Entry<T> | null
   }
   return { entryId: wire.entryId, value: template.decode(payload), tags, issuer: wire.issuer,
     expiresAtMillis: wire.expiresAtMillis, completed: wire.completed, taken: wire.taken };
+}
+
+type ContentWaiter = { resolve: (p: WireProgress) => void; reject: (e: Error) => void; onProgress?: (p: WireProgress) => void };
+
+/**
+ * The content swarm of the resident host, from a page (srad/large-networks-bulk-data.md LB-C-06):
+ * a fetch runs in the worker over the origin private file system and its progress reaches the
+ * page as pushes; the bytes cross the port only when the page asks to read them.
+ */
+export class RemoteContent {
+  constructor(private readonly host: BrowserHost) {}
+
+  /** Publishes bytes as an artifact the fleet can fetch from this host. */
+  async publish(data: Uint8Array, options: { name?: string; mediaType?: string; pieceSize?: number } = {}): Promise<WireManifest> {
+    return await this.host.request({ t: "contentPublish", bytes: data, name: options.name ?? null,
+      mediaType: options.mediaType ?? null, pieceSize: options.pieceSize ?? null }) as WireManifest;
+  }
+
+  /**
+   * Fetches a root from every holder the host can reach; resolves with the final progress once
+   * every piece is verified and stored, rejects when the fetch fails. `onProgress` hears each
+   * step the host pushes.
+   */
+  fetch(root: string, onProgress?: (progress: WireProgress) => void): Promise<WireProgress> {
+    return new Promise((resolve, reject) => {
+      this.host.waitContent(root, { resolve, reject, onProgress });
+      this.host.request({ t: "contentFetch", root }).then(
+        (answer) => this.host.settleContent(answer as WireProgress),
+        (e: unknown) => {
+          this.host.settleContent({ root, piecesVerified: 0, pieces: 0, bytesReceived: 0, bySource: {}, done: true,
+            failure: e instanceof Error ? e.message : String(e) });
+        });
+    });
+  }
+
+  /** The bytes of an artifact this host holds in full. */
+  async read(root: string): Promise<Uint8Array> {
+    return await this.host.request({ t: "contentRead", root }, 120_000) as Uint8Array;
+  }
+
+  /** The artifacts announced in the group. */
+  async list(): Promise<WireManifest[]> {
+    return await this.host.request({ t: "contentList" }) as WireManifest[];
+  }
+
+  /** What the group knows about a root: its manifest and its holders; null when unknown. */
+  async describe(root: string): Promise<{ manifest: WireManifest; completeHolders: number; partialHolders: number; held: number } | null> {
+    return await this.host.request({ t: "contentDescribe", root }) as
+      { manifest: WireManifest; completeHolders: number; partialHolders: number; held: number } | null;
+  }
 }

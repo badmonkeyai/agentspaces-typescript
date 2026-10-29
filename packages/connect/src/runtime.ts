@@ -48,12 +48,13 @@ export const ASSET_CARD_TYPE = "AssetCard";
 export const DEFAULT_DATA_SPACE = "data";
 
 /**
- * The inline payload limit of a Java `EntryRecord` (SPEC §7.1): a result
- * above it travels content-addressed in Java. The TypeScript core carries no
- * block exchange yet, so a result above `maxInlineResultBytes` is answered
- * with an error naming the limit rather than written into a record Java
- * replicas would refuse; an all-TypeScript fleet may raise the option up to
- * the frame cap.
+ * The inline payload limit of a Java `EntryRecord` (SPEC §7.1): a result above it
+ * travels content-addressed. With a `Content` attached to the connector's peer
+ * (`@agentspaces/client` `capabilities.Content`) the write path carries a result of
+ * any size: as one block up to the swarm's escalation bound and as an artifact above
+ * it (srad/large-networks-bulk-data.md LB-E-05), so the limit is not applied. Without
+ * one, a result above `maxInlineResultBytes` is answered with an error naming the
+ * limit rather than written into a record peers could not fetch.
  */
 export const INLINE_PAYLOAD_LIMIT = 64 * 1024;
 
@@ -271,8 +272,8 @@ export class ConnectorRuntime {
       this.executed += 1;
       let result = new DataResult(hash, query.asset, answered.rows, answered.error, this.connectorName);
       const size = cbor.dumps(toPayload(result)).length;
-      if (size > this.maxInlineResultBytes) {
-        // The block path (SPEC §6.1a) is pending in the TypeScript core; name the limit instead.
+      if (size > this.maxInlineResultBytes && this.peer.content === null) {
+        // No content swarm on this peer: nothing would carry the bytes, so name the limit instead.
         result = new DataResult(hash, query.asset, [],
           `result of ${size} bytes exceeds the ${this.maxInlineResultBytes}-byte inline limit (maxInlineResultBytes)`,
           this.connectorName);

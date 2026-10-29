@@ -29,11 +29,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { StringMap } from "@agentspaces/connect";
+import { Identity, Peer, Space, capabilities } from "@agentspaces/client";
+import { R2PieceStore, publishR2Object } from "../src/content.js";
 import { INVOCATION_HEADER, WorkersAssetProvider, rowOf, rowsOf } from "../src/providers.js";
 import type { CellEnv } from "../src/workers-types.js";
 import { everything } from "./fixtures.js";
 
 /** Fake bindings recording every call. */
+/** The big object: three 64 KiB pieces and a tail, a byte pattern the swarm hashes. */
+const BIG = new Uint8Array(3 * 65_536 + 100).map((_, i) => (i * 7 + 3) & 0xff);
+
 function fakeEnv(): { env: CellEnv; calls: unknown[][]; fetches: { url: string; init: RequestInit }[] } {
   const calls: unknown[][] = [];
   const fetches: { url: string; init: RequestInit }[] = [];
@@ -62,11 +67,19 @@ function fakeEnv(): { env: CellEnv; calls: unknown[][]; fetches: { url: string; 
       bind: (...values: unknown[]) => ({ all: async () => { calls.push(["d1", sql, values]); return { results: [{ sku: values[0], price: 1.5 }] }; } }),
       all: async () => { calls.push(["d1", sql, []]); return { results: [{ sku: "A" }, { sku: "B" }] }; } }) },
     IMAGES: {
-      head: async (key: string) => { calls.push(["r2.head", key]); return { key, size: 3, etag: "e", uploaded: new Date(0) }; },
+      head: async (key: string) => { calls.push(["r2.head", key]); return key === "public/big"
+        ? { key, size: BIG.length, etag: "big-1", uploaded: new Date(0), httpMetadata: { contentType: "application/octet-stream" } }
+        : { key, size: 3, etag: "e", uploaded: new Date(0) }; },
       list: async (o: unknown) => { calls.push(["r2.list", o]); return { objects: [{ key: "public/x", size: 1, etag: "e", uploaded: new Date(0) }], truncated: false }; },
-      get: async (key: string) => { calls.push(["r2.get", key]); return key === "public/big"
-        ? { key, size: 100_000, etag: "e", uploaded: new Date(0), arrayBuffer: async () => new ArrayBuffer(100_000) }
-        : { key, size: 3, etag: "e", uploaded: new Date(0), httpMetadata: { contentType: "text/plain" }, arrayBuffer: async () => new Uint8Array([104, 105, 33]).buffer }; },
+      get: async (key: string, options?: { range?: { offset: number; length: number } }) => {
+        calls.push(["r2.get", key, ...(options === undefined ? [] : [options])]);
+        const whole = key === "public/big" ? BIG : new Uint8Array([104, 105, 33]);
+        const slice = options?.range === undefined ? whole : whole.subarray(options.range.offset, options.range.offset + options.range.length);
+        return key === "public/big"
+          ? { key, size: BIG.length, etag: "big-1", uploaded: new Date(0), httpMetadata: { contentType: "application/octet-stream" },
+            arrayBuffer: async () => slice.slice().buffer }
+          : { key, size: 3, etag: "e", uploaded: new Date(0), httpMetadata: { contentType: "text/plain" }, arrayBuffer: async () => slice.slice().buffer };
+      },
     },
     EVENTS: { send: async (message: unknown, options: unknown) => { calls.push(["queue.send", message, options]); } },
     RESTOCK: {
@@ -175,6 +188,7 @@ test("R2 answers head, list, and get with the body inline up to the limit (JS-C-
   assert.equal(got.rows[0]!["contentType"], "text/plain");
   const big = await p.query("r2/IMAGES", { op: "get", key: "public/big" });
   assert.match(String(big.error), /exceeds the 1000-byte inline limit \(maxInlineResultBytes\)/);
+  assert.match(String(big.error), /give the provider artifacts/);
   assert.match(String((await p.query("r2/IMAGES", { op: "get", key: "private/x" })).error), /prefixes/);
 });
 
@@ -241,4 +255,41 @@ test("the provider's cards and a refresh resolving listed instances (JS-C-08)", 
   const cards = p.describeAssets("zG", "zI", 0);
   assert.equal(cards.length, p.assetNames().length);
   assert.equal(cards.find((c) => c["asset"] === "do/Inventory/w-1")!["id"], "inventory:do/Inventory/w-1");
+});
+
+test("an R2 object above the inline limit becomes an artifact the cell serves by ranged get (LB-C-05)", async () => {
+  const fake = fakeEnv();
+  const peer = new Peer(Identity.generate(), "zWorkersContent");
+  const store = new R2PieceStore(fake.env["IMAGES"] as unknown as R2PieceStore["bucket"]);
+  const content = new capabilities.Content(new capabilities.Pipes(peer), new Space(peer, "content"), store, { pieceSize: 65_536 });
+  const p = new WorkersAssetProvider(fake.env, everything(), { maxInlineResultBytes: 1_000,
+    artifacts: { content, store, pieceSize: 65_536 } });
+  const got = await p.query("r2/IMAGES", { op: "get", key: "public/big" });
+  assert.equal(got.error, null);
+  const row = got.rows[0]!;
+  assert.ok(row["root"]!.startsWith("bafkrei"), "the row carries the artifact root");
+  assert.equal(row["pieces"], "4");
+  assert.equal(row["body"], undefined, "no body inline");
+  // hashed by four ranged gets, nothing whole
+  const ranged = fake.calls.filter((c) => c[0] === "r2.get" && c[1] === "public/big" && c.length === 3);
+  assert.equal(ranged.length, 4);
+  // the manifest is announced and the cell's holding is complete
+  const manifest = content.listManifests()[0]!;
+  assert.equal(manifest["root"], row["root"]);
+  assert.equal(manifest["name"], "public/big");
+  assert.equal(manifest["mediaType"], "application/octet-stream");
+  assert.equal(content.describe(String(manifest["root"]))!["completeHolders"], 1);
+  assert.equal(store.have(String(manifest["root"])).size, 4);
+  // a piece read is a ranged get of exactly the asked slice, verified against the table
+  const piece = await store.read(String(manifest["root"]), 3, 0, 65_536);
+  assert.equal(piece!.length, 100);
+  assert.ok(capabilities.verifies(manifest["table"] as Uint8Array, 3, piece!));
+  const mid = await store.read(String(manifest["root"]), 1, 1_000, 16);
+  assert.deepEqual(mid, BIG.subarray(65_536 + 1_000, 65_536 + 1_016));
+  // the same etag publishes once
+  const again = await publishR2Object(content, store, "public/big", { pieceSize: 65_536 });
+  assert.equal(again["root"], manifest["root"]);
+  assert.equal(content.listManifests().length, 1);
+  assert.throws(() => store.write(), /read-only/);
+  peer.close();
 });

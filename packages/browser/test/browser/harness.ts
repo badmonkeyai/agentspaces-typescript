@@ -24,7 +24,8 @@
  */
 
 import { Template, deriveId, entry } from "@agentspaces/client";
-import { BrowserHost, ConnectOptions, IndexedDbKeyStore, PEER_PUB, RemoteTaken, connect, databaseName, deleteDatabase } from "../../src/index.js";
+import { BrowserHost, ConnectOptions, IndexedDbKeyStore, OpfsStore, PEER_PUB, RemoteTaken, connect, databaseName, deleteDatabase, opfsAvailable } from "../../src/index.js";
+import { capabilities } from "@agentspaces/client";
 
 export const TASK = "com.acme.browser.Task#v1";
 
@@ -58,7 +59,108 @@ function dispatch(type: string, persisted: boolean): void {
 
 const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
+async function sha256Hex(data: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(data)));
+  return [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** The test pattern both sides compute: byte i is (i * 13 + seed) mod 256. */
+function patterned(size: number, seed: number): Uint8Array {
+  return new Uint8Array(size).map((_, i) => (i * 13 + seed) & 0xff);
+}
+
 export const harness = {
+  /**
+   * LB-C-06: a fetch in the resident host's worker, with the progress pushes it sent this page,
+   * the bytes read back across the port, and their digest.
+   */
+  async contentFetch(name: string, root: string): Promise<{ ok: true; size: number; sha256: string; pushes: number;
+      sources: string[]; store: string | null } | { ok: false; error: string }> {
+    try {
+      const h = host(name);
+      let pushes = 0;
+      const final = await h.content.fetch(root, () => { pushes += 1; });
+      const bytes = await h.content.read(root);
+      const state = await h.status();
+      return { ok: true, size: bytes.length, sha256: await sha256Hex(bytes), pushes,
+        sources: Object.keys(final.bySource), store: state.contentStore ?? null };
+    } catch (e) {
+      return { ok: false, error: message(e) };
+    }
+  },
+
+  /** LB-C-06: the page publishes a patterned artifact through the host; the hub fetches it from the worker. */
+  async contentPublish(name: string, size: number, seed: number): Promise<{ ok: true; root: string; sha256: string;
+      listed: boolean } | { ok: false; error: string }> {
+    try {
+      const h = host(name);
+      const data = patterned(size, seed);
+      const manifest = await h.content.publish(data, { name: "from-the-browser.bin", pieceSize: 64 * 1024 });
+      const listed = (await h.content.list()).some((m) => m.root === manifest.root);
+      return { ok: true, root: manifest.root, sha256: await sha256Hex(data), listed };
+    } catch (e) {
+      return { ok: false, error: message(e) };
+    }
+  },
+
+  /**
+   * The OPFS piece store (LB-C-01): a three-piece artifact written piece by piece, read back
+   * by range while queued and after it settled, the bitfield persisted, and a reopened store
+   * resuming with every piece; "unavailable" where the origin private file system is absent.
+   */
+  async opfsStore(): Promise<{ ok: true; detail: string } | { ok: false; error: string } | { ok: false; error: "unavailable" }> {
+    if (!opfsAvailable()) {
+      return { ok: false, error: "unavailable" };
+    }
+    let store: OpfsStore;
+    try {
+      await OpfsStore.erase("harness-content");
+      store = await OpfsStore.open("harness-content");
+    } catch (e) {
+      return { ok: false, error: "unavailable" }; // a page thread that can read but not write (Safari)
+    }
+    try {
+      const pieceSize = 64 * 1024;
+      const data = new Uint8Array(2 * pieceSize + 100).map((_, i) => (i * 31 + 7) & 0xff);
+      const table = capabilities.hashPieces(data, pieceSize);
+      const manifest = capabilities.manifest(capabilities.contentRoot(table), data.length, pieceSize, table, "zHarness", Date.now());
+      const root = String(manifest["root"]);
+      store.open(manifest);
+      for (let i = 0; i < 3; i++) {
+        store.write(root, i, data.subarray(i * pieceSize, Math.min(data.length, (i + 1) * pieceSize)));
+      }
+      const staged = await store.read(root, 2, 0, 4);
+      if (staged === null || staged.length !== 4 || staged[0] !== data[2 * pieceSize]) {
+        return { ok: false, error: "a staged read did not serve the piece" };
+      }
+      await store.settled(root);
+      if (store.have(root).size !== 3) {
+        return { ok: false, error: `have after settle: ${store.have(root).size}` };
+      }
+      const ranged = await store.read(root, 1, 1_000, 16);
+      for (let i = 0; i < 16; i++) {
+        if (ranged === null || ranged[i] !== data[pieceSize + 1_000 + i]) {
+          return { ok: false, error: "a file read did not match the piece" };
+        }
+      }
+      const whole = await store.readArtifact(root);
+      if (whole.length !== data.length || whole[whole.length - 1] !== data[data.length - 1]) {
+        return { ok: false, error: `the artifact read back ${whole.length} bytes` };
+      }
+      await store.close();
+      const reopened = await OpfsStore.open("harness-content");
+      const resumed = reopened.have(root).size;
+      const kept = reopened.manifest(root) !== null;
+      await reopened.close();
+      await OpfsStore.erase("harness-content");
+      if (resumed !== 3 || !kept) {
+        return { ok: false, error: `a reopened store resumed ${resumed} pieces, manifest ${kept}` };
+      }
+      return { ok: true, detail: `${store.mode}: 3 pieces, ${data.length} bytes, resumed after reopen` };
+    } catch (e) {
+      return { ok: false, error: message(e) };
+    }
+  },
   sharedWorkerAvailable(): boolean {
     return typeof (globalThis as { SharedWorker?: unknown }).SharedWorker === "function";
   },

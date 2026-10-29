@@ -26,14 +26,15 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node --test build/test/golden.test.js build/test/agents.test.js build/test/layer34.test.js build/test/layer4.test.js build/test/verbs.test.js build/test/robustness.test.js build/test/social.test.js build/test/beacon.test.js build/test/portable.test.js build/test/session.test.js build/test/verbs-residency.test.js build/test/filters.test.js build/test/serving.test.js build/test/framing.test.js build/test/host-links.test.js build/test/verbs-join.test.js build/test/verbs-reduce.test.js build/test/verbs-ordered.test.js build/test/browser.test.js build/test/runtimes.test.js",
+    "test": "tsc && node --test build/test/golden.test.js build/test/agents.test.js build/test/layer34.test.js build/test/layer4.test.js build/test/content.test.js build/test/verbs.test.js build/test/robustness.test.js build/test/social.test.js build/test/beacon.test.js build/test/portable.test.js build/test/session.test.js build/test/verbs-residency.test.js build/test/filters.test.js build/test/serving.test.js build/test/framing.test.js build/test/host-links.test.js build/test/verbs-join.test.js build/test/verbs-reduce.test.js build/test/verbs-ordered.test.js build/test/browser.test.js build/test/runtimes.test.js",
     "size": "tsc && node tools/size.mjs",
     "test:packages": "npm test --workspaces --if-present",
     "build:packages": "npm run build --workspaces --if-present"
   },
   "dependencies": {
     "@noble/curves": "^2.4.0",
-    "@noble/hashes": "^2.4.0"
+    "@noble/hashes": "^2.4.0",
+    "multiformats": "^14.0.5"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
