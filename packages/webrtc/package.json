@@ -1,6 +1,6 @@
 {
   "name": "@agentspaces/webrtc",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "The webrtc dialer and acceptor of the AgentSpaces JavaScript client (srad/agentspaces-js.md §3.4, §3.5, §4.3): RTCPeerConnection data channels with signalling over aspace:cap/rtc-signal and attestation by signed fingerprint.",
   "license": "Apache-2.0",
   "type": "module",

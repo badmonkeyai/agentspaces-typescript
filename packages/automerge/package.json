@@ -1,6 +1,6 @@
 {
   "name": "@agentspaces/automerge",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "automerge-repo NetworkAdapter over an AgentSpaces fleet (srad/agentspaces-js.md JS-S-01, JS-S-03): sync messages as signed PIPE_DATA frames of aspace:cap/automerge.",
   "license": "Apache-2.0",
   "type": "module",

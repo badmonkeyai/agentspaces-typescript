@@ -1,6 +1,6 @@
 {
   "name": "@agentspaces/yjs",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Yjs provider over an AgentSpaces fleet (srad/agentspaces-js.md JS-S-02, JS-S-03): y-protocols sync and awareness as signed PIPE_DATA frames of aspace:cap/yjs.",
   "license": "Apache-2.0",
   "type": "module",

@@ -1,6 +1,6 @@
 {
   "name": "@agentspaces/client",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Wire-compatible AgentSpaces peer in TypeScript: a portable core that loads in browsers, Workers, Deno, Bun, and Node; joins Java fleets, writes signed entries, takes under the claim lattice, reads spaces through anti-entropy.",
   "license": "Apache-2.0",
   "type": "module",

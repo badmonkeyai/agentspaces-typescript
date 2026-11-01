@@ -1,6 +1,6 @@
 {
   "name": "@agentspaces/node",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "The Node service host of the AgentSpaces client (srad/agentspaces-js.md JS-R-04): the tcp and ws listeners, the file key and log stores, the node:crypto port, a multi-connection member that serves anti-entropy, and the agentspaces-node CLI.",
   "license": "Apache-2.0",
   "type": "module",
