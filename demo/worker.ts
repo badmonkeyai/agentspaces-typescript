@@ -36,7 +36,9 @@ function sleep(millis: number): Promise<void> {
 }
 
 async function main(): Promise<number> {
-  const host = process.argv[2] ?? "127.0.0.1";
+  // "127.0.0.1" dials tcp; "tls://127.0.0.1" dials TLS 1.3 with this peer's channel certificate.
+  const [scheme, host] = (process.argv[2] ?? "127.0.0.1").includes("://")
+    ? (process.argv[2] as string).split("://", 2) : ["tcp", process.argv[2] ?? "127.0.0.1"];
   const port = Number(process.argv[3] ?? 7468);
   const identity = Identity.generate();
   const group = groupIdFromFounding("research-fleet-demo-v1");
@@ -46,12 +48,17 @@ async function main(): Promise<number> {
   // certifies and renews, so the fleet stores its work AGENT_ATTESTED.
   const agent = identity.renewingSubordinate("ts-worker", "PT24H");
   const peer = new Peer(identity, group);
-  await peer.connect(host, port);
+  await peer.connect(host, port, scheme);
+  if (scheme === "tls") {
+    console.log(`typescript worker on tls://${host}:${port}, the seed's channel certificate attested`);
+  }
   await sleep(1000);
 
   let completed = 0;
   let idleStrikes = 0;
-  const deadline = Date.now() + 90_000;
+  // AGENTSPACES_DEMO_DEADLINE (seconds) lets a larger fleet wait for its peers to
+  // join before the race starts (run-polyglot-test.sh); 90 s otherwise.
+  const deadline = Date.now() + 1000 * Number(process.env.AGENTSPACES_DEMO_DEADLINE ?? 90);
   while (idleStrikes < 2 && Date.now() < deadline) {
     const entryId = await peer.takeEntry("tasks", TASK_TYPE, "ts-worker",
       60_000, 600, 8_000, agent);

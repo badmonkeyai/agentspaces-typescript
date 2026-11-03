@@ -48,6 +48,26 @@ function sleep(millis: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, millis));
 }
 
+/**
+ * The join through a beacon document waits in slices of 1 s, 2 s, 4 s, then 5 s each inside
+ * its budget: the schedule of the Java join by id (ISSUE-BootstrapRobustness §9.4).
+ */
+const JOIN_SLICE_FIRST_MS = 1_000;
+const JOIN_SLICE_MAX_MS = 5_000;
+
+/**
+ * `Peer.bootstrap` spent its `joinTimeoutMs`: the message and the fields say how many times
+ * the document was fetched, how many seeds were dialed and how many of them connected, and
+ * `cause` is the last error.
+ */
+export class BootstrapTimeoutError extends Error {
+  constructor(message: string, readonly fetches: number, readonly dialed: number, readonly connected: number,
+    cause: unknown) {
+    super(message, { cause });
+    this.name = "BootstrapTimeoutError";
+  }
+}
+
 /** A join-by-GroupID in flight: the group wanted and its resolver (§10.1). */
 interface PendingFounding {
   group: string;
@@ -198,6 +218,10 @@ export class Peer {
   // ROBUSTNESS.md: late, replayed and unknown frames are the normal case; count, never fail.
   readonly frames = new wire.FrameFilter();
   readonly ignoredKinds = new Map<string, number>();
+  /** Frames accepted bare under the dialed channel's attestation (SPEC §5.6), after this peer's CHANNEL_HELLO. */
+  attestedFrames = 0;
+  /** The dialed channel a CHANNEL_HELLO went out on, so one announcement serves one connection. */
+  private helloSentOn: FrameChannel | null = null;
   malformedFrames = 0;
   // A lost socket is reconnected to the seeds in turn (the next seed first, a pause of
   // reconnectIntervalMs after every full round, for reconnectWindowMs) and the peer
@@ -248,9 +272,9 @@ export class Peer {
     return typeof ad?.["issuer"] === "string" ? ad["issuer"] : null;
   }
 
-  /** Dials the seed and introduces this peer to the group. */
-  async connect(host: string, port: number): Promise<void> {
-    await this.connectAny([{ host, port }]);
+  /** Dials the seed (`tcp` unless `scheme` says otherwise, `tls` for instance) and introduces this peer to the group. */
+  async connect(host: string, port: number, scheme?: string): Promise<void> {
+    await this.connectAny([scheme === undefined ? { host, port } : { host, port, scheme }]);
   }
 
   /**
@@ -395,25 +419,87 @@ export class Peer {
    * document's only group), verifies its founding advertisement with the
    * four checks `joinByGroupId` applies and, when `groupId` is given, that
    * it is exactly that group, then dials the document's seeds of every scheme
-   * this peer dials, in priority order, through {@link connectAny} (JS-P-07).
-   * Returns the group selected.
+   * this peer dials, in priority order (JS-P-07). Returns the group selected.
+   *
+   * `timeoutMs` (3 000 by default) bounds one fetch of the document and
+   * `joinTimeoutMs` (10 000) bounds the whole call. A first attempt that
+   * succeeds fetches once and dials once. Otherwise the call keeps asking
+   * inside the budget, in slices of 1 s, 2 s, 4 s, then 5 s each, the shape
+   * of the Java join by id (ISSUE-BootstrapRobustness FR-4): at the start of
+   * each slice it fetches the document again when the previous fetch left the
+   * beacon unavailable ({@link beacon.BeaconUnavailableError}) or the document
+   * named no seed this peer dials, and dials again, once per slice, every seed
+   * that refused. A beacon or a seed that starts a few seconds after this peer
+   * is reached on a later slice. A refusal (the scheme policy, a document or a
+   * founding that does not verify, a founding for another id, a group the
+   * document does not carry) rejects at once, as before. When the budget runs
+   * out the call rejects with {@link BootstrapTimeoutError}, whose message
+   * carries the number of fetches, the seeds dialed, how many connected, and
+   * the last error.
    */
   async bootstrap(url: string, options: {
     groupId?: string | null; name?: string | null; allowPlain?: boolean;
-    beaconPeer?: string | null; timeoutMs?: number; fetch?: typeof fetch;
+    beaconPeer?: string | null; timeoutMs?: number; joinTimeoutMs?: number; fetch?: typeof fetch;
   } = {}): Promise<beacon.BeaconGroup> {
-    const document = await beacon.fetchBeaconDocument(url, options);
-    const group = beacon.groupFromDocument(document, { groupId: options.groupId, name: options.name });
-    const wanted = beacon.bareGroupId(options.groupId) ?? beacon.bareGroupId(group.id);
-    const founding = this.verifyFounding(group, wanted);
-    this.group = founding.group;
-    this.founding = founding.signed;
-    const seeds = this.seedsOfGroup(group);
-    if (seeds.length === 0) {
-      throw new Error(`the beacon document lists no ${this.dialableSchemes().join(" or ")} seed for ${group.name}`);
+    const joinTimeoutMs = options.joinTimeoutMs ?? 10_000;
+    const attemptMs = options.timeoutMs ?? 3_000;
+    const deadline = Date.now() + joinTimeoutMs;
+    let fetches = 0;
+    const dialed = new Set<string>();
+    let lastError: unknown = null;
+    let group: beacon.BeaconGroup | null = null;
+    let seeds: Seed[] = [];
+    let slice = JOIN_SLICE_FIRST_MS;
+    for (;;) {
+      const started = Date.now();
+      if (seeds.length === 0) {
+        fetches += 1;
+        try {
+          const document = await beacon.fetchBeaconDocument(url,
+            { ...options, timeoutMs: Math.min(attemptMs, Math.max(deadline - started, 1)) });
+          const selected = beacon.groupFromDocument(document, { groupId: options.groupId, name: options.name });
+          const wanted = beacon.bareGroupId(options.groupId) ?? beacon.bareGroupId(selected.id);
+          const founding = this.verifyFounding(selected, wanted);
+          this.group = founding.group;
+          this.founding = founding.signed;
+          group = selected;
+          seeds = this.seedsOfGroup(selected);
+          if (seeds.length === 0) {
+            lastError = new Error(`the beacon document lists no ${this.dialableSchemes().join(" or ")} seed for ${selected.name}`);
+          }
+        } catch (e) {
+          if (!(e instanceof beacon.BeaconUnavailableError)) {
+            throw e; // a refusal: asking again would not change it
+          }
+          lastError = e; // the beacon is unreachable or answered an error: ask again
+        }
+      }
+      if (seeds.length > 0 && Date.now() < deadline) {
+        try {
+          await this.dialAny(seeds); // one dial per seed, in order
+          this.introduce();
+          this.pullRevocations();
+          return group as beacon.BeaconGroup;
+        } catch (e) {
+          lastError = e;
+        } finally {
+          for (const seed of this.seeds) {
+            dialed.add(seedUrl(seed));
+          }
+        }
+      }
+      const now = Date.now();
+      const wait = Math.min(slice - (now - started), deadline - now);
+      if (wait > 0) {
+        await sleep(wait);
+      }
+      if (Date.now() >= deadline) {
+        const last = lastError instanceof Error ? lastError.message : String(lastError);
+        throw new BootstrapTimeoutError(`no join through ${url} within ${joinTimeoutMs} ms: ${fetches} fetch(es), `
+          + `0 of ${dialed.size} seed(s) connected; last error: ${last}`, fetches, dialed.size, 0, lastError);
+      }
+      slice = Math.min(slice * 2, JOIN_SLICE_MAX_MS);
     }
-    await this.connectAny(seeds);
-    return group;
   }
 
   /**
@@ -667,6 +753,25 @@ export class Peer {
   /** Publishes this peer's leased self-advertisement (spec §5.2) on every link. */
   introduce(): void {
     this.send("RUMOR", this.selfAdRumor());
+    this.maybeAnnounceChannel();
+  }
+
+  /**
+   * On a dialed channel the transport attested (`tls`), announces once that this peer accepts
+   * channel-attested frames there (CHANNEL_HELLO, SPEC §5.6; PeerNode.maybeAnnounceChannel), so
+   * a Java node in ATTESTED or SESSION mode stops signing every frame toward it. The announcement
+   * travels signed, and this peer keeps signing what it sends. Nothing is announced in `signed` mode.
+   */
+  private maybeAnnounceChannel(): void {
+    const channel = this.channel;
+    const attested = channel?.attestedPeer() ?? null;
+    if (channel === null || attested === null || this.channelAuth === "signed" || this.helloSentOn === channel) {
+      return;
+    }
+    this.helloSentOn = channel;
+    const env = wire.envelope(this.group, "CHANNEL_HELLO", this.identity.peerId,
+      wire.hlcNow(this.identity.peerId, this.now()), wire.channelHelloBody(true, attested), attested);
+    channel.send(wire.encodeFrame(env, this.identity));
   }
 
   /** This peer's advertisement as of now: its endpoints, hints, and lease (whole seconds, as always stamped). */
@@ -1324,7 +1429,7 @@ export class Peer {
     }
     // The channel becomes this peer's link only once open: a refused dial ends too,
     // and that end must not start a second reconnect chain (one dial per interval).
-    const channel = await dialer.dial(seed);
+    const channel = await dialer.dial(seed, { identity: this.identity });
     if (!this.running) {
       channel.close(); // closed while dialing
       return;
@@ -1469,6 +1574,8 @@ export class Peer {
       this.malformedFrames += 1;
     } else if (decoded!.auth === "SESSION" && session !== null) {
       session.confirmed = true; // the other end holds the key: key confirmation (SPEC §5.6)
+    } else if (decoded!.auth === "ATTESTED") {
+      this.attestedFrames += 1;
     }
     if (this.accepts(env)) {
       try {
@@ -1522,7 +1629,7 @@ export class Peer {
           reintroduce = true; // after this frame's own answer, so a probe's ACK stays first
         }
       }
-      if (kind !== "RUMOR" && kind !== "SESSION_HELLO" && !relayed) {
+      if (kind !== "RUMOR" && kind !== "SESSION_HELLO" && kind !== "CHANNEL_HELLO" && !relayed) {
         this.maybeSessionHello(sender, link); // a frame past the introduction proves the member admitted us
       }
     }

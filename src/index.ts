@@ -42,7 +42,7 @@ import * as revocation from "./revocation.js";
 export { revocation };
 import * as wire from "./wire.js";
 export { wire };
-export { Peer } from "./peer.js";
+export { BootstrapTimeoutError, Peer } from "./peer.js";
 export type { InviteJoined } from "./peer.js";
 import * as social from "./social.js";
 export { social };

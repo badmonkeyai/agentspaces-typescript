@@ -11,6 +11,10 @@
       "types": "./build/src/index.d.ts",
       "default": "./build/src/index.js"
     },
+    "./routes": {
+      "types": "./build/src/routes.d.ts",
+      "default": "./build/src/routes.js"
+    },
     "./package.json": "./package.json"
   },
   "engines": {

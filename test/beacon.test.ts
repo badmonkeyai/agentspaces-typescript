@@ -33,7 +33,7 @@ import test from "node:test";
 import * as beacon from "../src/beacon.js";
 import { loads } from "../src/cbor.js";
 import { Identity } from "../src/identity.js";
-import { Peer } from "../src/peer.js";
+import { BootstrapTimeoutError, Peer } from "../src/peer.js";
 import * as social from "../src/social.js";
 import * as wire from "../src/wire.js";
 import type { Dict } from "../src/wire.js";
@@ -369,6 +369,160 @@ test("bootstrap fetches, verifies the founding against the wanted group, and con
   } finally {
     peer.close();
     seed.close();
+    pages.close();
+  }
+});
+
+// ------------------------------------------------- bootstrap keeps asking
+// The join through a document waits in slices inside joinTimeoutMs (the shape of the Java
+// join by id, ISSUE-BootstrapRobustness FR-4): a beacon or a seed that starts a few seconds
+// after the client is reached on a later slice; a budget that runs out rejects with the counts.
+
+const GOLDEN_ID = "aspace://" + GOLDEN["group_id"];
+
+function later(millis: number, action: () => void): void {
+  setTimeout(action, millis);
+}
+
+test("bootstrap that succeeds at once fetches once and dials once", async () => {
+  const seed = new FakeSeed();
+  await seed.listen();
+  const pages = new Pages();
+  await pages.listen();
+  const peer = new Peer(Identity.generate(), "zPlaceholder");
+  try {
+    pages.bodies.set(beacon.WELL_KNOWN, Buffer.from(beacon.documentJson(
+      beacon.signBeaconDocument(Identity.generate(), [goldenGroup([`127.0.0.1:${seed.port}`])]))));
+    const started = Date.now();
+    const group = await peer.bootstrap(pages.url(beacon.WELL_KNOWN), { groupId: GOLDEN_ID, allowPlain: true });
+    assert.ok(Date.now() - started < 1000, "no slice was waited");
+    assert.equal(group.name, "weekend-hack");
+    assert.equal(pages.requests.length, 1, "the document was fetched once");
+    assert.ok(await until(() => seed.kindsOn(0).length >= 1, 5000));
+    assert.equal(seed.connections.length, 1, "the seed was dialed once");
+  } finally {
+    peer.close();
+    seed.close();
+    pages.close();
+  }
+});
+
+test("bootstrap fetches again when the beacon answers late (an error, then the document)", async () => {
+  const seed = new FakeSeed();
+  await seed.listen();
+  const pages = new Pages(); // answers 404 until the body is set
+  await pages.listen();
+  const peer = new Peer(Identity.generate(), "zPlaceholder");
+  try {
+    later(300, () => pages.bodies.set(beacon.WELL_KNOWN, Buffer.from(beacon.documentJson(
+      beacon.signBeaconDocument(Identity.generate(), [goldenGroup([`127.0.0.1:${seed.port}`])])))));
+    const started = Date.now();
+    const group = await peer.bootstrap(pages.url(beacon.WELL_KNOWN), { groupId: GOLDEN_ID, allowPlain: true });
+    const elapsed = Date.now() - started;
+    assert.equal(group.name, "weekend-hack");
+    assert.equal(pages.requests.length, 2, "asked again on the second slice");
+    assert.ok(elapsed >= 900 && elapsed < 3000, `joined on the 1 s slice, took ${elapsed} ms`);
+    assert.ok(peer.connected());
+    assert.ok(await until(() => seed.kindsOn(0).length >= 1, 5000));
+  } finally {
+    peer.close();
+    seed.close();
+    pages.close();
+  }
+});
+
+test("bootstrap fetches again when the document names no seed yet, and a stubbed fetch counts", async () => {
+  const seed = new FakeSeed();
+  await seed.listen();
+  const peer = new Peer(Identity.generate(), "zPlaceholder");
+  const documents = [
+    [goldenGroup([])],
+    [goldenGroup([`127.0.0.1:${seed.port}`])],
+  ];
+  const requested: string[] = [];
+  const serve: typeof fetch = async (input) => {
+    requested.push(String(input));
+    const groups = documents.length > 1 ? documents.shift() as beacon.BeaconGroup[] : documents[0];
+    const document = beacon.signBeaconDocument(Identity.generate(), groups);
+    return new Response(beacon.documentJson(document), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const group = await peer.bootstrap("https://beacon.example/.well-known/agentspaces/beacon.json",
+      { groupId: GOLDEN_ID, fetch: serve });
+    assert.equal(requested.length, 2, "the empty seed list was asked again");
+    assert.equal(group.seeds.length, 1, "the group of the document that named the seed");
+    assert.ok(peer.connected());
+    assert.equal(peer.group, GOLDEN["group_id"]);
+  } finally {
+    peer.close();
+    seed.close();
+  }
+});
+
+test("bootstrap dials again a seed that starts late on the address the document names", async () => {
+  const dead = await deadPort();
+  const pages = new Pages();
+  await pages.listen();
+  pages.bodies.set(beacon.WELL_KNOWN, Buffer.from(beacon.documentJson(
+    beacon.signBeaconDocument(Identity.generate(), [goldenGroup([`127.0.0.1:${dead}`])]))));
+  const late = new FakeSeed();
+  const peer = new Peer(Identity.generate(), "zPlaceholder");
+  try {
+    later(400, () => void late.listen(dead));
+    const started = Date.now();
+    await peer.bootstrap(pages.url(beacon.WELL_KNOWN), { groupId: GOLDEN_ID, allowPlain: true });
+    const elapsed = Date.now() - started;
+    assert.equal(pages.requests.length, 1, "a document that named a seed is not fetched again");
+    assert.ok(elapsed >= 900 && elapsed < 3000, `reached on the second slice, took ${elapsed} ms`);
+    assert.ok(peer.connected());
+    assert.ok(await until(() => late.kindsOn(0).length >= 1, 5000));
+    assert.equal(late.connections.length, 1, "one dial per slice reached it");
+  } finally {
+    peer.close();
+    late.close();
+    pages.close();
+  }
+});
+
+test("bootstrap reports the counts when the budget is spent, and finishes near the budget", async () => {
+  const dead = await deadPort();
+  const pages = new Pages();
+  await pages.listen();
+  pages.bodies.set(beacon.WELL_KNOWN, Buffer.from(beacon.documentJson(
+    beacon.signBeaconDocument(Identity.generate(), [goldenGroup([`127.0.0.1:${dead}`])]))));
+  const peer = new Peer(Identity.generate(), "zPlaceholder");
+  try {
+    const started = Date.now();
+    await assert.rejects(peer.bootstrap(pages.url(beacon.WELL_KNOWN),
+      { groupId: GOLDEN_ID, allowPlain: true, joinTimeoutMs: 1500 }), (e: unknown) => {
+      assert.ok(e instanceof BootstrapTimeoutError, String(e));
+      assert.equal(e.fetches, 1);
+      assert.equal(e.dialed, 1);
+      assert.equal(e.connected, 0);
+      assert.match(e.message, /within 1500 ms: 1 fetch\(es\), 0 of 1 seed\(s\) connected; last error: no seed answered/);
+      return true;
+    });
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed >= 1400 && elapsed < 2500, `finished near the budget, took ${elapsed} ms`);
+    assert.equal(pages.requests.length, 1, "the document named a seed, so it was not fetched again");
+    assert.ok(!peer.connected());
+
+    // A beacon that never answers: fetched at 0 s and at 1 s, nothing dialed.
+    const failing: typeof fetch = async () => { throw new TypeError("fetch failed"); };
+    await assert.rejects(peer.bootstrap("https://beacon.example/.well-known/agentspaces/beacon.json",
+      { groupId: GOLDEN_ID, joinTimeoutMs: 1500, fetch: failing }), (e: unknown) => {
+      assert.ok(e instanceof BootstrapTimeoutError);
+      assert.equal(e.fetches, 2);
+      assert.match(e.message, /2 fetch\(es\), 0 of 0 seed\(s\) connected; last error: GET .* failed: fetch failed/);
+      return true;
+    });
+    // A refusal rejects at once, as before: the founding is for another id.
+    const refusedAt = Date.now();
+    await assert.rejects(peer.bootstrap(pages.url(beacon.WELL_KNOWN), { groupId: "zOther", allowPlain: true }),
+      /carries no group/);
+    assert.ok(Date.now() - refusedAt < 500, "no slice was waited on a refusal");
+  } finally {
+    peer.close();
     pages.close();
   }
 });

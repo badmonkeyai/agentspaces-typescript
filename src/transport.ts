@@ -25,6 +25,7 @@
 
 import { Seed } from "./seed.js";
 
+import type { Identity } from "./identity.js";
 export type { Seed } from "./seed.js";
 
 /** One reliable, ordered, whole-frame connection. */
@@ -45,6 +46,9 @@ export interface FrameChannel {
   close(): void;
 }
 
+/** What a `Peer` hands its dialers: the identity a binding may present (the `tls` channel certificate). */
+export type DialContext = { identity?: Identity };
+
 /** Opens channels for one scheme. */
 export interface Dialer {
   readonly scheme: string;
@@ -54,8 +58,8 @@ export interface Dialer {
    * seed itself.
    */
   expand?(seed: Seed, resolve: boolean): Promise<Seed[]>;
-  /** Opens a channel, or rejects with the dial's error. */
-  dial(seed: Seed): Promise<FrameChannel>;
+  /** Opens a channel, or rejects with the dial's error; `context` names the dialing peer's identity. */
+  dial(seed: Seed, context?: DialContext): Promise<FrameChannel>;
 }
 
 /** Accepts channels for one scheme; only service hosts register one (JS-H-11). */
@@ -72,6 +76,7 @@ const defaults = new Map<string, Dialer>();
 /** The package that dials each scheme the design names, for the refusal of JS-Q-AVL-03. */
 export const DIALER_PACKAGES: { [scheme: string]: string } = {
   tcp: "@agentspaces/client/node or @agentspaces/node",
+  tls: "@agentspaces/client/node or @agentspaces/node",
   ws: "@agentspaces/client",
   wss: "@agentspaces/client",
   http: "@agentspaces/client",

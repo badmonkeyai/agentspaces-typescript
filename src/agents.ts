@@ -105,6 +105,25 @@ function mark(binding: Binding): MethodDecorator {
 }
 
 /** Names the agent, as `@AgentSpec` does: the card's name, description, and goals. */
+const DATA_USE = Symbol.for("agentspaces.dataUse");
+export const DATA_USE_TYPE = "https://badmonkey.ai/console#DataUse";
+export const CATALOG_SPACE = "catalog";
+
+/** One declared source (the console's data catalog, SRAD bma-spiral1-console §3.4). */
+export type DataUseDecl = { reads?: string[]; writes?: string[]; source: string; sensitivity?: string; freshness?: string };
+
+/**
+ * Declares what the agent reads from a source that is not a space (S1-G-09): on bind the binder writes one
+ * `DataUse` entry per declaration into the group's `catalog` space under the card TTL and renews it at half-TTL
+ * while the agent stays bound. Stack it for several sources.
+ */
+export function dataUse(decl: DataUseDecl) {
+  return (value: unknown, _context?: unknown): void => {
+    const holder = value as unknown as { [DATA_USE]?: DataUseDecl[] };
+    holder[DATA_USE] = [...(holder[DATA_USE] ?? []), decl];
+  };
+}
+
 export function agent(name: string, options: { description?: string; goals?: string[] } = {}) {
   return <C extends Class>(value: C, _context?: ClassDecoratorContext): C => {
     (value as unknown as { [SPEC]?: Spec })[SPEC] = { name, description: options.description ?? "",
@@ -299,6 +318,8 @@ export function onDecision(space: string, options: { prefix?: string; resultSpac
 /** A bound agent: its loops, watches, and join and reduce bindings, closed together. */
 export class Bound {
   card: Dict | null = null;
+  /** The `DataUse` entry ids the binder declared and renews (S1-G-09). */
+  readonly dataUse: string[] = [];
   running = true;
   readonly loops: Promise<void>[] = [];
   readonly subscriptions: Array<{ close(): void }> = [];
@@ -401,7 +422,31 @@ export class Binder {
     if (this.publishCard) {
       bound.card = this.publish(spec, consumes, produces, spaceBindings, actions);
     }
+    this.declareDataUse(bound, type as unknown as { [DATA_USE]?: DataUseDecl[] }, spec.name);
     return bound;
+  }
+
+  // ------------------------------------------------------------- data use
+
+  /** The `dataUse` carrier (S1-G-09): leased `DataUse` entries in `catalog`, renewed at half the card TTL. */
+  private declareDataUse(bound: Bound, type: { [DATA_USE]?: DataUseDecl[] }, name: string): void {
+    const declared = type[DATA_USE];
+    if (!declared || declared.length === 0) {
+      return;
+    }
+    const ttl = durationMillis(this.cardTtl);
+    for (const use of declared) {
+      const payload: Dict = { schemaVersion: 1, agent: name, peer: this.peer.identity.peerId, reads: use.reads ?? [],
+        writes: use.writes ?? [], source: use.source, sensitivity: use.sensitivity ?? "", freshness: use.freshness ?? "",
+        declaredBy: "decorator" };
+      bound.dataUse.push(this.peer.writeEntry(CATALOG_SPACE, DATA_USE_TYPE, payload, this.agentName, ttl, this.agent));
+    }
+    const renewal = this.peer.every(Math.max(250, Math.floor(ttl / 2)), () => {
+      for (const id of bound.dataUse) {
+        this.peer.renewEntry(CATALOG_SPACE, id, ttl, this.agent);
+      }
+    });
+    bound.subscriptions.push({ close: () => renewal.stop() });
   }
 
   private start(bound: Bound, instance: object, methods: Array<[string, Method, Binding]>, consumes: string[],

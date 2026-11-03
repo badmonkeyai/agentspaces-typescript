@@ -339,6 +339,11 @@ export function rumorBody(streamId: string, itemId: string, hops: number,
   return dumps({ streamId, itemId, hopsRemaining: hops, payload });
 }
 
+/** Bodies.ChannelHello (SPEC §5.6): this peer accepts channel-attested frames on the connection whose remote end it attested as `attestedRemote`. */
+export function channelHelloBody(acceptsBare: boolean, attestedRemote: string): Uint8Array {
+  return dumps({ acceptsBare, attestedRemote });
+}
+
 export function digestBody(digests: Dict): Uint8Array {
   return dumps({ digests });
 }

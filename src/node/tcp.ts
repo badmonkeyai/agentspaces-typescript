@@ -25,12 +25,12 @@ import { lookup } from "node:dns/promises";
 import { AddressInfo, Server, Socket, connect, createServer, isIP } from "node:net";
 import { concat, int32be, readInt32be } from "../bytes.js";
 import { Seed, seedAddress } from "../seed.js";
-import { ChannelEvents, Dialer, FrameChannel, Listener, ListenerHandle } from "../transport.js";
+import { ChannelEvents, DialContext, Dialer, FrameChannel, Listener, ListenerHandle } from "../transport.js";
 import { MAX_FRAME_BYTES } from "../wire.js";
 
 /** One TCP connection carrying length-prefixed frames. */
 export class TcpChannel implements FrameChannel {
-  readonly scheme = "tcp";
+  readonly scheme: string = "tcp";
   private readonly events = new ChannelEvents();
 
   constructor(private readonly socket: Socket, readonly remote: string) {
@@ -120,7 +120,7 @@ export class TcpChannel implements FrameChannel {
 
 /** Dials `tcp` seeds; a hostname expands to one seed per resolved address (DB-X-03). */
 export class TcpDialer implements Dialer {
-  readonly scheme = "tcp";
+  readonly scheme: string = "tcp";
 
   /** DB-X-03: a hostname becomes one seed per address it resolves to, in the resolver's order. */
   async expand(seed: Seed, resolve: boolean): Promise<Seed[]> {
@@ -134,7 +134,7 @@ export class TcpDialer implements Dialer {
     return addresses.map((a) => ({ ...seed, host: a.address }));
   }
 
-  dial(seed: Seed): Promise<FrameChannel> {
+  dial(seed: Seed, _context?: DialContext): Promise<FrameChannel> {
     return new Promise((resolve, reject) => {
       // The channel exists only once connected: a refused dial also emits close,
       // and that close must reach nobody (one reconnect chain per peer).

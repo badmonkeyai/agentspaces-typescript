@@ -72,7 +72,9 @@ class Councillor {
 const sleep = (millis: number) => new Promise((resolve) => setTimeout(resolve, millis));
 
 async function main(): Promise<number> {
-  const host = process.argv[2] ?? "127.0.0.1";
+  // "127.0.0.1" dials tcp; "tls://127.0.0.1" dials TLS 1.3 with this peer's channel certificate.
+  const [scheme, host] = (process.argv[2] ?? "127.0.0.1").includes("://")
+    ? (process.argv[2] as string).split("://", 2) : ["tcp", process.argv[2] ?? "127.0.0.1"];
   const port = Number(process.argv[3] ?? 7470);
   const value = Number(process.argv[4] ?? 30);
   const maxSeconds = Number(process.argv[5] ?? 90);
@@ -81,7 +83,7 @@ async function main(): Promise<number> {
   console.log(`typescript council worker ${identity.peerId}`);
   const agentIdentity = identity.renewingSubordinate("ts-worker", "PT24H");
   const peer = new Peer(identity, group);
-  await peer.connect(host, port);
+  await peer.connect(host, port, scheme);
   await sleep(1000);
   peer.pullAds();
   const pipes = new Pipes(peer);

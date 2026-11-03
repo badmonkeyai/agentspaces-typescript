@@ -131,6 +131,47 @@ example's type check), the root's `workerd` and `esbuild`.
   rows are bounded by the platform's per-value size, which is why the snapshot is chunked. Not run
   here: no account; `wrangler deploy` of `example/wrangler.json` is the documented path.
 
+## Routes for the Java connector
+
+When the Java connector (`agentspaces-connect-celld`) serves a deployment from beside it,
+`@agentspaces/workers/routes` gives the Worker the routes its object sources, change notices, and
+artifact inputs read:
+
+```typescript
+import { once } from "@agentspaces/workers";
+import { ChangeLog, receiveArtifact, serveChangeStream, serveRange } from "@agentspaces/workers/routes";
+
+export class Stock {
+  private readonly log: ChangeLog;
+  constructor(private readonly ctx: DurableObjectState, private readonly env: Env) {
+    this.log = new ChangeLog(ctx.storage.sql);
+  }
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/api/models/object") {
+      return serveRange(this.env.MODELS, request, url.searchParams.get("key") ?? "");   // 206, 412, 416
+    }
+    if (url.pathname === "/api/changes") return this.log.respond(request);          // ?after=&limit=
+    if (url.pathname === "/api/changes/stream") return serveChangeStream(this.log, request);
+    if (url.pathname === "/api/ingest") {
+      const id = request.headers.get("Aspace-Invocation-Id")!;
+      return Response.json(await once(this.ctx.storage, id, () =>
+        receiveArtifact(request, this.env.INGEST, `ingest/${request.headers.get("Aspace-Content-Root")}`)));
+    }
+    // ... a write records its change in the same storage:
+    // this.log.record({ kind: "upsert", route: "stock", key: sku, row: { sku, qty: String(qty) } });
+    return new Response("not found", { status: 404 });
+  }
+}
+```
+
+`serveRange` answers `Range` with 206 and `Content-Range`, a failed `If-Match` with 412, and a
+range past the end with 416. `ChangeLog` keeps the log in the object's SQLite; a first caller with
+no cursor starts at the end. `serveChangeStream` sends each change after `Last-Event-ID` with a
+keep-alive comment every 30 s, so celld never sees the stream idle. `receivePiece` takes the
+connector's chunked steps (`Aspace-Upload: piece | finish`) and stores the pieces as separate
+objects, because an R2 multipart upload needs parts of 5 MiB or more.
+
 ## Artifacts from R2
 
 A cell can hold large objects in R2 and serve them to the fleet as artifacts of the content swarm

@@ -400,11 +400,27 @@ export interface FetchOptions {
 }
 
 /**
+ * The beacon did not give a document: the GET failed (the host is down, the name does not
+ * resolve, the per-attempt timeout passed) or it answered a status other than 2xx. A caller
+ * with time left may ask again; `Peer.bootstrap` does. Every other failure of
+ * {@link fetchBeaconDocument} (the scheme policy, the size cap, the shape, the signature,
+ * the pin) is a plain `Error` and is a refusal that asking again would not change.
+ */
+export class BeaconUnavailableError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "BeaconUnavailableError";
+  }
+}
+
+/**
  * Fetches a beacon document and verifies it: `https://` unless `allowPlain`,
  * at most {@link MAX_DOCUMENT_BYTES}, parsed with unknown fields ignored,
  * and the signature verified under the carried key, which must hash to the
  * carried issuer and, when `beaconPeer` pins it, to that PeerId. Rejects on
- * any failure: a reader never acts on an unverified document.
+ * any failure: a reader never acts on an unverified document. A GET that
+ * fails or answers a status other than 2xx rejects with
+ * {@link BeaconUnavailableError}.
  */
 export async function fetchBeaconDocument(url: string, options: FetchOptions = {}): Promise<BeaconDocument> {
   const target = new URL(url);
@@ -417,11 +433,17 @@ export async function fetchBeaconDocument(url: string, options: FetchOptions = {
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 10_000);
   let bytes: Uint8Array;
   try {
-    const response = await doFetch(target, {
-      signal: controller.signal, redirect: "error", headers: { accept: "application/json" },
-    });
+    let response: Response;
+    try {
+      response = await doFetch(target, {
+        signal: controller.signal, redirect: "error", headers: { accept: "application/json" },
+      });
+    } catch (e) {
+      throw new BeaconUnavailableError(`GET ${target} failed: ${e instanceof Error ? e.message : String(e)}`,
+        { cause: e });
+    }
     if (!response.ok) {
-      throw new Error(`GET ${target} answered ${response.status}`);
+      throw new BeaconUnavailableError(`GET ${target} answered ${response.status}`);
     }
     const declared = Number(response.headers.get("content-length") ?? 0);
     if (declared > MAX_DOCUMENT_BYTES) {

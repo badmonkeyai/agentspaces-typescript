@@ -26,14 +26,19 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { ContextStore, installContextStores } from "../emitter.js";
 import { registerDefaultDialer } from "../transport.js";
 import { TcpDialer } from "./tcp.js";
+import { TlsDialer } from "./tls.js";
 
 registerDefaultDialer(new TcpDialer());
+registerDefaultDialer(new TlsDialer());
 installContextStores(<T>(): ContextStore<T> => {
   const storage = new AsyncLocalStorage<T>();
   return { get: () => storage.getStore(), run: (value, fn) => storage.run(value, fn) };
 });
 
 export { TcpChannel, TcpDialer, TcpListener } from "./tcp.js";
+export { TlsChannel, TlsDialer, TlsListener, channelCredential } from "./tls.js";
+export { attestChannelCertificate, buildChannelCertificate, generateChannelCertificate } from "./channel-certificate.js";
+export type { ChannelCertificate } from "./channel-certificate.js";
 export { FileKeyStore, agentKeys, loadOrCreateIdentity, savePkcs8, writeKeyFile } from "./keystore.js";
 export { nodeCrypto } from "./crypto.js";
 export { FileStore } from "./content-store.js";

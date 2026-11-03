@@ -65,7 +65,7 @@ The first run creates a `keys/` directory beside `seed.yaml` to hold the seed's 
 
 ```typescript
 import { Binder, Identity, Peer, Space, Template, agent, entry, groupIdFromFounding, spaceTake } from "@agentspaces/client";
-import "@agentspaces/client/node"; // Node: registers the tcp dialer
+import "@agentspaces/client/node"; // Node: registers the tcp and tls dialers
 
 @entry("shop.Order#v1") // the wire name; field names match the wire too
 class Order {
@@ -130,7 +130,7 @@ leans on ping liveness and does not.)
 
 ```ts
 import { Peer, Identity } from "@agentspaces/client";   // every runtime
-import "@agentspaces/client/node";                      // Node: registers the tcp dialer
+import "@agentspaces/client/node";                      // Node: registers the tcp and tls dialers
 const peer = new Peer(Identity.generate(), groupId);
 await peer.connect("seed.example.com", 7500);
 ```
@@ -142,7 +142,7 @@ await peer.connect("seed.example.com", 7500);
 
 | 0.2.0 | 0.4.0 |
 |---|---|
-| TCP dialing built into `Peer` | `import "@agentspaces/client/node"` registers the `tcp` dialer; `peer.registerDialer(d)` adds others; seeds carry a `scheme` (`tcp` when absent) |
+| TCP dialing built into `Peer` | `import "@agentspaces/client/node"` registers the `tcp` and `tls` dialers; `peer.registerDialer(d)` adds others; seeds carry a `scheme` (`tcp` when absent) |
 | `Identity.loadOrCreate(dir)`, `Identity.agentKeys(...)`, `identity.savePkcs8(path)` | `loadOrCreateIdentity(dir)`, `agentKeys(...)`, `savePkcs8(identity, path)` from `@agentspaces/client/node` |
 | `Buffer` in and out (`dumps`, frames, bodies, views) | plain `Uint8Array`; `bytes` helpers (`toHex`, `fromHex`, `toBase64`, `fromBase64`, `concat`, `equals`) |
 | `node:crypto` Ed25519, SHA-256, HKDF | the installed `CryptoPort`: noble by default, `installCrypto(nodeCrypto)` on Node for OpenSSL |
@@ -423,6 +423,20 @@ await peer.bootstrap("https://agentspaces.corp.example/.well-known/agentspaces/b
   { groupId: "aspace://z7f3a...", beaconPeer: "z6Mk...beaconPeerId" });
 ```
 
+`bootstrap` keeps asking inside a budget, as the Java join by id does.
+`timeoutMs` (3 000) bounds one fetch of the document and `joinTimeoutMs`
+(10 000) bounds the whole call. A first attempt that succeeds fetches once and
+dials once. Otherwise the call works in slices of 1 s, 2 s, 4 s, then 5 s
+each: at the start of each slice it fetches the document again when the
+beacon was unreachable or answered an error (`beacon.BeaconUnavailableError`)
+or the document named no seed this peer dials, and it dials again, once per
+slice, every seed that refused, so a beacon or a seed that starts a few
+seconds after the peer (the usual case in Compose and Kubernetes) is reached
+on a later slice. A refusal (a document or a founding that does not verify, a
+founding for another id) rejects at once. When the budget runs out the call
+rejects with `BootstrapTimeoutError` (`fetches`, `dialed`, `connected`, and
+the last error as `cause`), and its message carries the same counts.
+
 `connectAny(seeds)` is what `bootstrap` ends in and `connect(host, port)` is
 now built on: the seeds are dialed in order (a hostname becomes one seed per
 address it resolves to), and a lost socket fails over to the next seed
@@ -560,6 +574,30 @@ its links, forwards relayed frames to the members on its links or to the
 next relay a frame's path names, and keeps one session per link. Not here:
 the gossip-learning exchange (its payload is encoded and golden-pinned); the
 Raft voter is `@agentspaces/ordered`.
+
+### The tls binding
+
+In Node, `import "@agentspaces/client/node"` registers the `tls` dialer
+beside `tcp`. `peer.connect(host, port, "tls")`, or a `tls://host:port`
+seed in `connectAny`, a beacon document, or an invite, dials TLS 1.3 with a
+channel certificate: a fresh P-256 key in a certificate the peer's Ed25519
+identity key signs, the identity key in the CN (SPEC §5.6, mirroring Java's
+`ChannelCertificate`; Node has no X.509 builder, so
+`src/node/channel-certificate.ts` assembles it in DER). The dialer attests
+the seed from the certificate it presents and refuses one that attests
+nobody, so a Java node built with `requireAttestation(true)` admits the peer.
+On an attested channel the peer announces `CHANNEL_HELLO` once, so a Java
+node in ATTESTED or SESSION mode stops signing every frame toward it, and it
+accepts the bare frames that follow from exactly the attested sender
+(`peer.attestedFrames`); it keeps signing what it sends. A `Dialer` now
+receives a `DialContext` with the peer's identity, which is how the `tls`
+dialer finds the certificate to present. `TlsListener(identity)` accepts
+`tls` channels for a host, asking each client for its certificate without
+requiring one (a client without one connects unattested). The binding is
+Node only, like `tcp`; browsers, workerd, Deno, and Bun keep `wss` with
+session attestation. `test/tls.test.ts` pins it against a Node listener, and
+`CouncilCrossLanguageTest` runs the council worker over `tls://` against a
+Java council that requires attestation.
 
 ### Large artifacts: the content swarm
 
