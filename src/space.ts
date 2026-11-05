@@ -155,11 +155,16 @@ export const notNull = (): Matcher => (v) => v != null;
 
 const matcher = (spec: Condition): Matcher => typeof spec === "function" ? spec as Matcher : eq(spec);
 
+/** The schema a template names to read or watch every type in a space (a visitor's view); a take names one type. */
+export const ANY_TYPE = "*";
+
 /**
  * A query: the entry type (an `@entry` class or a schema string), field
  * conditions, and tag conditions. A plain value means equality; a function is
  * a predicate; `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `oneOf`, `contains`,
- * `isNull`, `notNull` are the Java matchers.
+ * `isNull`, `notNull` are the Java matchers. The schema {@link ANY_TYPE} (`"*"`)
+ * reads and watches every type; each entry then carries its wire type in
+ * `Entry.type` and its value is the plain payload.
  */
 export class Template<T = unknown> {
   readonly schema: string;
@@ -176,6 +181,11 @@ export class Template<T = unknown> {
     this.where = [...Object.entries(where).map(([k, v]): [string, Matcher] => [k, matcher(v)]),
       ...filters.map(parseFilter)];
     this.tags = Object.entries(tags).map(([k, v]) => [k, matcher(v)]);
+  }
+
+  /** Whether an entry of wire type `type` is in this template's scope. */
+  accepts(type: unknown): boolean {
+    return this.schema === ANY_TYPE || type === this.schema;
   }
 
   matches(payload: Dict, tags: Dict = {}): boolean {
@@ -271,7 +281,7 @@ export function parseFilter(clause: string): [string, Matcher] {
 
 /** An entry as the space holds it: the value and its metadata. */
 export type Entry<T> = {
-  entryId: string; value: T; tags: Dict; issuer: string;
+  entryId: string; value: T; tags: Dict; issuer: string; type: string;
   expiresAtMillis: number; completed: boolean; taken: boolean;
 };
 
@@ -473,7 +483,7 @@ export class Space {
     const found: Entry<T>[] = [];
     for (const [entryId, dto] of this.peer.states) {
       const record = (dto["record"] as Dict | undefined) ?? {};
-      if (record["type"] !== template.schema || !this.mine(dto) || dto["completed"]) {
+      if (!template.accepts(record["type"]) || !this.mine(dto) || dto["completed"]) {
         continue;
       }
       const lease = (record["lease"] as Dict | undefined) ?? {};
@@ -496,7 +506,7 @@ export class Space {
         continue;
       }
       found.push({ entryId, value: template.decode(payload), tags: { ...tags }, issuer: String(record["issuer"]),
-        expiresAtMillis: expires, completed: false, taken });
+        type: String(record["type"]), expiresAtMillis: expires, completed: false, taken });
       if (found.length >= limit) {
         break;
       }
@@ -586,7 +596,7 @@ export class Space {
     const payload = loads(raw) as Dict;
     const tags = (record["tags"] as Dict | undefined) ?? {};
     for (const { template, delivered, emit } of [...this.watchers.values()]) {
-      if (record["type"] !== template.schema || !template.matches(payload, tags)) {
+      if (!template.accepts(record["type"]) || !template.matches(payload, tags)) {
         continue;
       }
       const mark = `${entryId}:${markSuffix}`;
@@ -596,7 +606,7 @@ export class Space {
       delivered.add(mark);
       const lease = (record["lease"] as Dict | undefined) ?? {};
       emit({ kind, entry: { entryId, value: template.decode(payload), tags: { ...tags },
-        issuer: String(record["issuer"]), expiresAtMillis: Number(lease["expiresAtMillis"] ?? 0),
+        issuer: String(record["issuer"]), type: String(record["type"]), expiresAtMillis: Number(lease["expiresAtMillis"] ?? 0),
         completed: kind === COMPLETED, taken: kind === TAKEN } });
     }
   }

@@ -96,6 +96,12 @@ export function textOf(adType: string, ad: Dict): string {
   if (adType === "AssetCard") {
     return `${str(ad["description"])} ${str(ad["asset"])} ${str(ad["uri"])} ${str(ad["shape"])}`;
   }
+  if (adType === "ModelCard") {
+    return `${str(ad["name"])} ${str(ad["version"])} ${join(ad["tasks"])} ${str(ad["modality"])} ${str(ad["engine"])} ${str(ad["licence"])}`;
+  }
+  if (adType === "AppCard") {
+    return `${str(ad["name"])} ${str(ad["kind"])} ${str(ad["shape"])} ${str(ad["owner"])} ${str(ad["url"])}`;
+  }
   if (adType === "CapabilityAdvertisement") {
     return `${str(ad["capabilityType"])} ${str(ad["binding"])} ${JSON.stringify(ad["parameters"] ?? {})}`;
   }

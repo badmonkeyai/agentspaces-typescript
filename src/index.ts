@@ -52,6 +52,7 @@ import * as vote from "./vote.js";
 export { vote };
 export * from "./space.js";
 export * from "./agents.js";
+export * from "./console.js";
 export { JOIN_TICKET_TYPE, JOIN_TAG, KEY_TAG, JoinBinding, JoinTicket, KeyTickets } from "./join.js";
 export type { JoinConfig, ResolvedPart } from "./join.js";
 export { GLOBAL_KEY, REDUCE_KEY_TAG, REDUCE_TAG, STEPS_TAG, ReduceBinding, current as currentAccumulator,

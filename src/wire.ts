@@ -391,7 +391,8 @@ export function agentCard(group: string, identity: Identity, localName: string,
                           costHints: Dict, spaceBindings: Dict,
                           agentPublicKey: Uint8Array | null = null,
                           actions: Dict[] | null = null,
-                          agentCertificate: Dict | null = null): Dict {
+                          agentCertificate: Dict | null = null,
+                          ui: Dict | null = null): Dict {
   const agent = identity.agent(localName);
   const card: Dict = { id: `aspace://${group}/agent/${agent}`, issuer: identity.peerId,
     group, issued: issuedIso, ttl: ttlIso, agent, description, goals, consumes,
@@ -412,7 +413,23 @@ export function agentCard(group: string, identity: Identity, localName: string,
   if (agentCertificate !== null) {
     card["agentCertificate"] = agentCertificate; // v0.1.13: the agent's certificate
   }
+  if (ui !== null) {
+    card["ui"] = ui; // v0.1.26 (ISSUE-UiComponents): what the agent can show
+  }
   return card;
+}
+
+/** One component of a UiDeclaration in Java field order (SPEC §6.1a.3): id, catalogId, component, entry, controls, role. */
+export function uiComponent(id: string, catalogId: string, component: string, entry = "", controls: string[] = [],
+                            role: "panel" | "control" | "row" = "panel"): Dict {
+  return { id, catalogId, component, entry, controls, role };
+}
+
+/** A UiDeclaration in Java field order: protocol, version, components, entries {reads, writes}, catalogIds (derived). */
+export function uiDeclaration(components: Dict[], reads: string[] = [], writes: string[] = [],
+                              protocol = "a2ui", version = "v0.9.1"): Dict {
+  const catalogIds = [...new Set(components.map(c => String(c["catalogId"])))];
+  return { protocol, version, components, entries: { reads, writes }, catalogIds };
 }
 
 /**

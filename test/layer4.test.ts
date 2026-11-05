@@ -25,7 +25,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { Binder, agent, onEstimate, spaceTake } from "../src/agents.js";
-import { Aggregate, HashingEmbedder, Pipes, Semantic, Settle, actions, invoke, javaHash } from "../src/capabilities/index.js";
+import { Aggregate, HashingEmbedder, Pipes, Semantic, Settle, actions, invoke, javaHash, textOf } from "../src/capabilities/index.js";
 import type { Estimate } from "../src/capabilities/index.js";
 import { dumps, loads } from "../src/cbor.js";
 import { Identity } from "../src/identity.js";
@@ -186,6 +186,13 @@ class Researcher {
     return new Finding(task.topic, "researched " + task.topic);
   }
 }
+
+test("textOf indexes every advertisement kind as Java does, a ModelCard included (ISSUE-ModelCard)", () => {
+  assert.equal(textOf("AssetCard", { description: "d", asset: "a", uri: "u", shape: "s" }), "d a u s");
+  assert.equal(textOf("ModelCard", { name: "m", version: "1", tasks: ["classify", "embed"], modality: "text", engine: "onnx", licence: "Apache-2.0" }),
+    "m 1 classify embed text onnx Apache-2.0");
+  assert.equal(textOf("FutureCard", { id: "aspace://g/x" }), "aspace://g/x");
+});
 
 test("semantic queries rank cards locally and fetch them remotely", async () => {
   const [a, b] = fleet() as [NetPeer, NetPeer];

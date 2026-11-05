@@ -6,6 +6,7 @@ import { Identity, groupIdFromFounding } from "../../src/identity.js";
 import { Peer } from "../../src/peer.js";
 import { Binder, agent, dataUse, spaceNotify } from "../../src/agents.js";
 import { entry } from "../../src/space.js";
+import { rules } from "../../src/console.js";
 
 @entry("https://badmonkey.ai/console#Finding")
 class Finding {
@@ -27,7 +28,20 @@ await peer.connect(host, Number(port));
 await new Promise((r) => setTimeout(r, 1000));
 const bound = new Binder(peer, { agentName: "ts-coverage", cardTtl: "PT2M" }).bind(new TsCoverage());
 console.log(JSON.stringify({ ok: bound.dataUse.length > 0, peerId: peer.identity.peerId, entries: bound.dataUse }));
-await new Promise((r) => setTimeout(r, Number(maxSeconds ?? 60) * 1000));
+// S3-H-06: the console's rule entries read as data, once the group has settled
+const until = Date.now() + Number(maxSeconds ?? 60) * 1000;
+let reported = false;
+while (Date.now() < until) {
+  await new Promise((r) => setTimeout(r, 1000));
+  if (!reported) {
+    const read = rules(peer);
+    if (Object.values(read).every((v) => v.length > 0)) {
+      console.log(JSON.stringify({ rules: Object.fromEntries(Object.entries(read).map(([k, v]) => [k, v.length])),
+        sample: (read.Constraint[0] as { template?: string }).template ?? "" }));
+      reported = true;
+    }
+  }
+}
 await bound.close();
 peer.close();
 process.exit(0);

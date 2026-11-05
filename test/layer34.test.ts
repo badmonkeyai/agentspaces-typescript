@@ -29,7 +29,7 @@ import type { Decision, Proposal } from "../src/agents.js";
 import { dumps, loads } from "../src/cbor.js";
 import { Identity } from "../src/identity.js";
 import { Peer } from "../src/peer.js";
-import { COMPLETED, Space, TAKEN, TakeContext, Template, WRITTEN, contains, entry, gte, notNull, oneOf }
+import { ANY_TYPE, COMPLETED, Space, TAKEN, TakeContext, Template, WRITTEN, contains, entry, gte, notNull, oneOf }
   from "../src/space.js";
 import * as vote from "../src/vote.js";
 import * as wire from "../src/wire.js";
@@ -199,6 +199,21 @@ test("a watch delivers each entry once per kind, and as an async iterator", asyn
   events.close();
   await consumer;
   assert.deepEqual(iterated, ["a", "b", "c"]);
+});
+
+test("the any-type template reads and watches every type in a space, each entry naming its wire type", async () => {
+  const peer = new StubPeer();
+  const other = new StubPeer();
+  const space = new Space(peer, "tasks");
+  const seen: string[] = [];
+  space.watch(new Template(ANY_TYPE), (e) => seen.push(`${e.kind}:${e.entry.type}`));
+  foldFrom(other, "tasks", "com.acme.Task#v1", { topic: "a", priority: 1 }, peer);
+  foldFrom(other, "tasks", "https://example.org/notes#Note", { text: "n" }, peer);
+  assert.deepEqual(seen, ["WRITTEN:com.acme.Task#v1", "WRITTEN:https://example.org/notes#Note"]);
+  const all = space.entries(new Template(ANY_TYPE));
+  assert.deepEqual(all.map((e) => e.type).sort(), ["com.acme.Task#v1", "https://example.org/notes#Note"]);
+  assert.deepEqual(space.readAll(new Template<{ text: string }>(ANY_TYPE, { text: "n" })), [{ text: "n" }]);
+  assert.equal(space.readAll(new Template(Task)).length, 1);   // a typed template still sees its own type only
 });
 
 @agent("researcher", { description: "Researches topics", goals: ["research"] })

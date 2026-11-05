@@ -331,7 +331,51 @@ function decode(data: Uint8Array, view: DataView, offset: number, depth = 0): [C
       }
       return [result, offset];
     }
+    case 6: {
+      // A tagged item (RFC 8949 §3.4): the standard number tags fold to a number, a date tag keeps its
+      // value, any other tag is unwrapped. A Java writer tags an Instant or a BigDecimal this way.
+      if (length === null) {
+        throw new RangeError("a CBOR tag has no indefinite form");
+      }
+      const [item, next] = decode(data, view, offset, depth + 1);
+      return [untag(length as number, item), next];
+    }
     default:
       throw new RangeError(`unsupported CBOR major ${major}`);
+  }
+}
+
+/** The value a tagged item stands for; see the major-6 case above. */
+function untag(tag: number, item: CborValue): CborValue {
+  switch (tag) {
+    case 2:
+    case 3: {
+      if (!(item instanceof Uint8Array)) {
+        throw new RangeError(`CBOR bignum (tag ${tag}) needs a byte string`);
+      }
+      let big = 0n;
+      for (const b of item) {
+        big = (big << 8n) | BigInt(b);
+      }
+      const value = tag === 2 ? big : -1n - big;
+      if (value > BigInt(Number.MAX_SAFE_INTEGER) || value < BigInt(Number.MIN_SAFE_INTEGER)) {
+        return value; // beyond a safe integer: exact, as a bigint
+      }
+      return Number(value);
+    }
+    case 4:
+    case 5: {
+      // the mantissa may itself be a bignum (tag 2 or 3 inside: a Java Instant's seconds.nanos as a BigDecimal)
+      if (!Array.isArray(item) || item.length !== 2 || typeof item[0] !== "number"
+          || (typeof item[1] !== "number" && typeof item[1] !== "bigint")) {
+        throw new RangeError(`CBOR decimal fraction (tag ${tag}) needs [exponent, mantissa]`);
+      }
+      const base = tag === 4 ? 10 : 2;
+      const mantissa = Number(item[1]);
+      // a negative exponent divides (3 / 10 is 0.3; 3 * 0.1 is not)
+      return item[0] < 0 ? mantissa / Math.pow(base, -item[0]) : mantissa * Math.pow(base, item[0]);
+    }
+    default:
+      return item; // 0 and 1 (dates) keep their value; an unknown tag's content stands for itself
   }
 }

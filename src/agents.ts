@@ -95,6 +95,48 @@ type Verb = "take" | "orderedTake" | "notify" | "bid" | "ballot" | "decision" | 
   | "reduce";
 type Binding = { verb: Verb; cue?: EntryType; space: string; produces?: EntryType | EntryType[]; [attr: string]: unknown };
 type Spec = { name: string; description: string; goals: string[] };
+/** A declared A2UI component (SPEC §6.1a.3): the TypeScript form of `@UiComponent`. */
+export type UiComponentDecl = { catalog: string; component: string; id?: string; entry?: string; controls?: string[];
+  role?: "panel" | "control" | "row"; reads?: boolean; writes?: boolean };
+const UI = Symbol.for("agentspaces.ui");
+
+/**
+ * Declares an A2UI component this agent serves, on the class or a bound method (v0.1.26): the binder derives the
+ * card's `ui` group from every declaration; a control must name an action of the card. Stack it for several.
+ */
+export function uiComponent(decl: UiComponentDecl) {
+  return (value: unknown, _context?: unknown): void => {
+    const holder = value as unknown as { [UI]?: UiComponentDecl[] };
+    holder[UI] = [...(holder[UI] ?? []), decl];
+  };
+}
+
+function uiDeclarationOf(type: { [UI]?: UiComponentDecl[] }, methods: Array<[string, Method, Binding]>, actions: Dict[]): Dict | null {
+  const found: UiComponentDecl[] = [...(type[UI] ?? [])];
+  for (const [, method] of methods) {
+    found.push(...((method as unknown as { [UI]?: UiComponentDecl[] })[UI] ?? []));
+  }
+  if (found.length === 0) {
+    return null;
+  }
+  const names = new Set(actions.map(a => String(a["name"])));
+  const components: Dict[] = [];
+  const reads: string[] = [];
+  const writes: string[] = [];
+  for (const u of found) {
+    for (const control of u.controls ?? []) {
+      if (!names.has(control)) {
+        throw new Error(`ui component ${u.id ?? u.component} names the control '${control}', which is not an action of the card`);
+      }
+    }
+    components.push(wire.uiComponent(u.id ?? u.component, u.catalog, u.component, u.entry ?? "", u.controls ?? [], u.role ?? "panel"));
+    if (u.entry) {
+      if ((u.reads ?? true) && !reads.includes(u.entry)) reads.push(u.entry);
+      if (u.writes && !writes.includes(u.entry)) writes.push(u.entry);
+    }
+  }
+  return wire.uiDeclaration(components, reads, writes);
+}
 type Method = (this: unknown, ...args: never[]) => unknown;
 type MethodDecorator = (value: Method, context: ClassMethodDecoratorContext) => void;
 
@@ -420,7 +462,8 @@ export class Binder {
       throw e;
     }
     if (this.publishCard) {
-      bound.card = this.publish(spec, consumes, produces, spaceBindings, actions);
+      bound.card = this.publish(spec, consumes, produces, spaceBindings, actions,
+        uiDeclarationOf(type as unknown as { [UI]?: UiComponentDecl[] }, methods, actions));   // v0.1.26
     }
     this.declareDataUse(bound, type as unknown as { [DATA_USE]?: DataUseDecl[] }, spec.name);
     return bound;
@@ -562,7 +605,7 @@ export class Binder {
 
   // ----------------------------------------------------------------- card
 
-  private publish(spec: Spec, consumes: string[], produces: string[], spaceBindings: Dict, actions: Dict[]): Dict {
+  private publish(spec: Spec, consumes: string[], produces: string[], spaceBindings: Dict, actions: Dict[], ui: Dict | null = null): Dict {
     const now = this.peer.now();
     const issued = instantIso(now - (now % 1000));
     let localName = spec.name;
@@ -576,7 +619,7 @@ export class Binder {
     }
     const card = wire.agentCard(this.peer.group, this.peer.identity, localName, issued, this.cardTtl,
       spec.description, spec.goals, [...new Set(consumes)], [...new Set(produces)], {}, spaceBindings,
-      agentKey, actions.length > 0 ? actions : null, certificate);
+      agentKey, actions.length > 0 ? actions : null, certificate, ui);
     this.peer.publishAd("AgentCard", card);
     return card;
   }

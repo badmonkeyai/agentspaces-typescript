@@ -151,6 +151,12 @@ await peer.connect("seed.example.com", 7500);
 | `beacon.seedsOf(group, "tcp")` | also `beacon.seedsFor(group, schemes)`; joins take seeds of every scheme the peer dials |
 | `engines.node >=20` | `>=22` |
 
+What 0.5.0 adds for a reader of someone else's spaces (the Bad Monkey console's visitor peer, spiral 3 S3-C-06):
+`new Template(ANY_TYPE)` (`"*"`) reads and watches every type in a space, each `Entry` naming its wire `type`
+(a take still names one type); and `cbor.loads` decodes tagged items (RFC 8949 §3.4: bignums as numbers or
+bigints, decimal and binary fractions as numbers, so a Java `Instant` or `BigDecimal` reads; a date tag keeps
+its value; an unknown tag unwraps).
+
 The suites prove the core in Node, Deno, Bun, workerd, and headless Chromium,
 Firefox, and WebKit (`test/runtimes.test.ts`, `test/browser.test.ts`, which
 skip a runtime that is not installed unless `AGENTSPACES_RUNTIMES_REQUIRED=1`
@@ -641,6 +647,27 @@ and its connector answers an over-limit `get` with an artifact root. A
 `demo/council.ts` is the whole of it against the Java `CouncilFleet`
 coordinator; `test/layer34.test.ts`, `test/layer4.test.ts`, and
 `test/verbs.test.ts` prove each piece without a socket.
+
+## Reading the console's rules (enterprise platform)
+
+A fleet governed by the Bad Monkey enterprise console carries its rules as plain entries: `Vocabulary` and
+`Constraint` in the `constraints` space, `AgentConfiguration` in `policy`, `JuryDecision` in `decisions`,
+`ConsoleFinding` in `findings`, all named by the console namespace `https://badmonkey.ai/console#<Record>`.
+The `console` module exports them as `@entry` classes so a TypeScript peer reads them as data with the same
+`Template` it uses for its own entries. A late joiner holds nothing of a space until it pulls it, which `rules`
+does once per space before reading:
+
+```ts
+import { Constraint, rules, Space, Template } from "@agentspaces/client";
+
+for (const c of new Space(peer, "constraints").readAll(new Template(Constraint))) {
+  console.log(c.template, c.a, "->", c.b, c.enforcement);
+}
+const counts = Object.fromEntries(Object.entries(rules(peer)).map(([k, v]) => [k, v.length]));
+```
+
+The cross-language console test runs this worker beside the Python and Clojure ones and asserts each read the
+four kinds the console wrote.
 
 ## Run it
 
