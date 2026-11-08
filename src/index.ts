@@ -60,3 +60,7 @@ export { GLOBAL_KEY, REDUCE_KEY_TAG, REDUCE_TAG, STEPS_TAG, ReduceBinding, curre
 export type { ReduceConfig } from "./reduce.js";
 import * as capabilities from "./capabilities/index.js";
 export { capabilities };
+import * as pdt from "./pdt/index.js";
+export { pdt };
+export { Pdt } from "./pdt/index.js";
+export type { PdtOptions } from "./pdt/index.js";

@@ -648,6 +648,79 @@ and its connector answers an over-limit `get` with an artifact root. A
 coordinator; `test/layer34.test.ts`, `test/layer4.test.ts`, and
 `test/verbs.test.ts` prove each piece without a socket.
 
+### Values that change: persistent data structures
+
+`pdt` is the TypeScript port of the persistent data structures
+(srad/agentspaces-pdt.md, PD-C-05): maps, sets, vectors, and blobs stored as
+content-addressed trees whose unchanged parts every version shares, so a
+small update ships only its delta. A `PMap` is a CHAMP trie (sha2-256 key
+hashing, 32-way nodes, canonical layout whatever the order of operations), a
+`PVector` is Clojure's trie with a tail, and a `PBlob` is a prolly tree over
+FastCDC chunks (16/64/256 KiB). Every node is DAG-CBOR named by a CIDv1
+(`bafyrei...` for structured nodes, `bafkrei...` for chunks), and the Java,
+Python, and TypeScript ports produce the same bytes for the same values; the
+`pdt_*` and `content_*` tree vectors of `test/golden.json` pin that. Two
+rules keep a root equal to Java's: a value that is itself an object is
+embedded in the order you built it while the Java codec sorts a map's keys
+(ISSUE-CanonicalMaps), so put a nested object in canonical order
+(`canonicalMap`) when its root must match; and a number is encoded as an
+integer when it is a safe integer, as a float64 otherwise (`-0`, `1.5`,
+`1e300`), with `CborDouble` for an integral value that must stay a float.
+An escalated space payload (a `payloadRef` whose CID is dag-cbor, PD-E-01)
+goes to the facade's `payload(root)`, which reassembles the bytes once the
+tree is here and starts one tree fetch otherwise; `writePayload` and
+`readPayload` in `pdt/values` are the Java `PayloadTree` byte for byte
+(`test/pdt-payloads.test.ts` pins the Java roots).
+
+```ts
+import { Content, Pipes, Pdt, Space, pdt } from "@agentspaces/client";
+import { FileNodeBackend } from "@agentspaces/client/node";
+
+const content = new Content(new Pipes(peer), new Space(peer, "content"));
+const values = new Pdt(peer, { content, store: new pdt.NodeStore(new FileNodeBackend("/var/lib/aspace/pdt")) });
+content.run();
+values.run();                                          // ticks the exchange and the refs
+const facts = values.ref<pdt.PMap<string, pdt.CborValue>>("research", "facts", "map");
+await facts.swap((m) => m.assoc("sky", "blue"));       // a new head; the delta rides inline up to 32 KiB
+const value = await facts.deref();                     // the single head, or the merge of several
+value.get("sky");
+facts.watch((v) => console.log(v.count()));            // each new head once its nodes are here
+facts.history(5);                                      // earlier versions by base links
+```
+
+A ref is the set of live `PRef` entries with one name in a space; `swap`
+reads the heads, applies the function, writes the new nodes and a head whose
+`base` names the heads it read, and cancels the heads it superseded after a
+grace. Two writers that race leave two heads, and every reader computes the
+same merge: key-wise for maps, sets, and trees (a both-side conflict takes the
+head with the later HLC and reports a `PConflict` through `onConflict`), the
+later head whole for vectors and blobs unless `values.mergeFor(name, fn)` names
+a merge. A ref in `linear` mode (`modes: { counter: "linear" }`) takes its
+head with `Space.take` before computing, the `@SpaceReduce` pattern. A
+version whose delta is above the inline cap travels by request over the
+content swarm's tree exchange (tags 8 to 11, `trees = "1"` in this peer's
+content-swarm advertisement): a fetch asks for the root, walks each child
+subtree from the top sources, verifies every node against a CID a verified
+parent linked to, and skips what the reader already holds under a `haves`
+root, so the second version of a 3,000-entry map costs its path alone. With
+the group's content key (`keys: ContentKeys.of(key)`) every `NODES` message
+travels sealed under AES-256-GCM, and a keyless holder in a sealing group
+refuses to serve.
+
+The node store is `NodeStore` over a backend: memory anywhere,
+`FileNodeBackend` on Node (one file per CID, read back at open), and
+`OpfsNodeBackend` from `@agentspaces/browser` (an append-only pack in the
+origin private file system with an index rebuilt from the pack, for the
+resident worker, where synchronous access handles exist; a page thread falls
+back to memory). `test/pdt-vectors.test.ts` recomputes every golden vector
+and records the PD-N-03 check against `@ipld/dag-cbor` (it accepts
+`pdt_node_dagcbor` and refuses `pdt_node_embedded`); `test/pdt-values.test.ts`
+proves the values, spills, blobs, store, and inline deltas;
+`test/pdt-swarm.test.ts` runs two in-process peers through inline deltas,
+delta fetches against a held base, concurrent swaps, sealing, a linear ref,
+and a blob ref; `test/workers/pdt-worker.ts` is the worker a Java
+cross-language test spawns against a Java relay.
+
 ## Reading the console's rules (enterprise platform)
 
 A fleet governed by the Bad Monkey enterprise console carries its rules as plain entries: `Vocabulary` and
@@ -690,11 +763,29 @@ serving a remote action. Four runtimes, one space, no broker.
 ## On a network
 
 The client is generous in what it accepts and cautious in what it sends
-(ROBUSTNESS.md). Every verified frame passes a `FrameFilter` first: a stamp
-older than five minutes is stale, one further ahead than the HLC drift bound is
-refused, and a sender-and-stamp pair seen before is a replay; all three are
-dropped without a reply and counted (`peer.frames.stale`, `.ahead`,
-`.replayed`). A kind this client does not speak is counted in
+(ROBUSTNESS.md). Every verified frame passes a `FrameFilter` first, which
+judges the stamp in SPEC §9's order against this client's wall time. A stamp
+outside the canonical grammar is refused and counted in
+`peer.frames.stampsRefused`. The grammar is `physical:logical:node`, each
+number `0` or a non-zero ASCII digit followed by ASCII digits, the physical
+part at most 2^63 - 1 (held as a BigInt, so it orders exactly), and a node
+with no colon and no control character; one spelling per stamp means the
+bytes a signer signed always equal the stamp's re-encoding. Next, a stamp
+older than five minutes is stale (`.stale`) and a sender-and-stamp pair seen
+before is a replay (`.replayed`). A stamp past the HLC drift bound by at most
+`wire.FAR_FUTURE_MARGIN_MILLIS` (5 s) counts in `.aheadWithinMargin`, one
+further ahead in `.ahead`, and a counter above `wire.LOGICAL_LIMIT` (65536) in
+`.stampsRefused`. Each drop goes without a reply. The replica refuses a state,
+lease stamp, or claim that carries a stamp `wire.parseHlc` refuses, whether a
+rumor, anti-entropy, a snapshot, or the ordered log brings it, and counts it in
+`peer.foldStampsRefused` once its signatures verify, once per distinct state
+or claim; this client keeps no strikes. A PRef head orders by its `pdt.issued`
+attribute as Java's Refs does: a counter above the limit orders, and a
+malformed attribute leaves the entry's own stamp. The clock merges a remote
+physical part clamped one millisecond inside the drift bound, and a local
+increment past the limit carries into the next millisecond (HLC logical
+counter, 2026-11-08, Rust team report; HLC canonical stamps, 2026-11-08;
+`test/hlc-logical.test.ts`). A kind this client does not speak is counted in
 `peer.ignoredKinds`, a body that does not decode in `peer.malformedFrames`, and
 the reader goes on. A lost socket is a hiccup, not the end: the peer re-dials
 the seed every `reconnectIntervalMs` (5 s) for `reconnectWindowMs` (10 min),

@@ -47,7 +47,11 @@ export class OrderedLogHost {
   private lastAdvertised = "";
   private lastAdvertisedAt = 0;
   private readonly advertiseEvery: number;
-  /** Committed commands that were not well-formed claim commands, or were not authentic. */
+  /**
+   * Committed commands that were not well-formed claim commands, were not authentic, or carried a
+   * claim stamp that wire.parseHlc refuses (HLC logical counter, 2026-11-08, Rust team report); the
+   * peer's foldStampsRefused counts each distinct refused claim whose proof verifies.
+   */
   commandsDropped = 0;
   /** Committed claims installed, and those heard for an epoch the replica had already decided. */
   claimsInstalled = 0;
@@ -166,6 +170,13 @@ export class OrderedLogHost {
     const signed: Dict = { claim, holderKey, signature: parsed["signature"] };
     if (parsed["holderCertificate"] != null) {
       signed["holderCertificate"] = parsed["holderCertificate"];
+    }
+    // HLC logical counter, 2026-11-08 (Rust team report): every merge point refuses a claim whose
+    // stamp fails the strict parse, so the host neither installs nor announces it. The replica
+    // verifies it first and counts each distinct one once (HLC canonical stamps, 2026-11-08).
+    if (this.peer.refusesClaimStamp(entryId, signed)) {
+      this.commandsDropped += 1;
+      return;
     }
     const held = this.peer.claims.get(entryId)?.["claim"] as Dict | undefined;
     const committedEpoch = held === undefined ? 0 : Number(epochOf(held));

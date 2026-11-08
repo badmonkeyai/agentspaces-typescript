@@ -29,6 +29,7 @@ export type { ConnectOptions, RemoteTakeOptions } from "./page.js";
 export { IndexedDbKeyStore, openDatabase, closeDatabase, deleteDatabase, KEYS_STORE, STATE_STORE } from "./idb.js";
 export { LockElection } from "./lock.js";
 export { OpfsStore, opfsAvailable } from "./opfs.js";
+export { OpfsNodeBackend } from "./pdt-store.js";
 export type { Held } from "./lock.js";
 export {
   ResidentHost, DEFAULT_TICK_MILLIS, DEFAULT_LOCK_WAIT_MILLIS, DEFAULT_SNAPSHOT_MILLIS, DEFAULT_PAGE_TIMEOUT_MILLIS,

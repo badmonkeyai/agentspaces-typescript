@@ -36,6 +36,7 @@ installContextStores(<T>(): ContextStore<T> => {
 });
 
 export { TcpChannel, TcpDialer, TcpListener } from "./tcp.js";
+export { FileNodeBackend } from "./node-store.js";
 export { TlsChannel, TlsDialer, TlsListener, channelCredential } from "./tls.js";
 export { attestChannelCertificate, buildChannelCertificate, generateChannelCertificate } from "./channel-certificate.js";
 export type { ChannelCertificate } from "./channel-certificate.js";

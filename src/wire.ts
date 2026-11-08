@@ -59,6 +59,90 @@ export const MAX_CLAIM_HOLD_MILLIS = 24 * 60 * 60 * 1000;
 export const MAX_HLC_SKEW_MILLIS = 10 * 60 * 1000;
 
 /**
+ * The largest logical counter a remote stamp may carry (2^16), the bound Java, Rust, Python,
+ * TypeScript and Ruby share (HLC logical counter, 2026-11-08, Rust team report). An honest
+ * counter resets every millisecond and stays tiny, so every merge point refuses a remote stamp
+ * above the limit: the clock never takes it, and the receiver ignores the frame, folded state, or
+ * folded claim carrying it. A local increment past the limit carries into the physical part.
+ */
+export const LOGICAL_LIMIT = 65_536;
+
+/**
+ * The receiver's far-future margin (HLC canonical stamps, 2026-11-08): a frame whose physical part
+ * lies past the receiver's wall + MAX_HLC_SKEW_MILLIS by at most this much is dropped and counted
+ * apart from the far-future drops. Wall-clock skew between two hosts puts an honest peer that a
+ * hostile member dragged to its ceiling there, so such a peer loses those frames and no receiver
+ * strikes it for them; a frame further ahead is far-future (ASF-020).
+ */
+export const FAR_FUTURE_MARGIN_MILLIS = 5_000;
+
+/** An HLC stamp that {@link decodeHlc} read; its physical part is exact up to 2^63 - 1. */
+export interface HlcStamp {
+  readonly physical: bigint;
+  readonly logical: number;
+  readonly node: string;
+}
+
+/** The largest physical part, Long.MAX_VALUE: a stamp's physical part fits a signed 64-bit integer. */
+const PHYSICAL_MAX = (1n << 63n) - 1n;
+/** The largest counter Java's HlcTimestamp.parse reads (Integer.MAX_VALUE). */
+const DECODED_LOGICAL_MAX = 2_147_483_647;
+/** "0", or a non-zero ASCII digit followed by ASCII digits: one spelling for each number. */
+const CANONICAL_DIGITS = /^(?:0|[1-9][0-9]*)$/;
+/** A non-empty node holding no colon and no control character (U+0000..U+001F, U+007F). */
+const CANONICAL_NODE = /^[^:\u0000-\u001f\u007f]+$/;
+
+/**
+ * Reads a stamp in the canonical `physical:logical:node` grammar, or returns null (HLC canonical
+ * stamps, 2026-11-08). The physical and logical parts are each "0" or a non-zero ASCII digit
+ * followed by ASCII digits: no leading zero, sign, fraction, exponent, whitespace, or non-ASCII
+ * digit. The physical part fits a signed 64-bit integer, checked and held as a BigInt, so this
+ * client orders every physical part Java orders, exactly. The node is non-empty and holds no colon
+ * and no control character. One spelling per stamp means the bytes a signer signed always equal
+ * the stamp's re-encoding, so Java and this client verify the same claims. The counter reads up to
+ * Integer.MAX_VALUE, as Java's HlcTimestamp.parse does: the PRef head order and the frame filter's
+ * first step read stamps this way, and {@link parseHlc} adds the limit every merge point applies.
+ */
+export function decodeHlc(stamp: unknown): HlcStamp | null {
+  if (typeof stamp !== "string") {
+    return null;
+  }
+  const first = stamp.indexOf(":");
+  const second = first < 0 ? -1 : stamp.indexOf(":", first + 1);
+  if (second < 0) {
+    return null;
+  }
+  const physicalText = stamp.slice(0, first);
+  const logicalText = stamp.slice(first + 1, second);
+  const node = stamp.slice(second + 1);
+  if (!CANONICAL_DIGITS.test(physicalText) || !CANONICAL_DIGITS.test(logicalText) || !CANONICAL_NODE.test(node)) {
+    return null;
+  }
+  // Canonical digits have no leading zero, so the lengths bound the values before any is read.
+  if (physicalText.length > 19 || logicalText.length > 10) {
+    return null;
+  }
+  const physical = BigInt(physicalText);
+  const logical = Number(logicalText);
+  if (physical > PHYSICAL_MAX || logical > DECODED_LOGICAL_MAX) {
+    return null;
+  }
+  return { physical, logical, node };
+}
+
+/**
+ * Parses an acceptable HLC stamp, or returns null when a merge point must refuse it: the canonical
+ * grammar of {@link decodeHlc} with a logical counter from 0 to LOGICAL_LIMIT (HLC logical counter,
+ * 2026-11-08, Rust team report; HLC canonical stamps, 2026-11-08). Every merge and ordering point
+ * shares this one parser: the clock, the state and claim folds, the lease join, the claim lattice,
+ * and the frame filter's last step.
+ */
+export function parseHlc(stamp: unknown): HlcStamp | null {
+  const decoded = decodeHlc(stamp);
+  return decoded === null || decoded.logical > LOGICAL_LIMIT ? null : decoded;
+}
+
+/**
  * How far in the past a frame's stamp may be before it is dropped as stale, and how many
  * (sender, stamp) pairs the replay filter remembers (ROBUSTNESS.md §3.3, §3.4; the Java
  * node's MAX_FRAME_AGE_MILLIS and its recent-frames cache).
@@ -67,32 +151,42 @@ export const MAX_FRAME_AGE_MILLIS = 5 * 60 * 1000;
 export const FRAME_FILTER_CAPACITY = 4096;
 
 /**
- * Admits each verified frame once, fresh: a stamp older than MAX_FRAME_AGE_MILLIS is stale,
- * one further ahead than MAX_HLC_SKEW_MILLIS is refused, and a (sender, stamp) pair seen
- * before is a replay. All three are dropped silently and counted: late, duplicated and
- * replayed frames are the normal case on a network, not evidence of anything.
+ * Admits each verified frame once, fresh, judging its stamp in SPEC §9's order against this
+ * client's wall time (HLC canonical stamps, 2026-11-08). First it decodes the stamp, and one that
+ * {@link decodeHlc} refuses counts as `stampsRefused` and meets no time check. Then it drops a
+ * stamp older than MAX_FRAME_AGE_MILLIS as `stale` and a (sender, stamp) pair seen before as
+ * `replayed`: late and duplicated frames are the normal case on a network, and anyone can replay a
+ * frame its author signed. The later checks judge a fresh frame only its sender could have
+ * produced. A stamp past wall + MAX_HLC_SKEW_MILLIS by at most FAR_FUTURE_MARGIN_MILLIS counts as
+ * `aheadWithinMargin`, and one further ahead as `ahead` (ASF-020). A counter above LOGICAL_LIMIT
+ * counts as `stampsRefused`. This client keeps no strikes against frame senders, so each count
+ * records its drop.
  */
 export class FrameFilter {
   private readonly seen = new Set<string>();
   stale = 0;
+  /** Far-future frames past the margin (ASF-020): Java strikes their senders. */
   ahead = 0;
+  /** Far-future frames inside FAR_FUTURE_MARGIN_MILLIS: Java strikes nobody for them. */
+  aheadWithinMargin = 0;
   replayed = 0;
+  /** Frames whose stamp is not canonical or carries a counter above LOGICAL_LIMIT. */
+  stampsRefused = 0;
 
   constructor(private readonly capacity: number = FRAME_FILTER_CAPACITY) {}
 
   admit(env: Dict, nowMillis: number): boolean {
-    const physical = Number(String(env["stamp"] ?? "").split(":")[0]);
-    if (!Number.isFinite(physical)) {
+    const stamp = decodeHlc(env["stamp"]);
+    if (stamp === null) {
+      this.stampsRefused += 1;
       return false;
     }
-    if (nowMillis - physical > MAX_FRAME_AGE_MILLIS) {
+    const now = BigInt(Math.trunc(nowMillis));
+    if (now - stamp.physical > BigInt(MAX_FRAME_AGE_MILLIS)) {
       this.stale += 1;
       return false;
     }
-    if (physical - nowMillis > MAX_HLC_SKEW_MILLIS) {
-      this.ahead += 1;
-      return false;
-    }
+    // A canonical stamp has one spelling, so its text keys the replay set.
     const key = `${String(env["from"])}|${String(env["stamp"])}`;
     if (this.seen.has(key)) {
       this.replayed += 1;
@@ -105,6 +199,19 @@ export class FrameFilter {
         this.seen.delete(eldest);
       }
     }
+    const lead = stamp.physical - now - BigInt(MAX_HLC_SKEW_MILLIS);
+    if (lead > 0n) {
+      if (lead <= BigInt(FAR_FUTURE_MARGIN_MILLIS)) {
+        this.aheadWithinMargin += 1;
+      } else {
+        this.ahead += 1;
+      }
+      return false;
+    }
+    if (stamp.logical > LOGICAL_LIMIT) {
+      this.stampsRefused += 1;
+      return false;
+    }
     return true;
   }
 }
@@ -115,7 +222,10 @@ const hlcState = new Map<string, [number, number]>();
  * A fresh hybrid-logical-clock stamp in the Java string form: physical time
  * never runs backwards, and the logical counter increments within one
  * millisecond, so two stamps from the same node never collide and stamps
- * after an observed remote stamp sort after it (ASF-043).
+ * after an observed remote stamp sort after it (ASF-043). An increment that
+ * would pass LOGICAL_LIMIT carries instead: the physical part advances one
+ * millisecond and the counter resets to 0, so the clock never returns the
+ * same stamp twice (HLC logical counter, 2026-11-08, Rust team report).
  */
 export function hlcNow(node: string, nowMillis?: number): string {
   const wall = nowMillis ?? Date.now();
@@ -123,36 +233,54 @@ export function hlcNow(node: string, nowMillis?: number): string {
   if (wall > physical) {
     physical = wall;
     logical = 0;
-  } else {
+  } else if (logical < LOGICAL_LIMIT) {
     logical += 1;
+  } else {
+    physical += 1;
+    logical = 0;
   }
   hlcState.set(node, [physical, logical]);
   return `${physical}:${logical}:${node}`;
 }
 
-/** The physical milliseconds of an HLC stamp string: its signing time. */
+/**
+ * The physical milliseconds of an HLC stamp string: its signing time; throws when parseHlc refuses
+ * it. A physical part past 2^53 reads as the nearest double, which still lies past every wall-clock
+ * time a caller judges a signing time against; stamps order by {@link compareHlc}, exactly.
+ */
 export function hlcPhysical(stamp: unknown): number {
-  const physical = Number(String(stamp ?? "").split(":")[0]);
-  if (!Number.isFinite(physical)) {
-    throw new Error(`not an HLC stamp: ${String(stamp)}`);
+  return Number(requireHlc(stamp).physical);
+}
+
+/** The parsed stamp, or an error naming it when {@link parseHlc} refuses it. */
+function requireHlc(stamp: unknown): HlcStamp {
+  const parsed = parseHlc(stamp);
+  if (parsed === null) {
+    throw new Error(`not an acceptable HLC stamp: ${String(stamp)}`);
   }
-  return physical;
+  return parsed;
 }
 
 /**
  * Merges a remote stamp into the local clock so later local stamps sort after
- * everything observed. Remote physicals beyond the skew ceiling are ignored:
- * a hostile far-future stamp cannot pin this clock (ASF-020). `nowMillis` is
- * the caller's clock the skew is judged against (a peer's); default wall time.
+ * everything observed. The clock ignores a stamp that {@link parseHlc} refuses:
+ * one counter above LOGICAL_LIMIT near the skew ceiling, or one of -1e300, froze
+ * the clock, since adding one to such a number changes nothing (HLC logical
+ * counter, 2026-11-08, Rust team report). A remote physical merges clamped at
+ * wall + MAX_HLC_SKEW_MILLIS - 1, one millisecond inside the cap: a hostile
+ * far-future stamp cannot pin this clock (ASF-020), and a carry after the merge
+ * lands at most on the cap, which a receiver's strict greater-than check admits.
+ * `nowMillis` is the caller's clock (a peer's), which sets the cap; wall time
+ * by default.
  */
 export function hlcObserve(node: string, stamp: unknown, nowMillis?: number): void {
-  const parts = String(stamp ?? "").split(":");
-  const physical = Number(parts[0]);
-  const logical = Number(parts[1]);
-  if (!Number.isFinite(physical) || !Number.isFinite(logical)
-      || physical > (nowMillis ?? Date.now()) + MAX_HLC_SKEW_MILLIS) {
+  const parsed = parseHlc(stamp);
+  if (parsed === null) {
     return;
   }
+  const cap = BigInt(Math.trunc(nowMillis ?? Date.now()) + MAX_HLC_SKEW_MILLIS - 1);
+  const physical = Number(parsed.physical < cap ? parsed.physical : cap);
+  const logical = parsed.logical;
   const [currentPhysical, currentLogical] = hlcState.get(node) ?? [0, -1];
   if (physical > currentPhysical
       || (physical === currentPhysical && logical > currentLogical)) {
@@ -160,17 +288,40 @@ export function hlcObserve(node: string, stamp: unknown, nowMillis?: number): vo
   }
 }
 
-/** Compares two HLC stamps in the Java string form; positive when a > b. */
-export function compareHlc(a: string, b: string): number {
-  const [ap, al, an] = hlcTuple(a);
-  const [bp, bl, bn] = hlcTuple(b);
-  if (ap !== bp) {
-    return ap - bp;
+/**
+ * Compares two HLC stamps in the Java string form; positive when a > b, as Java's
+ * HlcTimestamp.compareTo orders every stamp its parse reads. The order is total: a stamp
+ * {@link decodeHlc} refuses sorts before every stamp it reads, and two refused stamps compare as
+ * strings (HLC logical counter, 2026-11-08, Rust team report). The folds refuse such stamps, so
+ * held state never carries one; the order only keeps a sort over unchecked text sound. A PRef
+ * head's `pdt.issued` may carry a counter above LOGICAL_LIMIT and orders by it, as in Java's Refs
+ * (HLC canonical stamps, 2026-11-08).
+ */
+export function compareHlc(a: unknown, b: unknown): number {
+  const pa = decodeHlc(a);
+  const pb = decodeHlc(b);
+  if (pa === null || pb === null) {
+    if (pa !== null || pb !== null) {
+      return pa === null ? -1 : 1;
+    }
+    const sa = String(a), sb = String(b);
+    return sa < sb ? -1 : sa > sb ? 1 : 0;
   }
-  if (al !== bl) {
-    return al - bl;
+  return compareParsed(pa, pb);
+}
+
+/**
+ * Java's HlcTimestamp.compareTo: physical, then logical, then node. The physical parts compare as
+ * BigInts, exactly to 2^63 - 1, and the nodes by UTF-16 code unit, as Java's String.compareTo does.
+ */
+function compareParsed(a: HlcStamp, b: HlcStamp): number {
+  if (a.physical !== b.physical) {
+    return a.physical < b.physical ? -1 : 1;
   }
-  return an < bn ? -1 : an > bn ? 1 : 0;
+  if (a.logical !== b.logical) {
+    return a.logical - b.logical;
+  }
+  return a.node < b.node ? -1 : a.node > b.node ? 1 : 0;
 }
 
 /** An Envelope in field order: ver, group, kind, from, to, stamp, body. */
@@ -426,6 +577,20 @@ export function uiComponent(id: string, catalogId: string, component: string, en
 }
 
 /** A UiDeclaration in Java field order: protocol, version, components, entries {reads, writes}, catalogIds (derived). */
+/**
+ * The host group of a published AppCard in Java field order (SPEC §6.1a.4, v0.1.28): url, port, hostAgent, path,
+ * signOn (tenant or none), publishedBy, publishedAt, status (serving or stopped). Appended last on the card; a card
+ * without it keeps its bytes.
+ */
+export function appCardHost(url: string, port = 0, hostAgent = "", path = "/", signOn: "tenant" | "none" = "tenant",
+                            publishedBy = "", publishedAtIso = "", status: "serving" | "stopped" = "serving"): Dict {
+  if (!url) throw new Error("a host has a url");
+  if (port < 0 || port > 65535) throw new Error("a host's port is 0 to 65535");
+  if (signOn !== "tenant" && signOn !== "none") throw new Error("a host's signOn is tenant or none");
+  if (status !== "serving" && status !== "stopped") throw new Error("a host's status is serving or stopped");
+  return { url, port, hostAgent, path: path || "/", signOn, publishedBy, publishedAt: publishedAtIso, status };
+}
+
 export function uiDeclaration(components: Dict[], reads: string[] = [], writes: string[] = [],
                               protocol = "a2ui", version = "v0.9.1"): Dict {
   const catalogIds = [...new Set(components.map(c => String(c["catalogId"])))];
@@ -816,13 +981,6 @@ export function claimDelta(entryId: string, signed: Dict): Uint8Array {
   return dumps({ state: null, claimEntry: entryId, claim: signed });
 }
 
-function hlcTuple(stamp: string): [number, number, string] {
-  const first = stamp.indexOf(":");
-  const second = stamp.indexOf(":", first + 1);
-  return [Number(stamp.slice(0, first)),
-    Number(stamp.slice(first + 1, second)), stamp.slice(second + 1)];
-}
-
 function num(value: CborValue): number {
   return value instanceof CborDouble ? value.value : Number(value ?? 0);
 }
@@ -844,7 +1002,10 @@ export function claimNumber(value: CborValue): number {
 /**
  * Compares two claims by the lattice's total order (spec §7.4): negative when
  * {@code a} wins. Epoch descending, bid ascending, HLC stamp ascending,
- * holder ascending, expiry descending; identical to TakeClaim.merge.
+ * holder ascending, expiry descending; identical to TakeClaim.merge. Throws
+ * when a claim's stamp is one {@link parseHlc} refuses: every merge point
+ * refuses such a claim before the lattice, so a throw here is a caller's bug
+ * (HLC logical counter, 2026-11-08, Rust team report).
  */
 export function compareClaims(a: Dict, b: Dict): number {
   if (num(a["epoch"]) !== num(b["epoch"])) {
@@ -853,16 +1014,9 @@ export function compareClaims(a: Dict, b: Dict): number {
   if (num(a["bid"]) !== num(b["bid"])) {
     return num(a["bid"]) - num(b["bid"]);
   }
-  const [ap, al, an] = hlcTuple(String(a["stamp"]));
-  const [bp, bl, bn] = hlcTuple(String(b["stamp"]));
-  if (ap !== bp) {
-    return ap - bp;
-  }
-  if (al !== bl) {
-    return al - bl;
-  }
-  if (an !== bn) {
-    return an < bn ? -1 : 1;
+  const byStamp = compareParsed(requireHlc(a["stamp"]), requireHlc(b["stamp"]));
+  if (byStamp !== 0) {
+    return byStamp;
   }
   if (String(a["holder"]) !== String(b["holder"])) {
     return String(a["holder"]) < String(b["holder"]) ? -1 : 1;

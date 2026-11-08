@@ -265,3 +265,79 @@ test("a committed command for an epoch the replica already decided is announced,
     stop();
   }
 });
+
+test("a committed claim stamped above LOGICAL_LIMIT is dropped, never installed or announced (HLC logical counter, 2026-11-08)", async () => {
+  const peer = new Peer(Identity.generate(), "zOrderedLogicalGroup");
+  const host = new OrderedLogHost(peer, "jobs", [peer.identity.peerId], { residency: SERVICE });
+  try {
+    await host.ready();
+    const entryId = peer.writeEntry("jobs", TASK, { job: "j3" }, "writer");
+    const spaceId = String((peer.states.get(entryId)!["record"] as wire.Dict)["spaceId"]);
+    const heard: string[] = [];
+    host.onCommitted((_id, c) => heard.push(String(c["stamp"])));
+    const holder = Identity.generate();
+    const command = (stamp: string): Uint8Array => {
+      const claim = wire.takeClaim(entryId, spaceId, 1, stamp, holder.agent("clerk"), 0.0, Date.now() + 60_000);
+      return claimCommand(entryId, claim, holder.publicRaw, wire.signedClaim(claim, holder)["signature"] as Uint8Array, null);
+    };
+    const apply = (c: Uint8Array): void => (host as unknown as { apply(c: Uint8Array): void }).apply(c);
+    const hostile = command(`${Date.now()}:2147483647:${holder.peerId}`);
+    apply(hostile); // the next epoch: the install path
+    assert.equal(host.commandsDropped, 1);
+    assert.equal(peer.claims.get(entryId), undefined, "the replica never installed it");
+    const honest = `${Date.now()}:${wire.LOGICAL_LIMIT}:${holder.peerId}`;
+    apply(command(honest));
+    assert.equal(host.claimsInstalled, 1);
+    apply(hostile); // the decided epoch: the announce-only path
+    assert.equal(host.commandsDropped, 2);
+    assert.equal(host.claimsRepeated, 0);
+    assert.deepEqual(heard, [honest], "listeners hear only the honest claim");
+    // HLC canonical stamps, 2026-11-08: the replica verified it and counted it once, on the first offer.
+    assert.equal(peer.foldStampsRefused, 1);
+  } finally {
+    host.close();
+    peer.close();
+  }
+});
+
+test("the host drops a committed claim whose stamp fails the strict parse on both paths (HLC logical counter, 2026-11-08)", async () => {
+  const peer = new Peer(Identity.generate(), "zOrderedMalformedGroup");
+  const host = new OrderedLogHost(peer, "jobs", [peer.identity.peerId], { residency: SERVICE });
+  try {
+    await host.ready();
+    const entryId = peer.writeEntry("jobs", TASK, { job: "j4" }, "writer");
+    const spaceId = String((peer.states.get(entryId)!["record"] as wire.Dict)["spaceId"]);
+    const heard: string[] = [];
+    host.onCommitted((_id, c) => heard.push(String(c["stamp"])));
+    const holder = Identity.generate();
+    const command = (stamp: string): Uint8Array => {
+      const claim = wire.takeClaim(entryId, spaceId, 1, stamp, holder.agent("clerk"), 0.0, Date.now() + 60_000);
+      return claimCommand(entryId, claim, holder.publicRaw, wire.signedClaim(claim, holder)["signature"] as Uint8Array, null);
+    };
+    const apply = (c: Uint8Array): void => (host as unknown as { apply(c: Uint8Array): void }).apply(c);
+    const now = Date.now();
+    const malformed = ["-1e300", "-18014398509481984", "0.5", "65535.5", "NaN", ""]
+      .map((logical) => `${now}:${logical}:${holder.peerId}`)
+      .concat([`${now}:${holder.peerId}`, `${now}.5:0:${holder.peerId}`, `0${now}:0:${holder.peerId}`]);
+    const commands = malformed.map(command);
+    for (const malformedCommand of commands) {
+      apply(malformedCommand); // the next epoch: the install path
+    }
+    assert.equal(host.commandsDropped, malformed.length);
+    assert.equal(peer.claims.get(entryId), undefined, "the replica never installed one");
+    const honest = `${now}:0:${holder.peerId}`;
+    apply(command(honest));
+    assert.equal(host.claimsInstalled, 1);
+    for (const malformedCommand of commands) {
+      apply(malformedCommand); // the decided epoch: the announce-only path
+    }
+    assert.equal(host.commandsDropped, 2 * malformed.length);
+    assert.equal(host.claimsRepeated, 0);
+    assert.deepEqual(heard, [honest], "listeners hear only the honest claim");
+    // HLC canonical stamps, 2026-11-08: each distinct claim counts once, though each came twice.
+    assert.equal(peer.foldStampsRefused, malformed.length);
+  } finally {
+    host.close();
+    peer.close();
+  }
+});

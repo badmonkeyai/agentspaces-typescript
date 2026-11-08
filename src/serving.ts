@@ -93,11 +93,16 @@ export function dotSetHash(dots: unknown): number {
   return h;
 }
 
-/** An `HlcTimestamp(long physical, int logical, String node)` record's hash, from its encoded form. */
+/**
+ * An `HlcTimestamp(long physical, int logical, String node)` record's hash, from its encoded form.
+ * The physical part reads as a BigInt, so a part past 2^53 hashes as Java's long does (HLC
+ * canonical stamps, 2026-11-08).
+ */
 export function hlcHash(encoded: string): number {
   const first = encoded.indexOf(":");
   const second = encoded.indexOf(":", first + 1);
-  const physical = Number(encoded.slice(0, first));
+  const physicalText = encoded.slice(0, first);
+  const physical = /^[0-9]+$/.test(physicalText) ? BigInt(physicalText) : 0n;
   const logical = Number(encoded.slice(first + 1, second)) | 0;
   const node = encoded.slice(second + 1);
   return javaRecordHash([javaLongHash(physical), logical, javaStringHash(node)]);

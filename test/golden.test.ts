@@ -65,7 +65,7 @@ import {
   verifyAgentCertificateAt,
   verifySignedGroupAd,
 } from "../src/identity.js";
-import { Peer, joinStates } from "../src/peer.js";
+import { Peer, RECORDLESS_HINT, joinStates, nameRecordless } from "../src/peer.js";
 import * as vote from "../src/vote.js";
 import * as revocation from "../src/revocation.js";
 import * as wire from "../src/wire.js";
@@ -516,8 +516,15 @@ test("int64 values beyond the safe range round-trip as BigInt", () => {
   assert.equal(loads(dumps(7n)), 7);
   assert.equal(loads(Buffer.from("1b001fffffffffffff", "hex")), Number.MAX_SAFE_INTEGER);
   assert.equal(loads(Buffer.from("1b0020000000000000", "hex")), 2n ** 53n);
-  // A non-integer number still needs the explicit double wrapper.
-  assert.throws(() => dumps(4.5), TypeError);
+  // A non-integer number, -0, and a magnitude past the safe range are float64 (0xFB), as the
+  // Java and Python codecs encode a double (review of 2026-11-08); an integral value that must
+  // stay a float still takes the wrapper, and a float decodes as one.
+  assert.deepEqual(dumps(4.5), Buffer.from("fb4012000000000000", "hex"));
+  assert.deepEqual(dumps(-0), Buffer.from("fb8000000000000000", "hex"));
+  assert.deepEqual(dumps(1e300), dumps(new CborDouble(1e300)));
+  assert.deepEqual(dumps(2.0), dumps(2));
+  assert.deepEqual(dumps(new CborDouble(2)), Buffer.from("fb4000000000000000", "hex"));
+  assert.ok(loads(dumps(4.5)) instanceof CborDouble);
 });
 
 test("joinByGroupId accepts only the verified founding document (SPEC 5.1, 10.1)", async () => {
@@ -558,6 +565,9 @@ test("every golden vector decodes", () => {
     // Deltas too, and the adv_* vectors: their content (not their encoding)
     // is hostile, so they round-trip like the rest. The deep-nesting vector
     // alone is undecodable by design (proven refused below).
+    // The pdt node vectors (pdt_sealed_node among them) carry no _cbor suffix: they are
+    // NodeCodec nodes (definite-length DAG-CBOR, srad/agentspaces-pdt.md §3.1), not the
+    // Jackson wire form this encoder reproduces; the pdt vector tests pin them.
     if ((name.endsWith("_cbor") || name.endsWith("_delta")) && name !== "adv_deep_nesting_cbor") {
       const raw = Buffer.from(value, "hex");
       const decoded = loads(raw);
@@ -694,6 +704,61 @@ function foldState(peer: Peer, name: string): void {
   const delta = loads(hex(name)) as Dict;
   (peer as unknown as { fold(dto: Dict): void }).fold(delta["state"] as Dict);
 }
+
+// The record-free renew of srad/agentspaces-pdt.md §3.9 (PD-L-01, PD-L-02, PD-L-04): the
+// peer-signed renew of the golden entry travels without its record; a replica that holds
+// the record merges it, one that does not keeps it pending with no event until the record
+// arrives, and this client advertises the hint a writer gates the form on (PD-L-03).
+test("a recordless renew matches Java, merges over a held record, and waits otherwise", () => {
+  const entry = "11111111-2222-3333-4444-555555555555";
+  const delta = loads(hex("state_delta_recordless_cbor")) as Dict;
+  const state = delta["state"] as Dict;
+  assert.equal(state["record"], undefined, "the record is absent, not null, on the wire");
+  assert.equal(state["entryId"], entry);
+  assert.deepEqual(dumps(delta), hex("state_delta_recordless_cbor"));
+  const renewedUntil = wire.hlcPhysical(GOLDEN["hlc_encoded"]) + 7_200_000;
+  assert.equal((state["leaseValue"] as Dict)["expiresAtMillis"], renewedUntil);
+
+  // a replica without the record: pending, no entry, no event, until the full DTO arrives
+  const waiting = peerAt(GOLDEN["certificate_verify_at"]);
+  const events: Dict[] = [];
+  waiting.onState = (dto) => events.push(dto);
+  foldState(waiting, "state_delta_recordless_cbor");
+  assert.equal(waiting.states.size, 0);
+  assert.deepEqual([...waiting.pendingStates.keys()], [entry]);
+  assert.equal(events.length, 0);
+  foldState(waiting, "delta_cbor");
+  assert.deepEqual([...waiting.states.keys()], [entry]);
+  assert.equal(waiting.pendingStates.size, 0);
+  const held = waiting.states.get(entry)!;
+  assert.equal(held["leaseStamp"], state["leaseStamp"]);
+  assert.equal((held["leaseValue"] as Dict)["expiresAtMillis"], renewedUntil);
+  assert.equal(events.length, 2, "the record's fold and the pending renew's fold");
+
+  // a replica that holds the record merges at once
+  const holder = peerAt(GOLDEN["certificate_verify_at"]);
+  foldState(holder, "delta_cbor");
+  assert.equal((holder.states.get(entry)!["leaseValue"] as Dict)["expiresAtMillis"], 1735693200000);
+  foldState(holder, "state_delta_recordless_cbor");
+  assert.equal((holder.states.get(entry)!["leaseValue"] as Dict)["expiresAtMillis"], renewedUntil);
+  assert.equal(holder.pendingStates.size, 0);
+
+  // a recordless state that names no entry is dropped; the rumor item id names it when the DTO does not
+  const unnamed: Dict = { ...state };
+  delete unnamed["entryId"];
+  foldState(holder, "delta_cbor");
+  (holder as unknown as { fold(dto: Dict): void }).fold({ ...unnamed });
+  nameRecordless(unnamed, `r:${entry}:123`);
+  assert.equal(unnamed["entryId"], entry);
+  const named: Dict = { ...state };
+  nameRecordless(named, "r:other:1");
+  assert.equal(named["entryId"], entry, "a DTO that carries its entry id keeps it");
+
+  // the hint rides on this peer's advertisement
+  const ad = (waiting as unknown as { selfAd(): Dict }).selfAd();
+  assert.equal((ad["resourceHints"] as Dict)[RECORDLESS_HINT], "1");
+  assert.equal(RECORDLESS_HINT, "wire.recordless");
+});
 
 test("hostile certificates never authenticate a record", () => {
   // v0.1.13: the control is the agent-signed delta (an attested entry's state

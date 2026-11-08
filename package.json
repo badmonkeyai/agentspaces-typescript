@@ -26,7 +26,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node --test build/test/golden.test.js build/test/console.test.js build/test/commerce.test.js build/test/agents.test.js build/test/layer34.test.js build/test/layer4.test.js build/test/content.test.js build/test/verbs.test.js build/test/robustness.test.js build/test/social.test.js build/test/beacon.test.js build/test/portable.test.js build/test/session.test.js build/test/verbs-residency.test.js build/test/filters.test.js build/test/serving.test.js build/test/framing.test.js build/test/tls.test.js build/test/host-links.test.js build/test/verbs-join.test.js build/test/verbs-reduce.test.js build/test/verbs-ordered.test.js build/test/browser.test.js build/test/runtimes.test.js build/test/ui.test.js",
+    "test": "tsc && node --test build/test/golden.test.js build/test/console.test.js build/test/commerce.test.js build/test/agents.test.js build/test/layer34.test.js build/test/layer4.test.js build/test/content.test.js build/test/pdt-vectors.test.js build/test/pdt-values.test.js build/test/pdt-payloads.test.js build/test/pdt-swarm.test.js build/test/verbs.test.js build/test/robustness.test.js build/test/hlc-logical.test.js build/test/social.test.js build/test/beacon.test.js build/test/portable.test.js build/test/session.test.js build/test/verbs-residency.test.js build/test/filters.test.js build/test/serving.test.js build/test/framing.test.js build/test/tls.test.js build/test/host-links.test.js build/test/verbs-join.test.js build/test/verbs-reduce.test.js build/test/verbs-ordered.test.js build/test/browser.test.js build/test/runtimes.test.js build/test/ui.test.js",
     "size": "tsc && node tools/size.mjs",
     "test:packages": "npm test --workspaces --if-present",
     "build:packages": "npm run build --workspaces --if-present"
@@ -37,6 +37,7 @@
     "multiformats": "^14.0.5"
   },
   "devDependencies": {
+    "@ipld/dag-cbor": "^10.0.2",
     "@types/node": "^22.0.0",
     "bun": "^1.4.3",
     "deno": "^2.9.6",

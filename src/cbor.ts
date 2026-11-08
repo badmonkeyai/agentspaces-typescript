@@ -27,8 +27,10 @@
  * signatures cover the bytes, so this codec keeps the distinction explicit
  * in both directions:
  * <ul>
- *   <li>A {@code number} encodes as an integer (major 0/1) and must be a safe
- *       integer; wrap a value in {@link CborDouble} to emit a float64. The
+ *   <li>A {@code number} encodes as an integer (major 0/1) when it is a safe
+ *       integer and as a float64 otherwise (a fraction, {@code -0}, a magnitude
+ *       past 2^53, Infinity, NaN); wrap an integral value in {@link CborDouble}
+ *       to emit it as a float64. The
  *       decoder returns every float (0xFA/0xFB) as a {@link CborDouble}, so
  *       {@code dumps(loads(x))} reproduces {@code x} for the float64 arrays
  *       in aggregate frames and for claim bids alike.</li>
@@ -153,10 +155,17 @@ function encode(value: CborValue, out: Uint8Array[]): void {
     // int64 beyond the safe range (an aggregate roster token, a Java long).
     out.push(value >= 0n ? headBig(0, value) : headBig(1, -1n - value));
   } else if (typeof value === "number") {
-    if (!Number.isSafeInteger(value)) {
-      throw new TypeError(`not a safe integer: ${value}; wrap doubles in CborDouble`);
+    if (!Number.isSafeInteger(value) || Object.is(value, -0)) {
+      // A fraction, -0, or a magnitude past 2^53 (Infinity and NaN included) is a float64 (0xFB),
+      // as the Java and Python codecs encode a double; an integral value that must stay a float
+      // is wrapped in CborDouble, since the number alone cannot say so.
+      const b = new Uint8Array(9);
+      b[0] = 0xfb;
+      new DataView(b.buffer).setFloat64(1, value, false);
+      out.push(b);
+    } else {
+      out.push(value >= 0 ? head(0, value) : head(1, -1 - value));
     }
-    out.push(value >= 0 ? head(0, value) : head(1, -1 - value));
   } else if (value instanceof Uint8Array) {
     out.push(head(2, value.length), value);
   } else if (typeof value === "string") {

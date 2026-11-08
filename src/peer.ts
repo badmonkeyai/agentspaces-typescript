@@ -27,9 +27,11 @@
  */
 
 import * as beacon from "./beacon.js";
-import { equals, fromBase64, utf8 } from "./bytes.js";
+import { equals, fromBase64, toHex, utf8 } from "./bytes.js";
 import { cryptoPort } from "./crypto.js";
 import { CborValue, dumps, loads } from "./cbor.js";
+import type { Pdt } from "./pdt/index.js";
+import * as pdtCids from "./pdt/cids.js";
 import { AgentIdentity, Identity, deriveId, instantIso, parseDurationMillis, parseInstantMillis, spaceIdLocal, verifyAgentCertificateAt, verifySignedGroupAd } from "./identity.js";
 import * as revocation from "./revocation.js";
 import * as serving from "./serving.js";
@@ -122,9 +124,36 @@ export interface BulkPayloads {
   ensure(root: string): void;
 }
 
+/**
+ * The wire hint this client advertises (SPEC v0.1.17 §9, srad/agentspaces-pdt.md §3.9, PD-L-04): a
+ * renew, cancel, or complete may reach it as an EntryStateDto without its record (PD-L-01); it merges
+ * the state over the record it holds or keeps it pending, without an event, until the record arrives.
+ */
+export const RECORDLESS_HINT = "wire.recordless";
+
+/** The most recordless states kept pending for records that have not arrived (PD-L-02). */
+export const MAX_PENDING_RECORDLESS = 1024;
+
+/**
+ * How many distinct refused states and claims a replica remembers so a re-offer counts no second
+ * refusal, as Java's ReplicatedSpace REJECTED_OFFERS_CAP (HLC canonical stamps, 2026-11-08).
+ */
+const MAX_REFUSED_STAMPS = 4096;
+
+/** Whether a `b` reference names a persistent tree (dag-cbor) rather than a piece artifact. */
+function isTreeRoot(ref: string): boolean {
+  try {
+    return pdtCids.parse(ref).codec === pdtCids.DAG_CBOR;
+  } catch {
+    return false;
+  }
+}
+
 export class Peer {
   readonly states = new Map<string, Dict>();
   readonly claims = new Map<string, Dict>();
+  /** Recordless states for entries whose record has not arrived yet, by entry id (PD-L-02). */
+  readonly pendingStates = new Map<string, Dict>();
   /** The founding advertisement this peer joined with, when it joined by GroupID. */
   founding: Dict | null = null;
   private channel: FrameChannel | null = null;
@@ -161,6 +190,18 @@ export class Peer {
   sessionFramesSent = 0;
   /** Session hellos ignored as older than the hello age window (never a strike). */
   framesStale = 0;
+  /**
+   * States and claims this replica refused because a stamp they carry (a record's `issued`, a
+   * state's `leaseStamp`, a claim's `stamp`) is one wire.parseHlc refuses: not canonical, or a
+   * logical counter above wire.LOGICAL_LIMIT (HLC logical counter, 2026-11-08, Rust team report).
+   * Rumors, anti-entropy, snapshots and committed claims all fold through the same check. This peer
+   * keeps no strikes, so the count records each refusal: after the signatures verify, since an
+   * unverified carrier names no signer, and once per distinct state or claim, since a re-offer is
+   * no new refusal (HLC canonical stamps, 2026-11-08).
+   */
+  foldStampsRefused = 0;
+  /** The distinct states and claims counted in foldStampsRefused, the eldest forgotten past the cap. */
+  private readonly refusedStamps = new Set<string>();
   /** The dialers this peer dials with, by scheme; the registered defaults at construction. */
   readonly dialers = new Map<string, Dialer>();
   private pendingFounding: PendingFounding | null = null;
@@ -260,6 +301,8 @@ export class Peer {
   private readonly blockAsked = new Map<string, number>();
   /** The content swarm attached to this peer (`capabilities/content`): resolves `b` references and takes payloads above its bound. */
   content: BulkPayloads | null = null;
+  /** The persistent data structures attached to this peer (`pdt`): refs, values, and the tree exchange (PD-C-05). */
+  pdt: Pdt | null = null;
   private running = false;
   private readonly pulledSpaces = new Set<string>();
   private pulledAds = false;
@@ -778,7 +821,8 @@ export class Peer {
   private selfAd(): Dict {
     const now = this.now();
     const hints = this.channelAuth === "session"
-      ? { ...this.resourceHints, [SESSION_HINT]: "1" } : { ...this.resourceHints };
+      ? { ...this.resourceHints, [RECORDLESS_HINT]: "1", [SESSION_HINT]: "1" }
+      : { ...this.resourceHints, [RECORDLESS_HINT]: "1" };
     const ad = wire.peerAdvertisement(this.group, this.identity, instantIso(now - (now % 1000)),
       "PT10M", hints);
     ad["endpoints"] = this.endpoints.map((e) => ({ ...e }));
@@ -961,6 +1005,12 @@ export class Peer {
       return new Uint8Array([0xf6]);
     }
     if (ref.startsWith("b")) {
+      // SPEC §7.1 tree roots: the codec alone tells a persistent tree (dag-cbor, 0x71) from a piece
+      // artifact (raw, 0x55); each goes to the seam that can carry it, never the other
+      // (srad/agentspaces-pdt.md PD-E-01). Without a facade a tree root stays invisible here.
+      if (isTreeRoot(ref)) {
+        return this.pdt === null ? null : this.pdt.payload(ref);
+      }
       if (this.content === null) {
         return null;
       }
@@ -1400,6 +1450,34 @@ export class Peer {
    * the issuer renews: `agent` must be the record's issuer, and without one
    * the issuer must be one of this peer's agent names.
    */
+  /**
+   * Cancels an entry this peer (or `agent`) wrote, as `EntryHandle.cancel` does in Java: a state whose
+   * `removes` cover its `adds`, signed by the issuer, so every replica drops the entry. The TypeScript
+   * replica reads such a state as dead where it consults the dot sets (the PDT refs do); elsewhere the
+   * entry lapses with its lease.
+   */
+  cancelEntry(space: string, entryId: string, agent: AgentIdentity | null = null): void {
+    const previous = this.states.get(entryId);
+    if (previous === undefined) {
+      throw new Error(`${entryId} is not held here`);
+    }
+    const record = previous["record"] as Dict;
+    const issuer = String(record["issuer"]);
+    if (agent !== null && agent.agentId !== issuer) {
+      throw new Error(`${entryId} was written by ${issuer}, not ${agent.agentId}`);
+    }
+    if (agent === null && !issuer.startsWith(this.identity.peerId + "/")) {
+      throw new Error(`${entryId} was written by ${issuer}, not by this peer`);
+    }
+    const now = this.now();
+    const dto = wire.signState({ ...previous, removes: unionDots(previous["removes"], previous["adds"]) },
+      this.identity, agent, now);
+    this.states.set(entryId, dto);
+    this.onState?.(dto);
+    this.send("RUMOR", wire.rumorBody(`space:${space}`, `x:${entryId}:${now}`, 6,
+      dumps({ state: dto, claimEntry: null, claim: null })));
+  }
+
   renewEntry(space: string, entryId: string, leaseMillis = 600_000,
              agent: AgentIdentity | null = null): void {
     const previous = this.states.get(entryId)!;
@@ -1676,6 +1754,9 @@ export class Peer {
         this.acceptAd(loads((rumor["payload"] as Uint8Array) ?? new Uint8Array([0xf6])));
       } else if (String(rumor["streamId"] ?? "").startsWith("space:")) {
         const delta = loads((rumor["payload"] as Uint8Array) ?? new Uint8Array([0xf6])) as Dict;
+        if (delta !== null && typeof delta === "object" && delta["state"] !== null && typeof delta["state"] === "object") {
+          nameRecordless(delta["state"] as Dict, rumor["itemId"]);
+        }
         this.foldDelta(delta);
       }
       this.forwardRumor(rumor, link);
@@ -2116,12 +2197,27 @@ export class Peer {
   }
 
   private fold(dto: Dict): void {
-    const record = dto["record"] as Dict | undefined;
-    const entryId = record?.["entryId"];
-    if (typeof entryId !== "string" || !this.verifyState(dto, record!)) {
+    if (dto["record"] === null || dto["record"] === undefined) {
+      this.foldRecordless(dto);
+      return;
+    }
+    const record = dto["record"] as Dict;
+    const entryId = record["entryId"];
+    if (typeof entryId !== "string" || !this.verifyState(dto, record)) {
       return; // unauthenticated record or forged mutable state: drop it
     }
-    if (this.refusedForRevocation(dto, record!)) {
+    // HLC logical counter, 2026-11-08 (Rust team report): every implementation refuses a state
+    // whose issue or lease stamp fails the strict parse, so the replicas converge and no such
+    // stamp reaches the lease's last-writer-wins join; a missing lease stamp is refused too. The
+    // check follows the signatures, and a re-offered state counts once (HLC canonical stamps,
+    // 2026-11-08).
+    if (wire.parseHlc(record["issued"]) === null || wire.parseHlc(dto["leaseStamp"]) === null) {
+      this.countStampRefusal(`s:${entryId}`, dto);
+      return;
+    }
+    const pending = this.pendingStates.get(entryId);
+    this.pendingStates.delete(entryId);
+    if (this.refusedForRevocation(dto, record)) {
       // Authentic, but its actor is revoked here (SPEC §5.6): what is already
       // held stays as held, and this state is not merged.
       return;
@@ -2135,6 +2231,43 @@ export class Peer {
         previous === undefined ? dto : joinStates(previous, dto));
     this.onState?.(this.states.get(entryId)!);
     this.wakeFoldWaiters();
+    if (pending !== undefined) {
+      this.foldRecordless(pending);
+    }
+  }
+
+  /**
+   * A renew, cancel, or complete without its record (srad/agentspaces-pdt.md §3.9, PD-L-01, PD-L-02,
+   * PD-L-04): the state is merged over the record this replica holds, through every check a full
+   * state passes, or kept pending with no event until anti-entropy ships the whole DTO. The entry
+   * id comes from the DTO's `entryId` or from the rumor item that carried it.
+   */
+  private foldRecordless(dto: Dict): void {
+    const entryId = dto["entryId"];
+    if (typeof entryId !== "string" || entryId.length === 0) {
+      return;
+    }
+    // HLC canonical stamps, 2026-11-08: a lease stamp is judged once the record arrives, since
+    // only the record's signer verifies the renewal; fold refuses it then and counts it once.
+    const previous = this.states.get(entryId);
+    if (previous === undefined) {
+      if (this.pendingStates.size >= MAX_PENDING_RECORDLESS && !this.pendingStates.has(entryId)) {
+        const oldest = this.pendingStates.keys().next().value;
+        if (oldest !== undefined) {
+          this.pendingStates.delete(oldest);
+        }
+      }
+      this.pendingStates.set(entryId, dto);
+      return;
+    }
+    const full: Dict = { ...dto, record: previous["record"] };
+    for (const carried of ["issuerPublicKey", "agentCertificate"]) {
+      if ((full[carried] === null || full[carried] === undefined) && previous[carried] !== undefined && previous[carried] !== null) {
+        full[carried] = previous[carried];
+      }
+    }
+    delete full["entryId"];
+    this.fold(full);
   }
 
   /**
@@ -2240,6 +2373,39 @@ export class Peer {
         && this.revocations.refuses(record["issuer"], stateCertificate["agentPublicKey"], signedAt));
   }
 
+  /**
+   * Whether a claim's stamp is one wire.parseHlc refuses. When it is and the claim's proof
+   * verifies, the replica counts the refusal in foldStampsRefused, once per distinct claim on the
+   * entry (HLC canonical stamps, 2026-11-08). The ordered-log host asks this of every committed
+   * claim before it installs or announces one.
+   */
+  refusesClaimStamp(entryId: string, signed: Dict): boolean {
+    const claim = (signed["claim"] ?? {}) as Dict;
+    if (wire.parseHlc(claim["stamp"]) !== null) {
+      return false;
+    }
+    if (wire.verifyClaimProof(signed, this.now())) {
+      this.countStampRefusal(`c:${entryId}`, claim);
+    }
+    return true;
+  }
+
+  /** Counts a verified carrier refused for its stamps, once per distinct `kind` and content. */
+  private countStampRefusal(kind: string, content: Dict): void {
+    const key = `${kind}=${toHex(cryptoPort().sha256(dumps(content)))}`;
+    if (this.refusedStamps.has(key)) {
+      return;
+    }
+    this.refusedStamps.add(key);
+    if (this.refusedStamps.size > MAX_REFUSED_STAMPS) {
+      const eldest = this.refusedStamps.values().next().value;
+      if (eldest !== undefined) {
+        this.refusedStamps.delete(eldest);
+      }
+    }
+    this.foldStampsRefused += 1;
+  }
+
   private foldClaim(entryId: string, signed: Dict): void {
     const claim = signed["claim"] as Dict | undefined;
     const holderKey = signed["holderKey"];
@@ -2257,7 +2423,13 @@ export class Peer {
     const bid = wire.claimNumber(claim["bid"]);
     const expires = wire.claimNumber(claim["expiresAtMillis"]);
     if (!Number.isFinite(epoch) || epoch <= 0 || !Number.isFinite(bid)
-        || !Number.isFinite(expires) || typeof claim["stamp"] !== "string") {
+        || !Number.isFinite(expires)) {
+      return;
+    }
+    // HLC logical counter, 2026-11-08 (Rust team report): every implementation refuses a claim
+    // whose stamp fails the strict parse, so the lattice decides alike everywhere and
+    // wire.compareClaims never sees an unparsed stamp.
+    if (this.refusesClaimStamp(entryId, signed)) {
       return;
     }
     // The proof: peer-signed, or agent-signed under a peer certificate
@@ -2300,12 +2472,26 @@ function physicalOrNull(stamp: unknown): number | null {
 }
 
 /** The state join (ASF-017), exported so the conformance suite can prove it. */
+/**
+ * Fills `entryId` of a recordless state from the rumor item id (`r:<id>:<stamp>`, `d:<id>`,
+ * `x:<id>:<stamp>`, `c:<id>:<stamp>`) when the DTO does not carry one (PD-L-02).
+ */
+export function nameRecordless(state: Dict, itemId: unknown): void {
+  if ((state["record"] !== null && state["record"] !== undefined) || state["entryId"] || typeof itemId !== "string") {
+    return;
+  }
+  const parts = itemId.split(":");
+  if (parts.length >= 2 && ["r", "d", "x", "c"].includes(parts[0]) && parts[1].length > 0) {
+    state["entryId"] = parts[1];
+  }
+}
+
 export function joinStates(previous: Dict, incoming: Dict): Dict {
   const merged: Dict = { ...previous };
   merged["adds"] = unionDots(previous["adds"], incoming["adds"]);
   merged["removes"] = unionDots(previous["removes"], incoming["removes"]);
-  if (wire.compareHlc(String(incoming["leaseStamp"] ?? "0:0:"),
-      String(previous["leaseStamp"] ?? "0:0:")) > 0) {
+  // compareHlc sorts a refused or missing stamp first; the folds hand this join parsed stamps only.
+  if (wire.compareHlc(incoming["leaseStamp"], previous["leaseStamp"]) > 0) {
     merged["leaseStamp"] = incoming["leaseStamp"];
     merged["leaseValue"] = incoming["leaseValue"];
   }

@@ -634,7 +634,7 @@ function decodeEntry<T>(template: Template<T>, wire: WireEntry): Entry<T> | null
   if (!template.matches(payload, tags)) {
     return null;
   }
-  return { entryId: wire.entryId, value: template.decode(payload), tags, issuer: wire.issuer,
+  return { entryId: wire.entryId, value: template.decode(payload), tags, issuer: wire.issuer, type: schemaOf(template.type),
     expiresAtMillis: wire.expiresAtMillis, completed: wire.completed, taken: wire.taken };
 }
 

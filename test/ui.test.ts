@@ -26,7 +26,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { dumps, loads } from "../src/cbor.js";
-import { uiComponent as uiComponentRecord, uiDeclaration } from "../src/wire.js";
+import { appCardHost, uiComponent as uiComponentRecord, uiDeclaration } from "../src/wire.js";
 
 type Dict = { [k: string]: unknown };
 const here = dirname(fileURLToPath(import.meta.url));
@@ -63,4 +63,25 @@ test("the golden card with a declaration round-trips byte for byte", { skip: !("
   const without: Dict = { ...card };
   delete without["ui"];
   assert.ok(!("ui" in (loads(dumps(without as never)) as Dict)));
+});
+
+// SPEC §6.1a.4 (v0.1.28, spiral 5 S5-P-01): a published AppCard carries its host last; the builder encodes it byte for byte.
+test("the golden app card with a host round-trips byte for byte", { skip: !("app_card_host_cbor" in GOLDEN) }, () => {
+  const raw = hex(GOLDEN["app_card_host_cbor"]);
+  const card = loads(raw) as Dict;
+  const keys = Object.keys(card);
+  assert.equal(keys[keys.length - 1], "host", "host is the last key, appended after ui");
+  assert.ok(same(dumps(card as never), raw));
+  const host = card["host"] as Dict;
+  const rebuilt = appCardHost(String(host["url"]), Number(host["port"]), String(host["hostAgent"]), String(host["path"]), host["signOn"] as "tenant" | "none",
+    String(host["publishedBy"]), String(host["publishedAt"]), host["status"] as "serving" | "stopped");
+  assert.ok(same(dumps(rebuilt as never), dumps(host as never)), "the TypeScript builder encodes the Java host byte for byte");
+  assert.equal(host["url"], "https://chat.acme.example");
+  assert.equal(host["port"], 7801);
+  const without: Dict = { ...card };
+  delete without["host"];
+  assert.ok(!("host" in (loads(dumps(without as never)) as Dict)));
+  assert.throws(() => appCardHost(""), /url/);
+  assert.throws(() => appCardHost("http://x", 70000), /port/);
+  assert.throws(() => appCardHost("http://x", 0, "", "/", "password" as never), /signOn/);
 });
