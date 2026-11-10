@@ -26,111 +26,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { Content, MemoryStore, Pipes } from "../src/capabilities/index.js";
 import { loads } from "../src/cbor.js";
-import { Identity } from "../src/identity.js";
-import { Peer } from "../src/peer.js";
 import * as pdt from "../src/pdt/index.js";
-import { Space } from "../src/space.js";
-import * as wire from "../src/wire.js";
 import type { Dict } from "../src/wire.js";
-import "../src/node/index.js";
-
-type V = pdt.CborValue;
-const GROUP = "zTypeScriptPdt";
-
-type Internals = { fold(dto: Dict): void; handle(env: Dict): void; send(kind: string, body: Uint8Array, to?: string | null): void };
-
-class Network {
-  readonly peers = new Map<string, NetPeer>();
-  /** While true, frames queue instead of arriving; `flush` delivers them (two writers that have not seen each other). */
-  holding = false;
-  private readonly held: (() => void)[] = [];
-
-  deliver(fn: () => void): void {
-    if (this.holding) {
-      this.held.push(fn);
-    } else {
-      fn();
-    }
-  }
-
-  flush(): void {
-    this.holding = false;
-    for (const fn of this.held.splice(0)) {
-      fn();
-    }
-  }
-}
-
-class NetPeer extends Peer {
-  constructor(readonly network: Network) {
-    super(Identity.generate(), GROUP);
-    network.peers.set(this.identity.peerId, this);
-    const self = this as unknown as Internals;
-    self.send = (kind: string, body: Uint8Array, to: string | null = null) => {
-      const env = wire.envelope(this.group, kind, this.identity.peerId,
-        wire.hlcNow(this.identity.peerId, this.now()), body, to);
-      network.deliver(() => {
-        const targets = to !== null ? [network.peers.get(to)!]
-          : [...network.peers.values()].filter((p) => p.identity.peerId !== this.identity.peerId);
-        for (const target of targets) {
-          if (target !== undefined && target.accepts(env)) {
-            (target as unknown as Internals).handle(env);
-          }
-        }
-      });
-    };
-  }
-
-  override pullSpace(_space: string): void {}
-  override pullRevocations(): void {}
-}
-
-type Node = { peer: NetPeer; space: Space; content: Content; pdt: pdt.Pdt };
-
-function node(network: Network, options: pdt.PdtOptions = {}): Node {
-  const peer = new NetPeer(network);
-  const space = new Space(peer, "content");
-  let seed = 7;
-  const random = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
-  const content = new Content(new Pipes(peer), space, new MemoryStore(), { pieceSize: 64 * 1024, random });
-  const p = new pdt.Pdt(peer, { content, ...options });
-  return { peer, space, content, pdt: p };
-}
-
-function fleet(n: number, options: pdt.PdtOptions = {}): Node[] {
-  const network = new Network();
-  const nodes = Array.from({ length: n }, () => node(network, options));
-  for (const { peer } of nodes) {
-    peer.introduce();
-  }
-  for (const { pdt: p } of nodes) {
-    p.advertise(); // every member now exists, so every advertisement reaches every cache
-  }
-  return nodes;
-}
-
-async function run(nodes: Node[], rounds = 10): Promise<void> {
-  for (let r = 0; r < rounds; r++) {
-    for (const { content, pdt: p } of nodes) {
-      content.tick();
-      p.tick();
-    }
-    for (const { pdt: p } of nodes) {
-      await p.exchange!.settled();
-    }
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-}
-
-function closeAll(nodes: Node[]): void {
-  for (const n of nodes) {
-    n.pdt.close();
-    n.content.stop();
-    n.peer.close();
-  }
-}
+import { Network, closeAll, fleet, node, run } from "./pdt-fleet.js";
+import type { Node, V } from "./pdt-fleet.js";
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -420,6 +320,16 @@ test("a linear ref serialises writers through takes, and a blob ref ships a file
   }
 });
 
+test("PDT 2 phase 4 measures: a sealed NODES that carries deltas is refused (§10.14)", () => {
+  // the owner's default of 2026-11-09: frames travel in plaintext answers only, and every port refuses the pair
+  const sealed = pdt.tree.sealedNodes(7, Uint8Array.of(1, 2, 3), 0);
+  assert.equal(pdt.tree.treeViolation(sealed), null);
+  const cid = pdt.cids.of(new Uint8Array([1]), pdt.cids.RAW);
+  assert.equal(pdt.tree.treeViolation({ ...sealed, deltas: [{ cid, base: cid, dcz: Uint8Array.of(0x64) }] }),
+    "a sealed NODES carries no deltas");
+  assert.equal(pdt.tree.treeViolation({ ...sealed, deltas: [] }), "a sealed NODES carries no deltas");
+});
+
 test("the exchange drops frames outside the bounds and refuses a tree it does not hold (PD-X-02)", async () => {
   const nodes = fleet(2);
   const [a, b] = nodes as [Node, Node];
@@ -443,12 +353,81 @@ test("the exchange drops frames outside the bounds and refuses a tree it does no
     const fetch = a.pdt.exchange!.fetchTree(unknown, [], [b.peer.identity.peerId]);
     await run(nodes, 2);
     assert.ok(!fetch.done);
-    assert.ok([...fetch.sources.values()].some((s) => s.lacks.has(unknown)), "b answered missing for the root");
+    assert.ok([...fetch.sources.values()].some((s) => s.lacks(unknown, a.peer.now())), "b answered missing for the root");
     fetch.cancel();
     assert.ok(fetch.done && fetch.failure === "cancelled");
     assert.equal(a.pdt.exchange!.fetches.size, 1, "a cancelled fetch leaves the map on the next tick");
     await run(nodes, 1);
     assert.equal(a.pdt.exchange!.fetches.size, 0);
+  } finally {
+    closeAll(nodes);
+  }
+});
+
+// ---- swarm retries (ROBUSTNESS.md §10.3, E2 and E4)
+
+test("a holder that lacked a node is asked again once its bench ends, and the fetch completes (swarm retries, E4)", async () => {
+  const nodes = fleet(2);
+  const [a, b] = nodes as [Node, Node];
+  try {
+    let value = pdt.PMap.empty<string, V>(a.pdt.store);
+    for (let i = 0; i < 300; i++) {
+      value = value.assoc(`k${i}`, "v".repeat(200));
+    }
+    const root = value.root();
+    a.pdt.exchange!.holdTree(root);
+    await run(nodes, 2);
+    const lacked = [...a.pdt.store.reachable(root)].filter((cid) => cid !== root).sort()[0]!;
+    const bytes = a.pdt.store.get(lacked)!;
+    a.pdt.store.remove(lacked);
+    const fetch = b.pdt.exchange!.fetchTree(root);
+    await run(nodes, 3);
+    assert.ok(!fetch.done, "the holder lacks a node: the fetch waits");
+    a.pdt.store.putVerified(lacked, bytes); // the holder's own fetch ran on and brought it
+    const deadline = Date.now() + 4000;
+    while (!fetch.done && Date.now() < deadline) {
+      await run(nodes, 1);
+      await sleep(50);
+    }
+    assert.ok(fetch.complete, fetch.trace.join("\n"));
+    assert.ok(b.pdt.store.complete(root));
+  } finally {
+    closeAll(nodes);
+  }
+});
+
+test("a late head is counted late, never ignored, and the tick fetches it again from another holder (swarm retries, E2)", async () => {
+  const nodes = fleet(3, { loadTimeoutMillis: 300 });
+  const [a, b, c] = nodes as [Node, Node, Node];
+  try {
+    const onA = a.pdt.ref<pdt.PMap<string, V>>("refs", "late", "map");
+    const base = await onA.swap((m) => m.assoc("k1", "v1"));
+    await run(nodes, 2);
+    const onB = b.pdt.ref<pdt.PMap<string, V>>("refs", "late", "map");
+    assert.equal((await onB.deref()).root(), base.root());
+    const entries = (m: pdt.PMap<string, V>) => {
+      let out = m;
+      for (let i = 0; i < 300; i++) {
+        out = out.assoc(`k${i}`, "v".repeat(200));
+      }
+      return out;
+    };
+    const later = entries(pdt.PMap.empty<string, V>(pdt.NodeStore.inMemory()));
+    const head = pdt.pref({ name: "late", kind: "map", root: later.root(), base: [base.root()], seq: 2, size: 300 });
+    a.peer.writeEntry("refs", pdt.PREF_TYPE, head, "typescript", 600_000, null, pdt.prefTags(head));
+    await run(nodes, 2);
+    assert.equal((await onB.deref()).root(), base.root(), "no member holds the new version yet");
+    assert.equal(b.pdt.stats()["headsIgnored"], 0);
+    assert.ok(Number(b.pdt.stats()["headsLate"]) >= 1);
+    const mirror = await c.pdt.ref<pdt.PMap<string, V>>("refs", "mirror", "map").swap(entries);
+    assert.equal(mirror.root(), later.root(), "the same content, the same root");
+    const deadline = Date.now() + 15_000;
+    while (!b.pdt.store.complete(later.root()) && Date.now() < deadline) {
+      await run(nodes, 1); // the tick alone, no read
+      await sleep(50);
+    }
+    assert.ok(b.pdt.store.complete(later.root()), "the tick fetched the head again");
+    assert.equal((await onB.deref()).root(), later.root());
   } finally {
     closeAll(nodes);
   }

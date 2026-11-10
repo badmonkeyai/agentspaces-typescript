@@ -1,6 +1,6 @@
 {
   "name": "@agentspaces/ordered",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "The ordered log for long-running JavaScript hosts (srad/agentspaces-js.md phase 4): a Raft voter with a durable LogStore, the ordered-takes coordinator, and the fleet-wide LEASED and ORDERED joins and the @spaceReduce keeper, for the service residency.",
   "license": "Apache-2.0",
   "type": "module",

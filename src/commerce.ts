@@ -1,15 +1,3 @@
-// The Bad Monkey console records as data (enterprise platform, spiral 3 S3-H-06): the entry types the console
-// and its agents write into a group's `constraints`, `policy`, `decisions`, and `findings` spaces, named by the
-// console namespace `https://badmonkey.ai/console#<Record>` so a TypeScript peer reads them with the same
-// `Template` it uses for its own entries. A field the wire carries that a class here does not declare still
-// arrives on the instance; the declared ones document the shape.
-//
-//     import { Constraint, rules } from "@agentspaces/client";
-//     for (const c of new Space(peer, "constraints").readAll(new Template(Constraint))) console.log(c.template, c.a, c.b);
-//     const counts = Object.fromEntries(Object.entries(rules(peer)).map(([k, v]) => [k, v.length]));
-
-
-
 /**
  * The commerce records (SPEC §6.5a, §7.6; the open `agentspaces-commerce` module): a `Mandate` is an AP2 Checkout or
  * Payment Mandate carried as an entry of a group's `commerce` space, an `Order` the UCP order it led to. The builders

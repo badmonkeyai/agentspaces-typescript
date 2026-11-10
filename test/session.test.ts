@@ -36,7 +36,7 @@ import { deriveSessionKey, sessionHelloBody, parseSessionHello, encodeSessionFra
 import { ChannelEvents, FrameChannel } from "../src/transport.js";
 import * as wire from "../src/wire.js";
 import type { Dict } from "../src/wire.js";
-import { fromHex, toHex, utf8 } from "../src/bytes.js";
+import { fromHex, toHex } from "../src/bytes.js";
 import "../src/node/index.js";
 
 const GROUP = "session-test-group";
@@ -180,7 +180,7 @@ test("the hello body and the key derivation are deterministic for fixed inputs",
   const fromA = deriveSessionKey(aPrivate, "zA", aNonce, bPublic, "zB", bNonce);
   const fromB = deriveSessionKey(bPrivate, "zB", bNonce, aPublic, "zA", aNonce);
   assert.equal(toHex(fromA), toHex(fromB), "both ends derive one key");
-  const env = wire.envelope(GROUP, "PING", "zA", "1735689600000:3:zA", utf8("x"), "zB");
+  const env = wire.envelope(GROUP, "PING", "zA", "1735689600000:3:zA", wire.pingBody(3), "zB");
   const frame = encodeSessionFrame(env, fromA);
   const decoded = wire.decodeFrameDetailed(frame, { session: { peer: "zA", key: fromA } });
   assert.equal(decoded?.auth, "SESSION");

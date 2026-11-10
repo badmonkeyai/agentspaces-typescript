@@ -77,6 +77,7 @@ export class Network {
   }
 
   deliver(target: NetPeer, env: Dict): void {
+    joinStream(target, env);
     const hold = this.holds.get(target.identity.peerId);
     const type = hold === undefined ? null : this.heldType(env);
     if (hold !== undefined && type !== null && hold.types.has(type)) {
@@ -86,6 +87,21 @@ export class Network {
     if (target.accepts(env)) {
       internals(target).handle(env);
     }
+  }
+}
+
+/**
+ * Every peer of this fleet holds every space, as a fleet of full replicas does, since the network
+ * answers no pull: a space rumor joins its space at the target before it arrives (a peer folds only
+ * the spaces it joined, HLC round five, 2026-11-08).
+ */
+function joinStream(target: Peer, env: Dict): void {
+  if (env["kind"] !== "RUMOR") {
+    return;
+  }
+  const stream = String((loads(env["body"] as Uint8Array) as Dict)["streamId"] ?? "");
+  if (stream.startsWith("space:")) {
+    target.joinSpace(stream.substring("space:".length));
   }
 }
 
@@ -243,7 +259,7 @@ export class OrderedFleet {
       const log = this.logs.get(voter.identity.peerId)!;
       voter.publishAd("CapabilityAdvertisement", { id: `aspace://${voter.group}/cap/ordered-log/${voter.identity.peerId}`,
         issuer: voter.identity.peerId, group: voter.group, issued: instantIso(now - (now % 1000)), ttl: "PT10M",
-        capabilityType: ORDERED_LOG_TYPE, parameters: log.parameters() });
+        capabilityType: ORDERED_LOG_TYPE, version: "0.1", binding: "pipe", parameters: log.parameters(), costHints: {} });
     }
   }
 

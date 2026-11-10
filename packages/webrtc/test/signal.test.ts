@@ -60,14 +60,24 @@ test("CAND matches the Java canonical bytes", () => {
     + "6174653a312031205544502031203139322e302e322e3120353030302074797020686f7374646b696e646443414e44ff");
 });
 
-test("a receiver ignores unknown keys and judges the known ones (JS-F-02)", () => {
-  // A body with later fields (a WebRTC Direct cert hash, a renegotiation kind) the reader ignores.
-  const body = cbor.dumps({ v: 1, sid: SID, kind: "END", code: 0, certhash: "later", renegotiate: "ice-restart" });
-  const signal = sig.decode(body);
-  assert.ok(signal !== null);
-  assert.equal(sig.malformed(signal!), null);
-  assert.equal(signal!.kind, "END");
-  assert.equal(signal!.code, 0);
+test("a receiver reads the RtcSignal record as Java's fromWire reads it (HLC round seven, 2026-11-08)", () => {
+  const end = sig.decode(sig.encode(sig.end(SID, sig.END_NORMAL)));
+  assert.ok(end !== null);
+  assert.equal(sig.malformed(end!), null);
+  assert.equal(end!.code, 0);
+  assert.deepEqual(sig.decode(sig.encode(sig.offer(SID, SDP, [FP]))), sig.offer(SID, SDP, [FP]));
+  // Java refuses a key the record does not name (annex B), so a later field needs a new version.
+  assert.equal(sig.decode(cbor.dumps({ v: 1, sid: SID, code: 0, kind: "END", certhash: "later" })), null);
+  // Java coerces nothing: no fingerprint as a number, no text kind as bytes, no v as text, no code as a float.
+  assert.equal(sig.decode(cbor.dumps({ v: 1, fp: [7], sdp: SDP, sid: SID, kind: "OFFER" })), null);
+  assert.equal(sig.decode(cbor.dumps({ v: 1, sid: SID, kind: new Uint8Array([69]) })), null);
+  assert.equal(sig.decode(cbor.dumps({ v: "1", sid: SID, code: 0, kind: "END" })), null);
+  assert.equal(sig.decode(cbor.dumps({ v: 1, sid: SID, code: new cbor.CborDouble(0), kind: "END" })), null);
+  // Fields in another order than the record's, or a null where the record omits the field, do not decode.
+  assert.equal(sig.decode(cbor.dumps({ sid: SID, v: 1, code: 0, kind: "END" })), null);
+  assert.equal(sig.decode(cbor.dumps({ v: 1, mid: null, sid: SID, code: 0, kind: "END" })), null);
+  // A record without its session or its kind is no signal.
+  assert.equal(sig.decode(cbor.dumps({ v: 1, sid: null, code: 0, kind: "END" })), null);
 });
 
 test("the bounds of appendix B", () => {

@@ -29,13 +29,13 @@
  */
 
 import { Identity, deriveId, instantIso } from "./identity.js";
-import { concat, fromBase64, fromUtf8, toBase64, utf8 } from "./bytes.js";
+import { concat, equals, fromBase64, fromUtf8, toBase64, utf8 } from "./bytes.js";
 import { Seed, parseSeed } from "./seed.js";
 
 /** One seed: a transport scheme, `host:port`, and its order. */
 export interface BeaconSeed {
-  transport: string;
-  address: string;
+  transport: string | null;
+  address: string | null;
   priority: number;
 }
 
@@ -45,7 +45,7 @@ export interface BeaconGroup {
   id?: string | null;
   founding?: string | null;
   seeds: BeaconSeed[];
-  wire?: { [key: string]: number } | null;
+  wire?: { [key: string]: number | null } | null;
   multicast?: string | null;
   parameters?: { [key: string]: string } | null;
   invite?: string | null;
@@ -57,7 +57,8 @@ export interface BeaconDocument {
   issuer?: string | null;
   issuerKey?: string | null;
   issued?: string | null;
-  ttl: number;
+  /** A Java long: a bigint when a float64 cannot hold it exactly. */
+  ttl: number | bigint;
   groups: BeaconGroup[];
   signature?: string | null;
 }
@@ -74,8 +75,12 @@ export const FORBIDDEN_PARAMETERS = ["content-key", "contentkey", "credential", 
 
 // ----------------------------------------------------------- canonical JSON
 
-/** A JSON string as Jackson writes it: `"`, `\` and controls escaped (short forms, else `\u00XX`), nothing else. */
-function jsonString(text: string): string {
+/**
+ * A JSON string as Jackson writes it: `"`, `\` and controls escaped (short forms, else `\u00XX`),
+ * nothing else, except that the signed bytes come from Jackson's byte writer, which writes each
+ * UTF-16 surrogate as an upper-case `\uXXXX` escape (HLC round seven, 2026-11-08).
+ */
+function jsonString(text: string, signed: boolean): string {
   let out = "\"";
   for (const ch of text) {
     const code = ch.codePointAt(0) as number;
@@ -92,6 +97,10 @@ function jsonString(text: string): string {
         case "\r": out += "\\r"; break;
         default: out += "\\u" + code.toString(16).toUpperCase().padStart(4, "0");
       }
+    } else if (signed && (code > 0xffff || (code >= 0xd800 && code <= 0xdfff))) {
+      for (let i = 0; i < ch.length; i++) {
+        out += "\\u" + ch.charCodeAt(i).toString(16).toUpperCase();
+      }
     } else {
       out += ch;
     }
@@ -99,92 +108,118 @@ function jsonString(text: string): string {
   return out + "\"";
 }
 
-function jsonInteger(value: unknown, what: string): string {
-  if (typeof value !== "number" || !Number.isInteger(value)) {
-    throw new Error(`${what} must be an integer, not ${String(value)}`);
+/** Java's int, the type of `v`, a seed's priority and a wire hint. */
+const INT_RANGE = [-(2 ** 31), 2 ** 31 - 1];
+/** Java's long, the type of `ttl`. */
+const LONG_MIN = -(1n << 63n);
+const LONG_MAX = (1n << 63n) - 1n;
+
+/** Whether the value is an integer the Java field holds: an int, or a long when `long`. */
+function holdsJavaInteger(value: unknown, long: boolean): value is number | bigint {
+  return typeof value === "bigint"
+    ? long && value >= LONG_MIN && value <= LONG_MAX
+    : typeof value === "number" && (long ? Number.isSafeInteger(value)
+      : Number.isInteger(value) && value >= INT_RANGE[0]! && value <= INT_RANGE[1]!);
+}
+
+/** An integer the Java field holds (an int, or a long when `long`), as Jackson writes it. */
+function jsonInteger(value: unknown, what: string, long = false): string {
+  if (!holdsJavaInteger(value, long)) {
+    throw new Error(`${what} must be an integer a Java ${long ? "long" : "int"} holds, not ${String(value)}`);
   }
   return String(value);
 }
 
 /** An object's fields in the given order, nulls and undefineds omitted. */
-function jsonObject(fields: [string, string | null][]): string {
-  return "{" + fields.filter(([, v]) => v !== null).map(([k, v]) => jsonString(k) + ":" + v).join(",") + "}";
+function jsonObject(fields: [string, string | null][], signed: boolean): string {
+  return "{" + fields.filter(([, v]) => v !== null).map(([k, v]) => jsonString(k, signed) + ":" + v).join(",") + "}";
 }
 
-/** A Map<String, X> with its keys sorted, as ORDER_MAP_ENTRIES_BY_KEYS writes it. */
-function jsonSortedMap(map: { [key: string]: unknown } | null | undefined,
+/**
+ * A Map<String, X> with its keys sorted, as ORDER_MAP_ENTRIES_BY_KEYS writes it: in String.compareTo
+ * order, by UTF-16 code units, which JavaScript's string comparison also uses.
+ */
+function jsonSortedMap(map: { [key: string]: unknown } | null | undefined, signed: boolean,
                        value: (v: unknown, k: string) => string): string | null {
   if (map === null || map === undefined) {
     return null;
   }
   const keys = Object.keys(map).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-  return "{" + keys.map((k) => jsonString(k) + ":" + value(map[k], k)).join(",") + "}";
+  return "{" + keys.map((k) => jsonString(k, signed) + ":" + value(map[k], k)).join(",") + "}";
 }
 
-function optionalString(value: unknown, what: string): string | null {
+function optionalString(value: unknown, what: string, signed: boolean): string | null {
   if (value === null || value === undefined) {
     return null;
   }
   if (typeof value !== "string") {
     throw new Error(`${what} must be a string`);
   }
-  return jsonString(value);
+  return jsonString(value, signed);
 }
 
-function jsonSeed(seed: BeaconSeed): string {
+/** A seed as Jackson writes the Seed record, which writes a null transport or address. */
+function jsonSeed(seed: BeaconSeed, signed: boolean): string {
   return jsonObject([
-    ["transport", optionalString(seed.transport, "seed.transport")],
-    ["address", optionalString(seed.address, "seed.address")],
+    ["transport", optionalString(seed.transport, "seed.transport", signed) ?? "null"],
+    ["address", optionalString(seed.address, "seed.address", signed) ?? "null"],
     ["priority", jsonInteger(seed.priority, "seed.priority")],
-  ]);
+  ], signed);
 }
 
-function jsonGroup(group: BeaconGroup): string {
+function jsonGroup(group: BeaconGroup, signed: boolean): string {
   if (typeof group.name !== "string") {
     throw new Error("a group needs a name");
   }
   return jsonObject([
-    ["name", jsonString(group.name)],
-    ["id", optionalString(group.id, "group.id")],
-    ["founding", optionalString(group.founding, "group.founding")],
-    ["seeds", "[" + (group.seeds ?? []).map(jsonSeed).join(",") + "]"],
-    ["wire", jsonSortedMap(group.wire, (v, k) => jsonInteger(v, `wire.${k}`))],
-    ["multicast", optionalString(group.multicast, "group.multicast")],
-    ["parameters", jsonSortedMap(group.parameters, (v, k) => optionalString(v, `parameters.${k}`) ?? "null")],
-    ["invite", optionalString(group.invite, "group.invite")],
-  ]);
+    ["name", jsonString(group.name, signed)],
+    ["id", optionalString(group.id, "group.id", signed)],
+    ["founding", optionalString(group.founding, "group.founding", signed)],
+    ["seeds", "[" + (group.seeds ?? []).map((seed) => jsonSeed(seed, signed)).join(",") + "]"],
+    ["wire", jsonSortedMap(group.wire, signed, (v, k) => (v === null ? "null" : jsonInteger(v, `wire.${k}`)))],
+    ["multicast", optionalString(group.multicast, "group.multicast", signed)],
+    ["parameters", jsonSortedMap(group.parameters, signed,
+      (v, k) => optionalString(v, `parameters.${k}`, signed) ?? "null")],
+    ["invite", optionalString(group.invite, "group.invite", signed)],
+  ], signed);
+}
+
+/** The document's fields but the signature, in declared order. */
+function documentFields(document: BeaconDocument, signed: boolean): [string, string | null][] {
+  return [
+    ["v", jsonInteger(document.v, "v")],
+    ["issuer", optionalString(document.issuer, "issuer", signed)],
+    ["issuerKey", optionalString(document.issuerKey, "issuerKey", signed)],
+    ["issued", optionalString(document.issued, "issued", signed)],
+    ["ttl", jsonInteger(document.ttl, "ttl", true)],
+    ["groups", "[" + (document.groups ?? []).map((group) => jsonGroup(group, signed)).join(",") + "]"],
+  ];
 }
 
 /**
  * BeaconDocument.canonicalBytes: the document without its signature as
- * Jackson writes it (declared field order, no whitespace, sorted maps,
- * nulls omitted). The bytes the issuer signs and a reader verifies.
+ * Jackson's byte writer writes it (declared field order, no whitespace, sorted
+ * maps, nulls omitted, each surrogate escaped). The bytes the issuer signs and
+ * a reader verifies.
  */
 export function canonicalDocumentBytes(document: BeaconDocument): Uint8Array {
-  return utf8(jsonObject([
-    ["v", jsonInteger(document.v, "v")],
-    ["issuer", optionalString(document.issuer, "issuer")],
-    ["issuerKey", optionalString(document.issuerKey, "issuerKey")],
-    ["issued", optionalString(document.issued, "issued")],
-    ["ttl", jsonInteger(document.ttl, "ttl")],
-    ["groups", "[" + (document.groups ?? []).map(jsonGroup).join(",") + "]"],
-  ]));
+  return utf8(jsonObject(documentFields(document, true), true));
 }
 
-/** The document as one-line JSON, signature included: what a beacon serves. */
+/**
+ * The document as one-line JSON, signature included: what a beacon serves, Java's
+ * toBytes, which Jackson's text writer writes, so a code point past U+FFFF stays as it is.
+ */
 export function documentJson(document: BeaconDocument): string {
-  const canonical = fromUtf8(canonicalDocumentBytes(document));
-  if (document.signature === null || document.signature === undefined) {
-    return canonical;
-  }
-  return canonical.slice(0, -1) + ",\"signature\":" + jsonString(document.signature) + "}";
+  return jsonObject([...documentFields(document, false),
+    ["signature", optionalString(document.signature, "signature", false)]], false);
 }
 
 /**
  * BeaconDocument.signed: builds and signs a document with the beacon's
  * identity. Here so a TypeScript beacon (or a test) can serve one.
  */
-export function signBeaconDocument(issuer: Identity, groups: BeaconGroup[], ttlSeconds = 300,
+export function signBeaconDocument(issuer: Identity, groups: BeaconGroup[], ttlSeconds: number | bigint = 300,
                                    issuedMillis: number = Date.now()): BeaconDocument {
   for (const group of groups) {
     refuseForbidden(group);
@@ -211,27 +246,133 @@ function refuseForbidden(group: BeaconGroup): void {
   }
 }
 
-function asString(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
+/*
+ * The member readers (SPEC v0.1.32 §9.3, 2026-11-09, the owner's rule that a wrong-typed field is
+ * refused in every port): a document, signed or not, refuses a member it names that holds another
+ * type than Java's field, as Java's reader does. An absent or null member reads as Java reads it.
+ */
+
+/** A text member, or null when absent. */
+function textMember(value: unknown, what: string): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    throw new Error(`not a beacon document: ${what} is not text`);
+  }
+  return value;
+}
+
+/** An integer member a Java int holds; absent or null reads as Java's default 0. */
+function intMember(value: unknown, what: string): number {
+  if (value === null || value === undefined) {
+    return 0;
+  }
+  if (!holdsJavaInteger(value, false)) {
+    throw new Error(`not a beacon document: ${what} is no integer a Java int holds`);
+  }
+  return value as number;
+}
+
+/** An integer member a Java long holds, exactly; absent or null reads as 0. */
+function longMember(value: unknown, what: string): number | bigint {
+  if (value === null || value === undefined) {
+    return 0;
+  }
+  if (!holdsJavaInteger(value, true)) {
+    throw new Error(`not a beacon document: ${what} is no integer a Java long holds`);
+  }
+  return value;
+}
+
+/** A list member, empty when absent. */
+function listMember(value: unknown, what: string): unknown[] {
+  if (value === null || value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new Error(`not a beacon document: ${what} is not an array`);
+  }
+  return value;
+}
+
+/** An object member whose every value meets `check`, or null when absent. */
+function mapMember<T>(value: unknown, what: string, check: (v: unknown, what: string) => void):
+  { [key: string]: T } | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`not a beacon document: ${what} is not an object`);
+  }
+  const map = value as { [key: string]: unknown };
+  for (const key of Object.keys(map)) {
+    check(map[key], `${what}.${key}`);
+  }
+  return map as { [key: string]: T };
 }
 
 /**
- * BeaconDocument.parse: reads a document from its JSON, ignoring unknown
- * fields, refusing a version below 1 and a group with a forbidden parameter.
+ * BeaconDocument.parse: reads a document from its JSON, refusing a version
+ * below 1 and a group with a forbidden parameter. An unsigned document reads
+ * leniently in form, with whitespace, any member order, and unknown members,
+ * while every member it names holds its Java type (SPEC v0.1.32 §9.3,
+ * 2026-11-09): a ttl sent as text or a priority sent as 1.0 refuses it, as
+ * Java's reader refuses it. A document that carries a signature must
+ * be exactly its canonical JSON, {@link documentJson} of what it decodes to
+ * (HLC round seven, 2026-11-08, owner ruling F3 applied to the beacon
+ * document): the signature covers {@link canonicalDocumentBytes}, which are
+ * then the text received less the signature member, so whitespace, another
+ * member order, an unknown or repeated member, another escape, or a number in
+ * another form refuses the document instead of relabelling it.
  */
 export function parseBeaconDocument(json: string | Uint8Array): BeaconDocument {
-  const raw: unknown = JSON.parse(typeof json === "string" ? json : fromUtf8(json));
+  const document = readDocument(typeof json === "string" ? json : fromUtf8(json));
+  if (document.signature === null) {
+    return document;
+  }
+  // bytes compare as bytes, since decoding drops a byte order mark and repairs ill-formed UTF-8
+  const canonical = documentJson(document);
+  if (typeof json === "string" ? canonical !== json : !equals(utf8(canonical), json)) {
+    throw new Error("a signed beacon document is not its canonical JSON");
+  }
+  // the signature lies outside the signed bytes, so another text of the same bytes is a relabel
+  if (!canonicalBase64(document.signature) || !canonicalBase64(document.issuerKey)) {
+    throw new Error("a signed beacon document's signature or key is not canonical base64");
+  }
+  return document;
+}
+
+/**
+ * JSON.parse keeping an integer past the float64 safe range as a bigint from its source text (HLC
+ * round seven, 2026-11-08), so a ttl a Java long holds and a float64 does not reads exactly. A
+ * number written with a fraction or an exponent reads as NaN (2026-11-09), since `1.0` and `1`
+ * parse alike and Java's reader holds no such number in an integer member.
+ */
+function exactIntegers(_key: string, value: unknown, context?: { source?: string }): unknown {
+  if (typeof value !== "number") {
+    return value;
+  }
+  const source = context?.source ?? "";
+  if (!/^-?\d+$/.test(source)) {
+    return Number.NaN;
+  }
+  return Number.isSafeInteger(value) ? value : BigInt(source);
+}
+
+function readDocument(text: string): BeaconDocument {
+  const raw: unknown = JSON.parse(text, exactIntegers as (key: string, value: unknown) => unknown);
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     throw new Error("not a beacon document");
   }
   const r = raw as { [key: string]: unknown };
-  const v = Number(r["v"] ?? 0);
-  if (!Number.isInteger(v) || v < 1) {
+  const v = intMember(r["v"], "v");
+  if (v < 1) {
     throw new Error(`not a beacon document: v=${String(r["v"])}`);
   }
   const groups: BeaconGroup[] = [];
-  for (const g of Array.isArray(r["groups"]) ? r["groups"] : []) {
-    if (typeof g !== "object" || g === null) {
+  for (const g of listMember(r["groups"], "groups")) {
+    if (typeof g !== "object" || g === null || Array.isArray(g)) {
       throw new Error("not a beacon document: a group is not an object");
     }
     const group = g as { [key: string]: unknown };
@@ -239,35 +380,50 @@ export function parseBeaconDocument(json: string | Uint8Array): BeaconDocument {
       throw new Error("not a beacon document: a group has no name");
     }
     const seeds: BeaconSeed[] = [];
-    for (const s of Array.isArray(group["seeds"]) ? group["seeds"] : []) {
-      const seed = (s ?? {}) as { [key: string]: unknown };
-      seeds.push({ transport: String(seed["transport"] ?? ""), address: String(seed["address"] ?? ""),
-        priority: Number(seed["priority"] ?? 0) });
+    for (const s of listMember(group["seeds"], "seeds")) {
+      if (typeof s !== "object" || s === null || Array.isArray(s)) {
+        throw new Error("not a beacon document: a seed is not an object");
+      }
+      const seed = s as { [key: string]: unknown };
+      seeds.push({ transport: textMember(seed["transport"], "seed.transport"),
+        address: textMember(seed["address"], "seed.address"), priority: intMember(seed["priority"], "seed.priority") });
     }
     const parsed: BeaconGroup = {
       name: group["name"],
-      id: asString(group["id"]),
-      founding: asString(group["founding"]),
+      id: textMember(group["id"], "group.id"),
+      founding: textMember(group["founding"], "group.founding"),
       seeds,
-      wire: typeof group["wire"] === "object" && group["wire"] !== null
-        ? group["wire"] as { [key: string]: number } : null,
-      multicast: asString(group["multicast"]),
-      parameters: typeof group["parameters"] === "object" && group["parameters"] !== null
-        ? group["parameters"] as { [key: string]: string } : null,
-      invite: asString(group["invite"]),
+      wire: mapMember<number | null>(group["wire"], "wire", (value, what) => {
+        if (value !== null) {
+          intMember(value, what);
+        }
+      }),
+      multicast: textMember(group["multicast"], "group.multicast"),
+      parameters: mapMember<string>(group["parameters"], "parameters", (value, what) => textMember(value, what)),
+      invite: textMember(group["invite"], "group.invite"),
     };
     refuseForbidden(parsed);
     groups.push(parsed);
   }
   return {
     v,
-    issuer: asString(r["issuer"]),
-    issuerKey: asString(r["issuerKey"]),
-    issued: asString(r["issued"]),
-    ttl: Number(r["ttl"] ?? 0),
+    issuer: textMember(r["issuer"], "issuer"),
+    issuerKey: textMember(r["issuerKey"], "issuerKey"),
+    issued: textMember(r["issued"], "issued"),
+    ttl: longMember(r["ttl"], "ttl"),
     groups,
-    signature: asString(r["signature"]),
+    // Jackson reads a number or a boolean as its text, which is then no canonical JSON
+    signature: textMember(r["signature"], "the signature"),
   };
+}
+
+/** Whether the text is absent or the padded standard base64 of the bytes it decodes to. */
+function canonicalBase64(text: string | null | undefined): boolean {
+  try {
+    return text === null || text === undefined || toBase64(fromBase64(text)) === text;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -375,8 +531,8 @@ export function seedsFor(group: BeaconGroup, schemes: Iterable<string>): Seed[] 
   const wanted = new Set([...schemes].map((s) => s.toLowerCase()));
   const out: { seed: Seed; priority: number; index: number }[] = [];
   group.seeds.forEach((s, index) => {
-    const scheme = s.transport.toLowerCase();
-    if (!wanted.has(scheme)) {
+    const scheme = (s.transport ?? "tcp").toLowerCase();
+    if (!wanted.has(scheme) || s.address === null) {
       return;
     }
     try {

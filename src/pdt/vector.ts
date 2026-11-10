@@ -25,7 +25,8 @@
 
 import { concat } from "../bytes.js";
 import type { CborValue } from "../cbor.js";
-import { Embedded, KIND_KEY, KIND_V, KIND_VR, Link, NodeFormatError, decode, encode } from "./nodes.js";
+import { RrRoot, RvNode } from "./kinds.js";
+import { Embedded, KIND_KEY, KIND_RR, KIND_RV, KIND_V, KIND_VR, Link, NodeFormatError, decode, encode, kindOf } from "./nodes.js";
 import { NodeStore } from "./store.js";
 import { Codec, Ctx, Flusher, Ref, cborHeader, codecOf, refOf, resolve, sameValue, spill } from "./values.js";
 
@@ -36,7 +37,12 @@ export const MASK = WIDTH - 1;
 export class VecNode {
   cid: string | null = null;
 
-  constructor(readonly leaf: boolean, public slots: (Ref | VecNode | string)[], public edit: object | null) {}
+  /**
+   * @param sizes the cumulative element counts of a relaxed interior node read from an `rv` node (PDT 2 phase 7,
+   *              P2-R-04), one per child; null on a leaf and on a dense node
+   */
+  constructor(readonly leaf: boolean, public slots: (Ref | VecNode | string)[], public edit: object | null,
+              readonly sizes: number[] | null = null) {}
 
   editable(ctx: Ctx): VecNode {
     if (ctx.owns(this.edit)) {
@@ -91,6 +97,15 @@ export class VecNode {
   }
 
   static decode(cid: string | null, bytes: Uint8Array): VecNode {
+    const n = VecNode.decodeV(cid, bytes);
+    if (n.leaf && n.slots.length !== WIDTH) {
+      throw new NodeFormatError(`vector leaf with ${n.slots.length} items; a leaf in the trie holds exactly 32`, cid);
+    }
+    return n;
+  }
+
+  /** A `v` node of 1 to 32 slots. */
+  private static decodeV(cid: string | null, bytes: Uint8Array): VecNode {
     const node = decode(bytes, cid);
     if (node[KIND_KEY] !== KIND_V) {
       throw new NodeFormatError(`expected a vector node, found kind '${String(node[KIND_KEY])}'`, cid);
@@ -104,15 +119,70 @@ export class VecNode {
     if (list.length === 0 || list.length > WIDTH) {
       throw new NodeFormatError(`vector node with ${list.length} slots; 1 to 32 expected`, cid);
     }
-    if (hasE && list.length !== WIDTH) {
-      throw new NodeFormatError(`vector leaf with ${list.length} items; a leaf in the trie holds exactly 32`, cid);
-    }
     const slots = list.map((item) => (item instanceof Link ? item.cid : refOf(item as Embedded)));
     const n = new VecNode(hasE, slots, null);
     n.cid = cid;
     return n;
   }
+
+  /**
+   * Reads a node of a relaxed tree at a known level (PDT 2 phase 7, P2-R-04; Java's VecNode.decodeRelaxed): a `v` leaf
+   * of 1 to 32 items at level 0, a dense `v` interior node above it, or an `rv` node whose size table describes a
+   * relaxed node. It refuses by name an `rv` node without `z`, a size table a radix index reads the same way, a child
+   * that holds more elements than its level holds, and a node that does not hold the elements its parent counts under
+   * it, so an index and an iteration read the same elements.
+   *
+   * @param level 0 for a leaf, else the shift of its children's index bits
+   * @param count the elements its parent counts under it
+   */
+  static decodeRelaxed(cid: string, bytes: Uint8Array, level: number, count: number): VecNode {
+    const node = kindOf(bytes, cid) === KIND_RV ? VecNode.decodeRv(cid, bytes, level) : VecNode.decodeV(cid, bytes);
+    if (node.sizes === null && node.leaf !== (level === 0)) {
+      throw new NodeFormatError(`a vector ${node.leaf ? "leaf" : "interior node"} at level ${level}`, cid);
+    }
+    const width = node.slots.length;
+    const capacity = 2 ** level;
+    const fits = node.sizes !== null ? node.sizes[width - 1] === count : (width - 1) * capacity < count && count <= width * capacity;
+    if (!fits) {
+      throw new NodeFormatError(`a vector node of ${width} slots at level ${level} does not hold the ${count} elements its`
+        + " parent counts under it", cid);
+    }
+    return node;
+  }
+
+  private static decodeRv(cid: string, bytes: Uint8Array, level: number): VecNode {
+    if (level === 0) {
+      throw new NodeFormatError("an rv node where a vector leaf belongs", cid);
+    }
+    const rv = RvNode.decode(bytes, cid);
+    if (rv.sizes === null) {
+      throw new NodeFormatError("an rv node without z; a dense interior node is a v node", cid);
+    }
+    const capacity = 2 ** level;
+    let previous = 0;
+    let dense = true;
+    rv.sizes.forEach((size, i) => {
+      if (size > MAX_COUNT) {
+        throw new NodeFormatError(`an rv size of ${size} passes the 2^31 - 1 elements a vector holds`, cid);
+      }
+      if (size - previous > capacity) {
+        throw new NodeFormatError(`an rv child holds ${size - previous} elements, more than the ${capacity} its level holds`, cid);
+      }
+      dense &&= i === rv.sizes!.length - 1 || size - previous === capacity;
+      previous = size;
+    });
+    if (dense) {
+      throw new NodeFormatError("a size table on a dense node; a dense interior node is a v node", cid);
+    }
+    const node = new VecNode(false, rv.children.map((link) => link.cid), null, [...rv.sizes]);
+    node.cid = cid;
+    return node;
+  }
 }
+
+/** The most elements a vector holds, and the deepest shift a reader reads (P2-R-04). */
+const MAX_COUNT = 0x7fffffff;
+const MAX_SHIFT = 30;
 
 export function tailoff(n: number): number {
   return n < WIDTH ? 0 : ((n - 1) >>> BITS) << BITS;
@@ -130,15 +200,20 @@ export function shiftFor(n: number): number {
 export class VecRoot {
   cid: string | null = null;
 
+  /**
+   * @param relaxed whether this is the root of an RRB tree read from an `rr` node (PDT 2 phase 7, P2-R-04): its tail
+   *                holds 0 to 32 elements whatever the count and its trie may hold relaxed nodes, so it reads through
+   *                the size tables, and an edit packs it first (P2-R-03)
+   */
   constructor(public n: number, public shift: number, public trie: VecNode | string | null, public tail: Ref[],
-              public edit: object | null) {}
+              public edit: object | null, readonly relaxed = false) {}
 
   static empty(): VecRoot {
     return new VecRoot(0, BITS, null, [], null);
   }
 
   tailoff(): number {
-    return tailoff(this.n);
+    return this.relaxed ? this.n - this.tail.length : tailoff(this.n);
   }
 
   private editable(ctx: Ctx): VecRoot {
@@ -177,11 +252,22 @@ export class VecRoot {
     if (i >= this.tailoff()) {
       return this.tail[i - this.tailoff()]!;
     }
+    if (this.relaxed) {
+      const { leaf, start } = relaxedLeafAt(this, i, ctx);
+      return leaf.item(i - start) as Ref;
+    }
     return this.leafFor(i, ctx).item(i & MASK) as Ref;
   }
 
   /** Items in index order; leaves load on demand. */
   *items(ctx: Ctx): Generator<Ref> {
+    if (this.relaxed) {
+      if (this.trie !== null) {
+        yield* relaxedLeaves(relaxedTrie(this, ctx), ctx);
+      }
+      yield* this.tail;
+      return;
+    }
     const off = this.tailoff();
     for (let i = 0; i < off; i += WIDTH) {
       const leaf = this.leafFor(i, ctx);
@@ -196,7 +282,23 @@ export class VecRoot {
 
   // ---- writes
 
+  /** The leftwise-dense `vr` root of the same elements (P2-R-03), built under a private edit token; this root when dense. */
+  packed(ctx: Ctx): VecRoot {
+    if (!this.relaxed) {
+      return this;
+    }
+    const edit = new Ctx(ctx.store, {});
+    let out = VecRoot.empty();
+    for (const item of this.items(ctx)) {
+      out = out.conj(item, edit);
+    }
+    return out;
+  }
+
   conj(item: Ref, ctx: Ctx): VecRoot {
+    if (this.relaxed) {
+      return this.packed(ctx).conj(item, ctx);
+    }
     const off = this.tailoff();
     if (this.n - off < WIDTH) {
       const r = this.editable(ctx);
@@ -236,6 +338,9 @@ export class VecRoot {
   pop(ctx: Ctx): VecRoot {
     if (this.n === 0) {
       throw new Error("pop on an empty vector");
+    }
+    if (this.relaxed) {
+      return this.packed(ctx).pop(ctx);
     }
     const off = this.tailoff();
     if (this.n - off > 1) {
@@ -285,6 +390,9 @@ export class VecRoot {
     if (i < 0 || i >= this.n) {
       throw new RangeError(`index ${i} of a vector of ${this.n}`);
     }
+    if (this.relaxed) {
+      return this.packed(ctx).assocN(i, item, ctx);
+    }
     const off = this.tailoff();
     if (i >= off) {
       if (sameValue(this.tail[i - off]!, item)) {
@@ -311,6 +419,9 @@ export class VecRoot {
   }
 
   static decode(cid: string | null, bytes: Uint8Array): VecRoot {
+    if (kindOf(bytes, cid) === KIND_RR) {
+      return VecRoot.decodeRr(cid, bytes);
+    }
     const node = decode(bytes, cid);
     if (node[KIND_KEY] !== KIND_VR) {
       throw new NodeFormatError(`expected a vector root, found kind '${String(node[KIND_KEY])}'`, cid);
@@ -334,6 +445,106 @@ export class VecRoot {
     const r = new VecRoot(n, shift, trie, t.map(refOf), null);
     r.cid = cid;
     return r;
+  }
+
+  /**
+   * Reads an `rr` root (PDT 2 phase 7, P2-R-04): the shape {@link RrRoot} checks, a count a vector can hold, and a
+   * shift of at most 30; the nodes below it load on demand through {@link VecNode.decodeRelaxed}.
+   */
+  private static decodeRr(cid: string | null, bytes: Uint8Array): VecRoot {
+    const rr = RrRoot.decode(bytes, cid);
+    if (rr.count > MAX_COUNT || rr.shift > MAX_SHIFT) {
+      throw new NodeFormatError(`rr root with count ${rr.count} and shift ${rr.shift}`, cid);
+    }
+    const r = new VecRoot(rr.count, rr.shift, rr.trie === null ? null : rr.trie.cid, rr.tail.map(refOf), null, true);
+    r.cid = cid;
+    return r;
+  }
+}
+
+// ------------------------------------------------------------------ relaxed reads (PDT 2 phase 7, P2-R-04)
+
+/** A sub-tree of a relaxed root: a node or its CID at a level, and the elements under it (Java's Rrb.Sub). */
+interface Sub { ref: VecNode | string; level: number; count: number }
+
+/** A node at a level, read and checked against the elements its parent counts under it. */
+function loadSub(sub: Sub, ctx: Ctx): VecNode {
+  return sub.ref instanceof VecNode ? sub.ref : VecNode.decodeRelaxed(sub.ref, ctx.load(sub.ref), sub.level, sub.count);
+}
+
+/** The elements under child `j` of a node: from the size table when relaxed, else a full child but the last. */
+function childCount(node: VecNode, j: number, level: number, count: number): number {
+  if (node.sizes !== null) {
+    return node.sizes[j]! - (j === 0 ? 0 : node.sizes[j - 1]!);
+  }
+  const last = node.slots.length - 1;
+  return j < last ? 2 ** level : count - last * 2 ** level;
+}
+
+/** Child `j` of a sub-tree, loaded and kept in its parent's slot. */
+function kid(sub: Sub, j: number, ctx: Ctx): Sub {
+  const node = loadSub(sub, ctx);
+  const ref = node.item(j);
+  const child: Sub = { ref: ref as VecNode | string, level: sub.level - BITS, count: childCount(node, j, sub.level, sub.count) };
+  if (ref instanceof VecNode) {
+    return child;
+  }
+  const loaded = loadSub(child, ctx);
+  node.slots[j] = loaded;
+  return { ...child, ref: loaded };
+}
+
+/** The trie of a relaxed root as a sub-tree, loaded and kept on the root. */
+function relaxedTrie(root: VecRoot, ctx: Ctx): Sub {
+  const loaded = loadSub({ ref: root.trie!, level: root.shift, count: root.tailoff() }, ctx);
+  root.trie = loaded;
+  return { ref: loaded, level: root.shift, count: root.tailoff() };
+}
+
+/** The child of a node that holds a local index: by radix when dense, by binary search of `z` when relaxed. */
+function locate(node: VecNode, level: number, index: number): number {
+  if (node.sizes === null) {
+    return Math.floor(index / 2 ** level);
+  }
+  const z = node.sizes;
+  let lo = 0, hi = z.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (z[mid]! > index) {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return lo;
+}
+
+/** The elements before child `j` of a node at a level. */
+function before(node: VecNode, level: number, j: number): number {
+  return node.sizes === null ? j * 2 ** level : j === 0 ? 0 : node.sizes[j - 1]!;
+}
+
+/** The leaf of a relaxed root that holds a trie index, and the index of its first element. */
+function relaxedLeafAt(root: VecRoot, index: number, ctx: Ctx): { leaf: VecNode; start: number } {
+  let at = relaxedTrie(root, ctx);
+  let start = 0;
+  while (at.level > 0) {
+    const node = loadSub(at, ctx);
+    const j = locate(node, at.level, index - start);
+    start += before(node, at.level, j);
+    at = kid(at, j, ctx);
+  }
+  return { leaf: loadSub(at, ctx), start };
+}
+
+function* relaxedLeaves(sub: Sub, ctx: Ctx): Generator<Ref> {
+  const node = loadSub(sub, ctx);
+  if (sub.level === 0) {
+    yield* node.slots as Ref[];
+    return;
+  }
+  for (let j = 0; j < node.slots.length; j++) {
+    yield* relaxedLeaves(kid(sub, j, ctx), ctx);
   }
 }
 
@@ -386,6 +597,16 @@ export class PVector<E = CborValue> implements Iterable<E> {
 
   count(): number {
     return this.raw.n;
+  }
+
+  /** Whether this vector's root is an `rr` root that still holds a relaxed node (P2-R-03); a head over it is `PRef.v` 2. */
+  relaxed(): boolean {
+    return this.raw.relaxed;
+  }
+
+  /** The leftwise-dense `vr` vector of the same elements, whose root those elements have whatever the history (P2-R-03). */
+  packed(): PVector<E> {
+    return this.raw.relaxed ? new PVector(this.raw.packed(this.ctx), this.ctx, this.codec) : this;
   }
 
   isEmpty(): boolean {
@@ -442,7 +663,8 @@ export class PVector<E = CborValue> implements Iterable<E> {
     let open: [number, number] | null = null;
     for (let i = 0; i < common; i++) {
       let same: boolean;
-      if ((i & MASK) === 0 && i + WIDTH <= Math.min(this.raw.tailoff(), base.raw.tailoff())) {
+      // a relaxed vector compares element by element, since its leaves need not align with the other's
+      if (!this.raw.relaxed && !base.raw.relaxed && (i & MASK) === 0 && i + WIDTH <= Math.min(this.raw.tailoff(), base.raw.tailoff())) {
         const a = this.raw.leafFor(i, this.ctx), b = base.raw.leafFor(i, base.ctx);
         if (a === b || (a.cid !== null && a.cid === b.cid)) {
           if (open !== null) {
@@ -471,8 +693,9 @@ export class PVector<E = CborValue> implements Iterable<E> {
     return { changed, added: Math.max(0, this.count() - base.count()), removed: Math.max(0, base.count() - this.count()) };
   }
 
+  /** Equality by the packed roots (P2-R-03): two vectors of the same elements are equal whatever their histories. */
   equals(other: PVector<E>): boolean {
-    return this.root() === other.root();
+    return this.packed().root() === other.packed().root();
   }
 }
 

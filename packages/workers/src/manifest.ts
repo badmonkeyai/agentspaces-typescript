@@ -28,7 +28,7 @@
 
 import { assetCard, ASSET_INVOKE_CAPABILITY, DATA_QUERY_CAPABILITY } from "@agentspaces/connect";
 import type { StringMap } from "@agentspaces/connect";
-import { parseDurationMillis } from "@agentspaces/client";
+import { durationIso, parseDurationMillis } from "@agentspaces/client";
 import type { wire } from "@agentspaces/client";
 
 type Dict = wire.Dict;
@@ -464,5 +464,6 @@ export function cardTtl(manifest: AssetManifest): string {
   if (manifest.freshness === undefined) {
     return DEFAULT_TTL;
   }
-  return `PT${Math.max(1, Math.round((2 * parseDurationMillis(manifest.freshness)) / 1000))}S`;
+  // As Java's Duration prints it, PT1M for sixty seconds, which every receiver requires (HLC round six, 2026-11-08).
+  return durationIso(1000 * Math.max(1, Math.round((2 * parseDurationMillis(manifest.freshness)) / 1000)));
 }

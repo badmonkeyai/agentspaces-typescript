@@ -25,11 +25,14 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { ContextStore, installContextStores } from "../emitter.js";
 import { registerDefaultDialer } from "../transport.js";
+import { installZstd } from "../pdt/dcz.js";
 import { TcpDialer } from "./tcp.js";
 import { TlsDialer } from "./tls.js";
+import { nodeZstd } from "./zstd.js";
 
 registerDefaultDialer(new TcpDialer());
 registerDefaultDialer(new TlsDialer());
+installZstd(nodeZstd); // PDT 2 phase 7 (P2-Z-04): the decoder of intra-chunk delta frames
 installContextStores(<T>(): ContextStore<T> => {
   const storage = new AsyncLocalStorage<T>();
   return { get: () => storage.getStore(), run: (value, fn) => storage.run(value, fn) };

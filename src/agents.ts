@@ -146,18 +146,20 @@ function mark(binding: Binding): MethodDecorator {
   };
 }
 
-/** Names the agent, as `@AgentSpec` does: the card's name, description, and goals. */
 const DATA_USE = Symbol.for("agentspaces.dataUse");
-export const DATA_USE_TYPE = "https://badmonkey.ai/console#DataUse";
 export const CATALOG_SPACE = "catalog";
 
-/** One declared source (the console's data catalog, SRAD bma-spiral1-console §3.4). */
-export type DataUseDecl = { reads?: string[]; writes?: string[]; source: string; sensitivity?: string; freshness?: string };
+/**
+ * One declared source and the record type its entry is written as (neutral vectors, 2026-11-09): `type` is the wire
+ * type the caller names, such as its product's data-catalog record; the binder names none of its own.
+ */
+export type DataUseDecl = { type: string; reads?: string[]; writes?: string[]; source: string; sensitivity?: string;
+  freshness?: string };
 
 /**
- * Declares what the agent reads from a source that is not a space (S1-G-09): on bind the binder writes one
- * `DataUse` entry per declaration into the group's `catalog` space under the card TTL and renews it at half-TTL
- * while the agent stays bound. Stack it for several sources.
+ * Declares what the agent reads from a source that is not a space: on bind the binder writes one entry of the
+ * declaration's `type` per declaration into the group's `catalog` space under the card TTL and renews it at
+ * half-TTL while the agent stays bound. Stack it for several sources.
  */
 export function dataUse(decl: DataUseDecl) {
   return (value: unknown, _context?: unknown): void => {
@@ -166,6 +168,7 @@ export function dataUse(decl: DataUseDecl) {
   };
 }
 
+/** Names the agent, as `@AgentSpec` does: the card's name, description, and goals. */
 export function agent(name: string, options: { description?: string; goals?: string[] } = {}) {
   return <C extends Class>(value: C, _context?: ClassDecoratorContext): C => {
     (value as unknown as { [SPEC]?: Spec })[SPEC] = { name, description: options.description ?? "",
@@ -360,7 +363,7 @@ export function onDecision(space: string, options: { prefix?: string; resultSpac
 /** A bound agent: its loops, watches, and join and reduce bindings, closed together. */
 export class Bound {
   card: Dict | null = null;
-  /** The `DataUse` entry ids the binder declared and renews (S1-G-09). */
+  /** The data-use entry ids the binder declared and renews. */
   readonly dataUse: string[] = [];
   running = true;
   readonly loops: Promise<void>[] = [];
@@ -471,7 +474,7 @@ export class Binder {
 
   // ------------------------------------------------------------- data use
 
-  /** The `dataUse` carrier (S1-G-09): leased `DataUse` entries in `catalog`, renewed at half the card TTL. */
+  /** The `dataUse` carrier: leased entries of each declaration's type in `catalog`, renewed at half the card TTL. */
   private declareDataUse(bound: Bound, type: { [DATA_USE]?: DataUseDecl[] }, name: string): void {
     const declared = type[DATA_USE];
     if (!declared || declared.length === 0) {
@@ -482,7 +485,7 @@ export class Binder {
       const payload: Dict = { schemaVersion: 1, agent: name, peer: this.peer.identity.peerId, reads: use.reads ?? [],
         writes: use.writes ?? [], source: use.source, sensitivity: use.sensitivity ?? "", freshness: use.freshness ?? "",
         declaredBy: "decorator" };
-      bound.dataUse.push(this.peer.writeEntry(CATALOG_SPACE, DATA_USE_TYPE, payload, this.agentName, ttl, this.agent));
+      bound.dataUse.push(this.peer.writeEntry(CATALOG_SPACE, use.type, payload, this.agentName, ttl, this.agent));
     }
     const renewal = this.peer.every(Math.max(250, Math.floor(ttl / 2)), () => {
       for (const id of bound.dataUse) {
@@ -813,7 +816,7 @@ export class Binder {
       if (!pid.startsWith(prefix) || fired.has(pid)) {
         return;
       }
-      const decided = votes.decision(this.peer.states, pid);
+      const decided = votes.decision(this.peer, space.name, pid);
       if (decided === null) {
         return;
       }
@@ -864,7 +867,7 @@ export class Binder {
       }
       void Promise.resolve().then(async () => {
         try {
-          if (proposalId !== null && votes.proposals(this.peer.states).has(proposalId)) {
+          if (proposalId !== null && votes.proposals(this.peer, vote).has(proposalId)) {
             return;
           }
           const result = await method.call(instance, event.entry.value as never);

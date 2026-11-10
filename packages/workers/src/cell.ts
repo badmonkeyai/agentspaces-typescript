@@ -23,8 +23,10 @@
  * refresh, the snapshot, and the next alarm), while an in-memory
  * housekeeping timer runs the per-second duties for as long as the object
  * is live; the one connection is outbound, `wss` to the configured seeds
- * (`ws` under the `dev-local` profile), re-dialed once at once when the
- * socket closes and on each alarm while down. The self-advertisement
+ * (`ws` under the `dev-local` profile). The alarm owns every dial, with the
+ * core's redial off: it dials again at once when the socket closes (at the
+ * reconnect cadence when the link ended within it of its dial) and on each
+ * alarm while down. The self-advertisement
  * carries `js.residency=cell`. On eviction nothing runs: every claim and
  * lease the cell held lapses on its own clock, and the next alarm brings
  * the same identity back (the pause rule). Only the public Durable Objects
@@ -89,10 +91,14 @@ function whereTemplate(schema: string, where: Where): Template<Dict> {
   return new Template<Dict>(schema, conditions);
 }
 
-/** A dialer wrapper that reports whether a dial is in flight, so the alarm never starts a second one. */
+/**
+ * A dialer wrapper that reports whether a dial is in flight, so the alarm never starts a second one, and when a
+ * dialed link ends, with the time it came up.
+ */
 class TrackedDialer implements Dialer {
   readonly scheme: string;
-  constructor(private readonly inner: Dialer, private readonly track: (dialing: boolean) => void) {
+  constructor(private readonly inner: Dialer, private readonly track: (dialing: boolean) => void,
+              private readonly ended: (linkedAt: number) => void) {
     this.scheme = inner.scheme;
   }
 
@@ -103,7 +109,10 @@ class TrackedDialer implements Dialer {
   async dial(seed: Seed): Promise<FrameChannel> {
     this.track(true);
     try {
-      return await this.inner.dial(seed);
+      const channel = await this.inner.dial(seed);
+      const linkedAt = Date.now();
+      channel.onClose(() => this.ended(linkedAt));
+      return channel;
     } finally {
       this.track(false);
     }
@@ -161,12 +170,13 @@ export abstract class CellHost<Env extends CellEnv = CellEnv> extends DurableObj
     if (this.config.invite !== null) {
       this.peer.resourceHints[social.JOIN_HINT] = this.joinCredential(this.config.invite, identity.peerId);
     }
-    // The core redials once at once when the socket closes; the alarm owns every later dial.
-    this.peer.reconnectWindowMs = 0;
+    // The alarm owns every dial, so the core's redial is off (swarm retries, ROBUSTNESS.md §10.3 E5).
+    this.peer.redial = false;
     for (const scheme of ["ws", "wss"] as const) {
       const inner = this.peer.dialers.get(scheme) ?? new WsDialer(scheme, (url, protocols) =>
         new (globalThis as unknown as { WebSocket: new (u: string, p: string[]) => WebSocketLike }).WebSocket(url, protocols));
-      this.peer.registerDialer(new TrackedDialer(inner, (dialing) => { this.dialing = dialing; }));
+      this.peer.registerDialer(new TrackedDialer(inner, (dialing) => { this.dialing = dialing; },
+        (linkedAt) => { void this.linkEnded(linkedAt); }));
     }
     this.restore();
     await this.onBoot();
@@ -260,6 +270,23 @@ export abstract class CellHost<Env extends CellEnv = CellEnv> extends DurableObj
       this.log(`alarm failed: ${e instanceof Error ? e.message : String(e)}`);
     }
     await this.scheduleAlarm();
+  }
+
+  /**
+   * The dialed link ended: the alarm dials again at once, or at the reconnect cadence when the link ended within it
+   * of its dial, so a seed that drops each link at once gets no dial loop (swarm retries, ROBUSTNESS.md §10.6).
+   */
+  private async linkEnded(linkedAt: number): Promise<void> {
+    if (this.paused) {
+      return;
+    }
+    const quick = Date.now() - linkedAt < this.config.reconnectMillis;
+    this.log(`link lost; re-dialing on the next alarm${quick ? `, in ${this.config.reconnectMillis} ms` : ""}`);
+    try {
+      await this.scheduleAlarm(quick ? this.config.reconnectMillis : 0);
+    } catch (e) {
+      this.log(`alarm not armed: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   /** A socket handed to the hibernation API closed: reconnect on the next alarm, soon. */

@@ -26,7 +26,8 @@
 
 import { toHex } from "./bytes.js";
 import { cryptoPort } from "./crypto.js";
-import { CborValue, loads } from "./cbor.js";
+import { CborValue } from "./cbor.js";
+import * as records from "./records.js";
 import { Identity, deriveId, parseInstantMillis } from "./identity.js";
 
 type Dict = { [key: string]: CborValue };
@@ -91,18 +92,10 @@ export class Registry {
   constructor(private readonly founder: () => string | null,
               private readonly group: () => string | null = () => null) {}
 
-  /** Verifies and accepts one rumor payload (a CBOR SignedRevocation). */
+  /** Verifies and accepts one rumor payload, a SignedRevocation read strictly (HLC round six, 2026-11-08, F3). */
   accept(stream: string, payload: unknown, nowMillis: number): boolean {
-    if (!(payload instanceof Uint8Array)) {
-      return false;
-    }
-    let signed: CborValue;
-    try {
-      signed = loads(payload);
-    } catch {
-      return false;
-    }
-    return this.acceptSigned(stream, signed, nowMillis);
+    const signed = records.readRecord(payload, records.SIGNED_REVOCATION);
+    return signed !== null && this.acceptSigned(stream, signed, nowMillis);
   }
 
   exportSigned(): Dict {
@@ -114,29 +107,27 @@ export class Registry {
       this.acceptSigned(stream, signed, nowMillis);
   }
 
-  /** Verifies and accepts one decoded SignedRevocation {adBytes, publicKey, signature}. */
+  /**
+   * Verifies and accepts one decoded SignedRevocation {adBytes, publicKey, signature}. The
+   * revocation its `adBytes` hold reads strictly as the stream's record, a RevocationAdvertisement on
+   * the peer stream and a CredentialRevocation on the credential stream (HLC round six, 2026-11-08, F3).
+   */
   acceptSigned(stream: string, signed: unknown, nowMillis: number): boolean {
-    if (typeof signed !== "object" || signed === null || Array.isArray(signed)) {
+    const s = records.conformed(signed, records.SIGNED_REVOCATION);
+    if (s === null || (stream !== PEER_STREAM && stream !== CREDENTIAL_STREAM)) {
       return false;
     }
-    const s = signed as Dict;
-    const adBytes = s["adBytes"];
-    const key = s["publicKey"];
-    const signature = s["signature"];
-    if (!(adBytes instanceof Uint8Array) || !(key instanceof Uint8Array) || key.length !== 32
-        || !(signature instanceof Uint8Array)) {
+    const adBytes = s["adBytes"] as Uint8Array;
+    const key = s["publicKey"] as Uint8Array;
+    const signature = s["signature"] as Uint8Array;
+    const ad = records.readRecord(adBytes, stream === PEER_STREAM ? records.REVOCATION_ADVERTISEMENT
+      : records.CREDENTIAL_REVOCATION);
+    if (key.length !== 32 || ad === null) {
       return false;
     }
-    let ad: Dict;
-    let issued: number;
-    try {
-      ad = loads(adBytes) as Dict;
-      issued = parseInstantMillis(ad["issued"]);
-    } catch {
-      return false;
-    }
+    const issued = parseInstantMillis(ad["issued"]);
     const group = this.group();
-    if (typeof ad !== "object" || ad === null || deriveId(key) !== ad["issuer"]
+    if (deriveId(key) !== ad["issuer"]
         || !Identity.verify(key, adBytes, signature)
         || issued > nowMillis + MAX_ISSUED_SKEW_MILLIS
         || (group !== null && ad["group"] !== group)) {
@@ -146,13 +137,10 @@ export class Registry {
     if (stream === PEER_STREAM) {
       const founder = this.founder();
       // Founder-rooted only: a CA-rooted record is not trusted here.
-      if (founder === null || ad["issuer"] !== founder || typeof ad["revoked"] !== "string") {
+      if (founder === null || ad["issuer"] !== founder) {
         return false;
       }
       return keep(this.peers, ad["revoked"] as string, { rank: FOUNDER, issued, hash, ad, signed: s });
-    }
-    if (stream !== CREDENTIAL_STREAM) {
-      return false;
     }
     const target = ad["target"];
     if (!validTarget(target) || !REASONS.includes(String(ad["reason"]))

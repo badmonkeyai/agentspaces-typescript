@@ -35,9 +35,12 @@
 import { dumps, loads, canonicalMap } from "../cbor.js";
 import { cryptoPort } from "../crypto.js";
 import { multibase, spaceIdLocal } from "../identity.js";
-import type { BulkPayloads, Peer } from "../peer.js";
+import * as cids from "../pdt/cids.js";
+import type { BulkPayloads, Peer, SpillStore } from "../peer.js";
+import { SpillRefusedError, leaseExpiryOf, present } from "../peer.js";
 import type { Space } from "../space.js";
 import { durationMillis } from "../space.js";
+import { CARD_SPILL_PIECE_SIZE } from "../wire.js";
 import type { Dict } from "../wire.js";
 import type { Pipes } from "./pipes.js";
 
@@ -58,6 +61,8 @@ export const PIECE_WANT = 1, PIECE = 2, HAVE = 3, CANCEL = 4, REJECT = 5, MANIFE
 export const REASON_NOT_HELD = 1, REASON_OVER_BUDGET = 2, REASON_POLICY = 3, REASON_UNKNOWN_ROOT = 4;
 export const SEALING_NONE = "none", SEALING_GROUP_KEY = "group-key";
 export const HASHING_PLAIN = "plain", HASHING_SEALED = "sealed";
+/** A manifest's layout (PD-X-09): the flat piece table, which an absent layout means, or a blob tree. */
+export const LAYOUT_PIECES = "pieces", LAYOUT_TREE = "tree";
 
 const B32 = "abcdefghijklmnopqrstuvwxyz234567";
 
@@ -155,7 +160,12 @@ export function manifest(root: string, size: number, pieceSize: number, table: U
     created: createdMillis, attrs: attrs === null || Object.keys(attrs).length === 0 ? null : canonicalMap(attrs) };
 }
 
-/** The first broken invariant of a manifest, or null (SPEC annex G). */
+/**
+ * The first broken invariant of a manifest, or null (SPEC annex G). A `layout: tree` manifest names a blob tree,
+ * whose dag-cbor root names every piece, so it may carry no piece table and its table, when it has one, is not over
+ * its root (P2-X-01, as the owner ruled in the PDT 2 follow-ups of 2026-11-09, F3); a flat manifest carries exactly
+ * one of the table and the table reference.
+ */
 export function manifestViolation(m: Dict): string | null {
   if (m["v"] !== VERSION) {
     return `unsupported manifest version ${String(m["v"])}`;
@@ -168,8 +178,12 @@ export function manifestViolation(m: Dict): string | null {
   if (!(size >= 0) || Number(m["pieces"]) !== piecesOf(size, ps)) {
     return "pieces does not match ceil(size / pieceSize)";
   }
+  const layout = m["layout"], tree = layout === LAYOUT_TREE;
   const table = m["table"], ref = m["tableRef"];
-  if ((table == null) === (ref == null)) {
+  if (table != null && ref != null) {
+    return tree ? "at most one of table and tableRef may be present" : "exactly one of table and tableRef must be present";
+  }
+  if (table == null && ref == null && !tree) {
     return "exactly one of table and tableRef must be present";
   }
   if (table != null) {
@@ -182,7 +196,7 @@ export function manifestViolation(m: Dict): string | null {
     if (table.length !== Number(m["pieces"]) * HASH_BYTES) {
       return "table length does not match pieces";
     }
-    if (contentRoot(table) !== m["root"]) {
+    if (!tree && contentRoot(table) !== m["root"]) {
       return "table does not hash to the root";
     }
   }
@@ -191,6 +205,12 @@ export function manifestViolation(m: Dict): string | null {
   }
   if (m["hashing"] !== HASHING_PLAIN && m["hashing"] !== HASHING_SEALED) {
     return "unknown hashing";
+  }
+  if (layout != null && layout !== LAYOUT_PIECES && layout !== LAYOUT_TREE) {
+    return `unknown layout ${String(layout)}`;
+  }
+  if (tree && !(cids.isCid(m["root"]) && cids.parse(m["root"] as string).codec === cids.DAG_CBOR)) {
+    return "a tree manifest's root is a dag-cbor CID";
   }
   if (!isRoot(m["root"])) {
     return "root is not a content root";
@@ -435,6 +455,8 @@ export class Fetch {
   readonly started = Date.now();
   holdingsReadAt = 0;
   manifestAskedAt = 0;
+  /** The artifact length the fetch expects, when its caller knows it: a manifest of another length fails it at once. */
+  expectedSize: number | null = null;
   private scheduling = false;
   private reschedule = false;
   private readonly waiters: (() => void)[] = [];
@@ -905,6 +927,7 @@ export class Content implements BulkPayloads {
     this.spaceId = spaceIdLocal(`${this.peer.group}/${space.name}`);
     pipes.onCapability(TYPE, (from, payload) => this.onFrame(from, payload));
     this.peer.content = this;
+    this.peer.spillStore = new ContentSpillStore(this); // AppCard origin and formats, 2026-11-09 (SPEC §6.1a.5)
     this.start();
   }
 
@@ -951,11 +974,12 @@ export class Content implements BulkPayloads {
     const found: Dict[] = [];
     for (const dto of this.peer.states.values()) {
       const record = (dto["record"] as Dict | undefined) ?? {};
-      if (record["type"] !== typeName || dto["completed"] || record["spaceId"] !== this.spaceId) {
+      // PDT 2 phase 7 gate: a cancelled record is gone, as Java's EntryState.present judges it
+      if (record["type"] !== typeName || !present(dto) || record["spaceId"] !== this.spaceId) {
         continue;
       }
-      const lease = (record["lease"] as Dict | undefined) ?? {};
-      if (Number(lease["expiresAtMillis"] ?? 0) <= now) {
+      // PDT 2 phase 7 gate: the lease register, which a holder's renewal at half-life moves (SPEC §7.3)
+      if (leaseExpiryOf(dto) <= now) {
         continue;
       }
       if (root !== null && ((record["tags"] as Dict | undefined) ?? {})["root"] !== root) {
@@ -1091,15 +1115,22 @@ export class Content implements BulkPayloads {
 
   // ---- fetch
 
-  fetch(root: string): Fetch {
+  /**
+   * Starts or joins the fetch of a root. With `expectedSize`, a manifest that states another length fails the fetch
+   * before it asks for a piece, so a caller that knows the length never fetches more (AppCard origin and formats,
+   * 2026-11-09).
+   */
+  fetch(root: string, expectedSize: number | null = null): Fetch {
     if (!isRoot(root)) {
       throw new Error(`not a content root: ${root}`);
     }
     const existing = this.fetches.get(root);
     if (existing !== undefined) {
+      existing.expectedSize ??= expectedSize;
       return existing;
     }
     const f = new Fetch(this, root);
+    f.expectedSize = expectedSize;
     this.fetches.set(root, f);
     this.drive(f);
     return f;
@@ -1138,7 +1169,11 @@ export class Content implements BulkPayloads {
         }
         return;
       }
-      if (!(m["table"] instanceof Uint8Array)) {
+      if (f.expectedSize !== null && Number(m["size"]) !== f.expectedSize) {
+        f.fail(`the artifact is ${String(m["size"])} bytes; the fetch expects ${f.expectedSize}`);
+      } else if (m["layout"] === LAYOUT_TREE) {
+        f.fail("the manifest names a blob tree, which the tree exchange fetches");
+      } else if (!(m["table"] instanceof Uint8Array)) {
         f.fail("the manifest's table is a block; this client keeps tables inline");
       } else if (m["sealing"] !== SEALING_NONE) {
         f.fail("sealed root; this client holds no content key");
@@ -1309,6 +1344,68 @@ export class Content implements BulkPayloads {
     return { fetchesActive: this.fetches.size, rootsHeld: this.store.roots().size, bytesServed: this.bytesServed,
       wantsRefused: this.wantsRefused, piecesStruck: this.piecesStruck };
   }
+}
+
+/**
+ * The card spill over a group's content swarm (SPEC §6.1a.5, v0.1.32; ISSUE-AppCardOriginFormats §9.8; AppCard origin
+ * and formats, 2026-11-09): a parts document is an artifact in 65,536-byte pieces with manifest `name` the card's id,
+ * media type `application/cbor`, and sealing `none`, since the card it completes travels unsealed. A reader fetches it
+ * from every holder, each piece verified against the root. The fetch expects the stub's `size`, so a manifest that
+ * states another length fails it before a piece arrives; a fetch that has not completed by the store's deadline is
+ * cancelled and fails, so a root nobody serves never holds the reader. A `Content` installs one on its peer.
+ */
+export class ContentSpillStore implements SpillStore {
+  static readonly MEDIA_TYPE = "application/cbor";
+  /** How long a fetch of a parts document may take before it fails, unless the store is built with another deadline. */
+  static readonly FETCH_TIMEOUT_MILLIS = 30_000;
+
+  constructor(readonly content: Content, readonly fetchTimeoutMillis = ContentSpillStore.FETCH_TIMEOUT_MILLIS) {
+    if (!(fetchTimeoutMillis > 0)) {
+      throw new RangeError(`the fetch timeout must be positive: ${fetchTimeoutMillis}`);
+    }
+  }
+
+  put(name: string, document: Uint8Array): string {
+    return String(this.content.publish(document, { pieceSize: CARD_SPILL_PIECE_SIZE, name,
+      mediaType: ContentSpillStore.MEDIA_TYPE })["root"]);
+  }
+
+  async get(root: string, size: number): Promise<Uint8Array> {
+    const known = this.content.manifestOf(root);
+    if (known !== null && Number(known["size"]) !== size) {
+      throw lengthRefused(root, Number(known["size"]), size);
+    }
+    const f = this.content.fetch(root, size);
+    if (!(await f.await(this.fetchTimeoutMillis))) {
+      if (!f.done) {
+        f.cancel();
+        if (this.content.fetches.get(root) === f) {
+          this.content.fetches.delete(root);
+        }
+        throw new Error(`the parts document ${root} was not served within ${this.fetchTimeoutMillis} ms`);
+      }
+      const m = this.content.manifestOf(root);
+      if (m !== null && Number(m["size"]) !== size) {
+        throw lengthRefused(root, Number(m["size"]), size);
+      }
+      throw new Error(`the fetch of ${root} failed: ${String(f.failure)}`);
+    }
+    const bytes = f.readBytes();
+    if (bytes.length !== size) {
+      // a fetch of the same root that another caller began without a length shares its session
+      throw lengthRefused(root, bytes.length, size);
+    }
+    return bytes;
+  }
+
+  release(root: string): void {
+    this.content.unpin(root);
+  }
+}
+
+/** The refusal of an artifact whose length is not the stub's `size` (`SpillStore.get`). */
+function lengthRefused(root: string, actual: number, stated: number): SpillRefusedError {
+  return new SpillRefusedError(`the artifact ${root} is ${actual} bytes; the stub states ${stated}`);
 }
 
 /** The block id helper the legacy exchange uses (`z` + base58 of sha-256), for callers that mix both. */

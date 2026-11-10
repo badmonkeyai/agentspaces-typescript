@@ -34,10 +34,12 @@ import * as blob from "./blob.js";
 import { ChampNode, reassembleMap } from "./champ.js";
 import * as cids from "./cids.js";
 import { chunksOf } from "./fastcdc.js";
-import { Embedded as EmbeddedItem, KIND_B, KIND_KEY, KIND_M, KIND_VR, KIND_X, Link, MAX_DEPTH, MAX_NODE_BYTES,
+import { TextLeaf } from "./kinds.js";
+import { Embedded as EmbeddedItem, KIND_B, KIND_KEY, KIND_M, KIND_T, KIND_VR, KIND_X, Link, MAX_DEPTH, MAX_NODE_BYTES,
   NodeFormatError, decode, encode, isLinkShaped, kindOf, linkItem, skip, spilledLink } from "./nodes.js";
 import type { Embedded } from "./nodes.js";
 import { NodeStore } from "./store.js";
+import { PText } from "./text.js";
 import { VecNode, VecRoot, reassembleArray } from "./vector.js";
 
 export const VALUE_LIMIT = 1024;
@@ -74,12 +76,28 @@ export class BlobNode {
   constructor(readonly content: Uint8Array) {}
 }
 
-/** A value slot: inline CBOR, a spilled node in memory, or the CID of a spilled node. */
-export type Ref = Uint8Array | XNode | BlobNode | OrderedNode | ChampNode | VecRoot | string;
+/**
+ * A text value held out of line, kind `t` (PDT 2 phase 7, P2-T-02, Java's TextNode): a value in the text form of
+ * `PText` above 1 KiB spills to a node holding the canonical bytes of the same leaf, and reads back as the value it
+ * was. The node bytes are made eagerly, so a text whose node would pass the 1 MiB node bound is refused on the way in.
+ */
+export class TextNode {
+  cid: string | null = null;
+  readonly node: Uint8Array;
+  constructor(readonly value: Uint8Array) {
+    this.node = PText.fromWire(value).encode();
+  }
+}
 
-/** The context of a read or write: the store, and the transient token that owns editable nodes. */
+/** A value slot: inline CBOR, a spilled node in memory, or the CID of a spilled node. */
+export type Ref = Uint8Array | XNode | BlobNode | TextNode | OrderedNode | ChampNode | VecRoot | string;
+
+/**
+ * The context of a read or write: the store, the transient token that owns editable nodes, and whether the tree keeps
+ * the level-1 kinds, as an escalated payload does (PDT 2 phase 7; §6.10.3, rule 7), so no text spills to a `t` node.
+ */
 export class Ctx {
-  constructor(readonly store: NodeStore, readonly edit: object | null = null) {}
+  constructor(readonly store: NodeStore, readonly edit: object | null = null, readonly levelOne = false) {}
 
   owns(token: object | null): boolean {
     return token !== null && token === this.edit;
@@ -141,6 +159,9 @@ export function sameValue(a: Ref, b: Ref): boolean {
   if (a instanceof BlobNode && b instanceof BlobNode) {
     return bytesEqual(a.content, b.content);
   }
+  if (a instanceof TextNode && b instanceof TextNode) {
+    return bytesEqual(a.value, b.value);
+  }
   const ca = cidOf(a), cb = cidOf(b);
   return ca !== null && ca === cb;
 }
@@ -168,6 +189,9 @@ export function spill(cbor: Uint8Array, ctx: Ctx): Ref {
   }
   if (cbor.length <= VALUE_LIMIT) {
     return cbor;
+  }
+  if (!ctx.levelOne && PText.isText(cbor)) {
+    return new TextNode(cbor);
   }
   const major = cbor[0]! >> 5;
   const info = cbor[0]! & 0x1f;
@@ -328,6 +352,9 @@ export function resolve(ref: Ref, ctx: Ctx, depth = 0): Uint8Array {
   if (ref instanceof XNode) {
     return isLinkShaped(ref.value) ? resolveLinked(spilledLink(ref.value)!, ctx, depth + 1) : ref.value;
   }
+  if (ref instanceof TextNode) {
+    return ref.value;
+  }
   if (ref instanceof OrderedNode) {
     return reassembleOrdered(ref.items, ctx, depth);
   }
@@ -354,6 +381,11 @@ export function resolve(ref: Ref, ctx: Ctx, depth = 0): Uint8Array {
       return reassembleArray(VecRoot.decode(cid, bytes), ctx, depth);
     case KIND_B:
       return byteString(blob.PBlob.load(ctx.store, cid).bytes());
+    case KIND_T:
+      if (ctx.levelOne) {
+        throw new NodeFormatError("a level-one tree holds no text node (rule 7)", cid);
+      }
+      return PText.toWire(TextLeaf.decode(bytes, cid));
     default:
       throw new NodeFormatError(`a spilled value cannot be a node of kind '${kind}'`, cid);
   }
@@ -420,7 +452,7 @@ export function writePayload(cbor: Uint8Array, store: NodeStore): { root: string
   if (cbor.length === 0) {
     throw new Error("an empty payload is not a CBOR item");
   }
-  const ctx = new Ctx(store);
+  const ctx = new Ctx(store, null, true);
   const spilled = spill(cbor, ctx);
   const flusher = new Flusher(store);
   let root: string;
@@ -447,7 +479,7 @@ export function readPayload(root: string, ctx: Ctx): Uint8Array {
   if (kind !== KIND_X && kind !== KIND_M && kind !== KIND_VR && kind !== KIND_B) {
     throw new NodeFormatError(`a payload root is an x, m, vr, or b node, not '${kind}'`, root);
   }
-  return resolve(root, ctx);
+  return resolve(root, ctx.levelOne ? ctx : new Ctx(ctx.store, ctx.edit, true));
 }
 
 export function decodeX(cid: string, bytes: Uint8Array): XNode {
@@ -502,6 +534,8 @@ export class Flusher {
       cid = this.writeBlob(ref);
     } else if (ref instanceof XNode) {
       cid = this.put(encodeX(ref), cids.DAG_CBOR);
+    } else if (ref instanceof TextNode) {
+      cid = this.put(ref.node, cids.DAG_CBOR);
     } else if (ref instanceof OrderedNode) {
       cid = this.put(encodeX(new XNode(linkItem(this.cidOf(ref.items)))), cids.DAG_CBOR);
     } else {

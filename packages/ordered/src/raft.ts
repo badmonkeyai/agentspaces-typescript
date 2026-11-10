@@ -26,7 +26,7 @@
  * twice in a term and never loses an acknowledged entry.
  */
 
-import { cbor, wire } from "@agentspaces/client";
+import { cbor, records, wire } from "@agentspaces/client";
 
 type Dict = wire.Dict;
 import { LogEntry, LogStore, MemoryLogStore } from "./store.js";
@@ -69,8 +69,9 @@ export function frame(kind: "requestVote" | "voteReply" | "appendEntries" | "app
   return dumps(out);
 }
 
+/** A decoded long field (a number when safe, else a bigint) as a number. */
 function num(value: unknown): number {
-  return typeof value === "bigint" ? Number(value) : typeof value === "number" ? value : Number.NaN;
+  return typeof value === "bigint" ? Number(value) : value as number;
 }
 
 export class RaftLog {
@@ -241,13 +242,10 @@ export class RaftLog {
     if (this.suspended) {
       return; // absent, as far as the others can tell
     }
-    let decoded: Dict;
-    try {
-      decoded = loads(payload) as Dict;
-    } catch {
-      return;
-    }
-    if (typeof decoded !== "object" || decoded === null) {
+    // HLC round seven, 2026-11-08: a frame decodes as Java's fromWire reads RaftMessages.Frame, under
+    // its annex I schema and the canonical-bytes rule, or it is dropped
+    const decoded = records.readRecord(payload, records.RAFT_FRAME);
+    if (decoded === null) {
       return;
     }
     if (!this.members.includes(from)) {

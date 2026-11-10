@@ -21,7 +21,8 @@
  * advertisements, and the query pipe to other members.
  */
 
-import { dumps, loads } from "../cbor.js";
+import { dumps } from "../cbor.js";
+import { SEM_QUERY, SEM_RESPONSE, readRecord } from "../records.js";
 import type { Dict } from "../wire.js";
 import type { Pipes } from "./pipes.js";
 
@@ -100,7 +101,16 @@ export function textOf(adType: string, ad: Dict): string {
     return `${str(ad["name"])} ${str(ad["version"])} ${join(ad["tasks"])} ${str(ad["modality"])} ${str(ad["engine"])} ${str(ad["licence"])}`;
   }
   if (adType === "AppCard") {
-    return `${str(ad["name"])} ${str(ad["kind"])} ${str(ad["shape"])} ${str(ad["owner"])} ${str(ad["url"])}`;
+    // SPEC §6.1a.2 v0.1.32 (AppCard origin and formats, 2026-11-09): the inline fields, which a stub keeps
+    let text = `${str(ad["name"])} ${str(ad["kind"])} ${str(ad["shape"])} ${str(ad["owner"])} ${str(ad["url"])}`;
+    const origin = ad["origin"] as Dict | undefined;
+    if (origin !== undefined) {
+      text += ` ${str(origin["system"])} ${str(origin["ref"])}`;
+    }
+    if (ad["formats"] !== undefined) {
+      text += ` ${join(ad["formats"])}`;
+    }
+    return text;
   }
   if (adType === "CapabilityAdvertisement") {
     return `${str(ad["capabilityType"])} ${str(ad["binding"])} ${JSON.stringify(ad["parameters"] ?? {})}`;
@@ -160,24 +170,21 @@ export class Semantic {
   }
 
   private onFrame(from: string, payload: Uint8Array): void {
-    let frame: Dict;
-    try {
-      frame = loads(payload) as Dict;
-    } catch {
+    // HLC round seven, 2026-11-08: a query, else a response, as Java's fromWire reads each under its
+    // annex I schema and the canonical-bytes rule; anything else is dropped
+    const query = readRecord(payload, SEM_QUERY);
+    if (query !== null && typeof query["text"] === "string") {
+      this.answer(from, query);
       return;
     }
-    if (typeof frame !== "object" || frame === null) {
-      return;
-    }
-    if (typeof frame["text"] === "string") {
-      this.answer(from, frame);
-    } else if (Array.isArray(frame["hits"])) {
-      for (const hit of frame["hits"] as Dict[]) {
-        if (typeof hit === "object" && hit !== null && hit["adType"]) {
+    const response = readRecord(payload, SEM_RESPONSE);
+    if (response !== null && response["hits"] !== null) {
+      for (const hit of response["hits"] as Dict[]) {
+        if (hit["adType"]) {
           this.pipes.peer.acceptAd(hit);
         }
       }
-      this.pending.get(Number(frame["nonce"] ?? -1))?.();
+      this.pending.get(Number(response["nonce"]))?.();
     }
   }
 
@@ -195,9 +202,9 @@ export class Semantic {
       }
     }
     scored.sort((a, b) => b.score - a.score);
-    const limit = Math.max(1, Math.min(Number(query["limit"] ?? 10), 16));
+    const limit = Math.max(1, Math.min(query["limit"] as number, 16));
     const hits = scored.slice(0, limit).map(({ stored }) => ({ adType: stored["adType"], adBytes: stored["adBytes"],
       publicKey: stored["publicKey"], signature: stored["signature"] }));
-    this.pipes.send(from, TYPE, dumps({ nonce: query["nonce"] ?? 0, hits }));
+    this.pipes.send(from, TYPE, dumps({ nonce: query["nonce"]!, hits }));
   }
 }

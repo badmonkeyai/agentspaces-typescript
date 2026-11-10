@@ -23,14 +23,21 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
-import { dumps, loads } from "../src/cbor.js";
+import { CborDouble, canonicalMap, dumps, loads } from "../src/cbor.js";
+import { Identity } from "../src/identity.js";
 import { FileNodeBackend } from "../src/node/node-store.js";
 import * as pdt from "../src/pdt/index.js";
+import { ISSUED_ATTR, ISSUER_ATTR, MAX_ATTRS_BYTES, MAX_BASE_STEPS, MAX_SEQ, PREF_TYPE, Refs, pref } from "../src/pdt/refs.js";
+import type { TreeExchange } from "../src/pdt/tree.js";
+import { Peer } from "../src/peer.js";
+import { Space } from "../src/space.js";
+import * as wire from "../src/wire.js";
 import type { Dict } from "../src/wire.js";
 
 type V = pdt.CborValue;
@@ -433,4 +440,470 @@ test("the heads rule folds equal roots and supersedes bases of a larger seq (§1
   assert.deepEqual(pdt.headsAmong([v0, v1, v2, fork, revert]).map((h) => h.root), ["r0"]);
   assert.equal(pdt.headsAmong([v0, v1, v2, fork, revert])[0]!.seq, 4);
   assert.deepEqual(pdt.headsAmong([v2, head("r2", ["r1"], 3, "3500:0", "zC/c")]).length, 1);
+});
+
+const NOW = 1_700_000_000_000;
+
+/** A refs engine over an in-memory store on a peer whose wall reads `wall`, with `exchange` as its tree exchange. */
+function engine(wall = NOW, exchange: TreeExchange | null = null): { refs: Refs; store: pdt.NodeStore; peer: Peer } {
+  const store = pdt.NodeStore.inMemory();
+  const peer = new Peer(Identity.generate(), "zPdtValuesTest", () => wall);
+  return { refs: new Refs(peer, store, exchange), store, peer };
+}
+
+/** The engine's state of the ref `name` of `kind` in the space `s`, opened through `Refs.ref`. */
+type RefState = { spaceId: string; known: Map<string, pdt.Head>; ignoredEntries: Set<string> };
+
+function refState(refs: Refs, name = "doc", kind: pdt.RefKindName = "map"): RefState {
+  refs.ref(new Space(refs.peer, "s"), name, kind);
+  return (refs as unknown as { states: Map<string, RefState> }).states.get(`s/${name}`)!;
+}
+
+/** The head `toHead` reads from an entry issued at `issued` by `peer/a` whose payload is `payload`. */
+function headOf(refs: Refs, state: RefState, payload: Uint8Array, entryId: string, issued = `${NOW}:0:peer`): pdt.Head | null {
+  const record = { spaceId: state.spaceId, type: PREF_TYPE, payload, issued, issuer: "peer/a", entryId,
+    lease: { expiresAtMillis: NOW + 60_000 } };
+  return (refs as unknown as { toHead(state: unknown, dto: Dict): pdt.Head | null }).toHead(state, { record });
+}
+
+/** A map head named `doc` whose root hashes `seed`, with `attrs` as given, encoded as a writer writes it. */
+function prefBytes(seed: string, attrs: Dict | null = null, fields: Partial<pdt.PRefFields> = {}): Uint8Array {
+  const head = pref({ name: "doc", kind: "map", root: pdt.cids.of(new TextEncoder().encode(seed), 0x55), seq: 1, size: 1, ...fields });
+  if (attrs !== null) {
+    head["attrs"] = canonicalMap(attrs);
+  }
+  return dumps(head);
+}
+
+type Vector = { id: string; carrier: string; hex: string; verdict: "accept" | "refuse-undecodable" };
+
+const VECTORS: Vector[] = (JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "test",
+  "wire-encoding-vectors.json"), "utf-8")) as { vectors: Vector[] }).vectors;
+
+test("every PRef vector is a head exactly when the wire encoding accepts it, and each refusal counts once in headsIgnored (R1, R3)", () => {
+  // HLC round six, 2026-11-08 (F1, F3, R1, R3): a PRef is a protocol record. A field of the wrong
+  // kind, attrs written as null, keys out of order, an item under a longer head, and a null or
+  // non-text value under any attr but pdt.issued and pdt.issuer make it undecodable, and the reader
+  // ignores the head and counts it in headsIgnored once per entry, as Java counts it.
+  const wall = 1_800_000_000_000;
+  const { refs } = engine(wall);
+  const state = refState(refs, "facts");
+  const own = `${wall - 1000}:0:peer`;
+  const javaIssuer = "z6M1N9PyyHGkJfLZRmQ4VjAypZUi5uuUm8UDMHK1YfieJ";
+  const advisory: { [id: string]: [string, string] } = {
+    "pref-01": [`${wall}:0:${javaIssuer}`, `${javaIssuer}/java`],
+    "pref-02": [own, "peer/a"],
+    "pref-03": [own, "peer/a"],
+    "pref-04": [own, "peer/a"],
+    "pref-05": [own, "peer/a"],
+    "pref-08": [`${wall}:0:${javaIssuer}`, "peer/a"],
+  };
+  const prefs = VECTORS.filter((v) => v.carrier === "pref");
+  assert.equal(prefs.length, 12);
+  let refused = 0;
+  for (const vector of prefs) {
+    const bytes = Uint8Array.from(Buffer.from(vector.hex, "hex"));
+    for (let read = 0; read < 2; read++) {
+      const head = headOf(refs, state, bytes, vector.id, own);
+      if (vector.verdict === "accept") {
+        assert.notEqual(head, null, vector.id);
+        assert.deepEqual([head!.issued, head!.issuer], advisory[vector.id], vector.id);
+      } else {
+        assert.equal(head, null, vector.id);
+      }
+    }
+    refused += vector.verdict === "accept" ? 0 : 1;
+    assert.equal(refs.headsIgnored, refused, `${vector.id} counts once`);
+  }
+  assert.equal(refused, 6);
+});
+
+test("pdt.issued and pdt.issuer that are null or no text fall back to the entry's own pair together, and the head stays (R1, E10)", () => {
+  const { refs } = engine();
+  const state = refState(refs);
+  const advisory = `${NOW + 9}:0:peer`;
+  // HLC round six, 2026-11-08 (R1): the reserved pair holds any application value. A pdt.issued that
+  // is absent, null, no text, or no acceptable stamp, or a pdt.issuer that is present and null, no
+  // text, or no agent id under Java's grammar (R5), leaves the entry's own stamp and issuer together.
+  const fallBack: Dict[] = [
+    { [ISSUED_ATTR]: null, [ISSUER_ATTR]: "peer/b" },
+    { [ISSUED_ATTR]: 7, [ISSUER_ATTR]: "peer/b" },
+    { [ISSUED_ATTR]: new TextEncoder().encode(advisory), [ISSUER_ATTR]: "peer/b" },
+    { [ISSUED_ATTR]: [advisory], [ISSUER_ATTR]: "peer/b" },
+    { [ISSUER_ATTR]: "peer/b" },
+    { [ISSUED_ATTR]: advisory, [ISSUER_ATTR]: null },
+    { [ISSUED_ATTR]: advisory, [ISSUER_ATTR]: 7 },
+    { [ISSUED_ATTR]: advisory, [ISSUER_ATTR]: new TextEncoder().encode("peer/b") },
+    { [ISSUED_ATTR]: advisory, [ISSUER_ATTR]: { peer: "b" } },
+    { [ISSUED_ATTR]: advisory, [ISSUER_ATTR]: "peer/b/c" },
+    { [ISSUED_ATTR]: advisory, [ISSUER_ATTR]: "peer/b:c" },
+  ];
+  for (const [index, attrs] of fallBack.entries()) {
+    const head = headOf(refs, state, prefBytes(`fallback-${index}`, attrs), `e-fallback-${index}`);
+    assert.notEqual(head, null, `the head stays: ${index}`);
+    assert.deepEqual([head!.issued, head!.issuer], [`${NOW}:0:peer`, "peer/a"], `falls back together: ${index}`);
+  }
+  const taken = headOf(refs, state, prefBytes("taken", { note: "x", [ISSUED_ATTR]: advisory, [ISSUER_ATTR]: "peer/b" }), "e-taken")!;
+  assert.deepEqual([taken.issued, taken.issuer], [advisory, "peer/b"]);
+  assert.equal(refs.headsIgnored, 0, "the reserved pair counts nothing");
+});
+
+test("a null or non-text value under any other attr makes the PRef undecodable, ignored and counted (R1, R3)", () => {
+  const { refs } = engine();
+  const state = refState(refs);
+  const others: Dict[] = [{ note: null }, { note: 7 }, { note: true }, { note: new Uint8Array([1]) }, { note: ["x"] },
+    { note: { a: "b" } }, { note: 2n ** 64n }];
+  for (const [index, attrs] of others.entries()) {
+    assert.equal(headOf(refs, state, prefBytes(`other-${index}`, { ...attrs, [ISSUED_ATTR]: `${NOW + 9}:0:peer` }), `e-other-${index}`),
+      null, String(index));
+  }
+  assert.equal(refs.headsIgnored, others.length);
+});
+
+test("the attrs bound counts the UTF-8 bytes of keys and text values, and nothing for a reserved attr that is no text (R1)", () => {
+  const over = `attrs larger than ${MAX_ATTRS_BYTES} bytes`;
+  const head = (attrs: Dict): Dict => ({ ...pref({ name: "doc", kind: "map",
+    root: pdt.cids.of(new TextEncoder().encode("bound"), 0x55), seq: 1, size: 1 }), attrs });
+  // the key "a" counts one byte and the key "é" two
+  assert.equal(pdt.prefViolation(head({ a: "x".repeat(MAX_ATTRS_BYTES - 3), "é": "" })), null);
+  assert.equal(pdt.prefViolation(head({ a: "x".repeat(MAX_ATTRS_BYTES - 2), "é": "" })), over);
+  assert.equal(pdt.prefViolation(head({ a: "é".repeat(MAX_ATTRS_BYTES / 2) })), over);
+  const filler = "x".repeat(MAX_ATTRS_BYTES - 1 - ISSUED_ATTR.length - ISSUER_ATTR.length);
+  assert.equal(pdt.prefViolation(head({ a: filler, [ISSUED_ATTR]: ["0123456789".repeat(100)], [ISSUER_ATTR]: 2n ** 70n })), null);
+  assert.equal(pdt.prefViolation(head({ a: `${filler}x`, [ISSUED_ATTR]: null, [ISSUER_ATTR]: null })), over);
+});
+
+test("a pdt.issued past the reader's wall + MAX_DRIFT + 5 s falls back to the entry's own pair (R2)", () => {
+  const { refs } = engine();
+  const state = refState(refs);
+  // HLC round six, 2026-11-08 (R2): a rewrite's stamp can no longer win every conflict by stamping ahead.
+  const ceiling = NOW + wire.MAX_HLC_SKEW_MILLIS + wire.FAR_FUTURE_MARGIN_MILLIS;
+  const atCeiling = headOf(refs, state, prefBytes("ceiling", { [ISSUED_ATTR]: `${ceiling}:0:peer`, [ISSUER_ATTR]: "peer/b" }), "e-at")!;
+  assert.deepEqual([atCeiling.issued, atCeiling.issuer], [`${ceiling}:0:peer`, "peer/b"]);
+  const ahead = headOf(refs, state, prefBytes("ahead", { [ISSUED_ATTR]: `${ceiling + 1}:0:peer`, [ISSUER_ATTR]: "peer/b" }), "e-ahead")!;
+  assert.deepEqual([ahead.issued, ahead.issuer], [`${NOW}:0:peer`, "peer/a"]);
+  const far = headOf(refs, state, prefBytes("far", { [ISSUED_ATTR]: `${2n ** 62n}:0:peer` }), "e-far")!;
+  assert.deepEqual([far.issued, far.issuer], [`${NOW}:0:peer`, "peer/a"]);
+  assert.equal(refs.headsIgnored, 0);
+});
+
+test("headsIgnored counts a bound violation, another kind, another ref name, and an undecodable PRef, once per entry (R3)", () => {
+  const { refs } = engine();
+  const state = refState(refs);
+  const ignored: [string, Uint8Array][] = [
+    ["violation", dumps({ ...pref({ name: "doc", kind: "map", root: "not-a-cid", seq: 1, size: 1 }) })],
+    ["kind", prefBytes("kind", null, { kind: "set" })],
+    ["name", dumps(pref({ name: "other", kind: "map", root: pdt.cids.of(new TextEncoder().encode("name"), 0x55), seq: 1, size: 1 }))],
+    ["float seq", dumps({ ...pref({ name: "doc", kind: "map", root: pdt.cids.of(new TextEncoder().encode("f"), 0x55), seq: 1, size: 1 }),
+      seq: new CborDouble(1) })],
+    ["unknown field", dumps({ ...pref({ name: "doc", kind: "map", root: pdt.cids.of(new TextEncoder().encode("u"), 0x55), seq: 1, size: 1 }),
+      extra: "x" })],
+    ["no record", dumps("text")],
+    ["not cbor", Uint8Array.of(0xff)],
+  ];
+  for (const [why, payload] of ignored) {
+    assert.equal(headOf(refs, state, payload, `e-${why}`), null, why);
+    assert.equal(headOf(refs, state, payload, `e-${why}`), null, why);
+  }
+  assert.equal(refs.headsIgnored, ignored.length);
+  assert.ok(state.ignoredEntries.has("e-kind"));
+  assert.notEqual(headOf(refs, state, prefBytes("fine"), "e-fine"), null);
+  assert.equal(refs.headsIgnored, ignored.length);
+});
+
+/** Writes a map version holding `entries` into the store and records it among the known versions. */
+function version(known: Map<string, pdt.Head>, store: pdt.NodeStore, entries: [string, V][], base: string[], seq: number,
+                 issued: string, issuer: string): pdt.Head {
+  let map = pdt.PMap.empty<string, V>(store);
+  for (const [k, v] of entries) {
+    map = map.assoc(k, v);
+  }
+  const head: pdt.Head = { root: map.root(), base, seq, size: map.count(), kind: "map", mode: "multi", issuer,
+    issued: `${issued}:${issuer.split("/")[0]}`, entryId: `${issuer}-${seq}`, expiresAtMillis: NOW + 60_000 };
+  known.set(head.root, head);
+  return head;
+}
+
+/** The merged value of `heads` (in merge order) and the conflict reasons the merge reported. */
+async function merged(refs: Refs, known: Map<string, pdt.Head>, heads: pdt.Head[]): Promise<{ value: pdt.PMap<string, V>; reasons: string[] }> {
+  const reasons: string[] = [];
+  // PDT 2 phase 7 (P2-V-02): the walk also reads the chain nodes a state learned, none here
+  const state = { name: "doc", kind: pdt.kindNamed("map"), known, ancestry: new Map(), chain: new Map(),
+    conflictListeners: [(e: pdt.PConflict) => reasons.push(e.reason)] };
+  const value = await (refs as unknown as { materialize(state: unknown, heads: pdt.Head[]): Promise<unknown> })
+    .materialize(state, [...heads].sort(pdt.mergeOrder));
+  return { value: value as pdt.PMap<string, V>, reasons };
+}
+
+test("two writers whose histories start from empty and share no version merge to the union of their keys (E16)", async () => {
+  const { refs, store } = engine();
+  const known = new Map<string, pdt.Head>();
+  // HLC round five, 2026-11-08 (E16): two base walks that share no version but each end at a first
+  // version within the 64-step limit share the empty value as their base.
+  const a1 = version(known, store, [["a1", 1]], [], 1, "1000:0", "zA/a");
+  const a2 = version(known, store, [["a1", 1], ["a2", 2]], [a1.root], 2, "2000:0", "zA/a");
+  const b1 = version(known, store, [["b1", 1]], [], 1, "1100:0", "zB/b");
+  const b2 = version(known, store, [["b1", 1], ["b2", 2], ["both", "b"]], [b1.root], 2, "2100:0", "zB/b");
+  const b3 = version(known, store, [["b1", 1], ["b2", 2], ["b3", 3], ["both", "b"]], [b2.root], 3, "3100:0", "zB/b");
+  const a3 = version(known, store, [["a1", 1], ["a2", 2], ["both", "a"]], [a2.root], 3, "3000:0", "zA/a");
+  const two = await merged(refs, known, [a2, b2]);
+  assert.deepEqual([...two.value.keys()].sort(), ["a1", "a2", "b1", "b2", "both"]);
+  assert.deepEqual(two.reasons, []);
+  // a first version against a longer history merges from empty too
+  const mixed = await merged(refs, known, [a1, b3]);
+  assert.deepEqual([...mixed.value.keys()].sort(), ["a1", "b1", "b2", "b3", "both"]);
+  // a key both writers set to different values takes the later head, as any three-way merge does
+  const clash = await merged(refs, known, [a3, b3]);
+  assert.deepEqual([...clash.value.keys()].sort(), ["a1", "a2", "b1", "b2", "b3", "both"]);
+  assert.equal(clash.value.get("both"), "b");
+  assert.deepEqual(clash.reasons, ["LATER_HLC"]);
+});
+
+test("a base walk that reaches an unknown version or the step limit gives no common base, and a shared version stays the base (E16)", async () => {
+  const { refs, store } = engine();
+  const known = new Map<string, pdt.Head>();
+  const a1 = version(known, store, [["a1", 1]], [], 1, "1000:0", "zA/a");
+  const a2 = version(known, store, [["a1", 1], ["a2", 2]], [a1.root], 2, "2000:0", "zA/a");
+  // a version whose base this replica never saw: the walk does not end at a first version
+  const orphan = version(known, store, [["o", 1]], [pdt.cids.of(new TextEncoder().encode("unseen"), 0x71)], 2, "2100:0", "zB/b");
+  const unseen = await merged(refs, known, [a2, orphan]);
+  assert.deepEqual([...unseen.value.keys()], ["o"]);
+  assert.deepEqual(unseen.reasons, ["NO_COMMON_BASE"]);
+  // a history longer than the walk bound: its first version lies one step past the limit. HLC round
+  // five, 2026-11-08 (E16): the walk holds the version it first reaches at step MAX_BASE_STEPS and
+  // follows none of its bases, as Java's Refs.ancestors does, so the limit cuts off step 65.
+  let deep = version(known, store, [["d", 0]], [], 1, "5000:0", "zB/b");
+  for (let i = 1; i <= MAX_BASE_STEPS + 1; i++) {
+    deep = version(known, store, [["d", i]], [deep.root], i + 1, `${5000 + i}:0`, "zB/b");
+  }
+  const past = await merged(refs, known, [a2, deep]);
+  assert.deepEqual([...past.value.keys()], ["d"]);
+  assert.deepEqual(past.reasons, ["NO_COMMON_BASE"]);
+  // one step shorter, the first version lies exactly at the limit, inside the walk
+  const inside = known.get(deep.base[0]!)!;
+  const within = await merged(refs, known, [a2, inside]);
+  assert.deepEqual([...within.value.keys()].sort(), ["a1", "a2", "d"]);
+  assert.deepEqual(within.reasons, []);
+  // two forks of a shared version keep that version as their base: a key one side removed stays removed
+  const left = version(known, store, [["a2", 2], ["l", 1]], [a2.root], 3, "3000:0", "zA/a");
+  const right = version(known, store, [["a1", 1], ["a2", 2], ["r", 1]], [a2.root], 3, "3100:0", "zC/c");
+  const forks = await merged(refs, known, [left, right]);
+  assert.deepEqual([...forks.value.keys()].sort(), ["a2", "l", "r"]);
+});
+
+test("the base walk holds the version it first reaches at the step limit, as Java's Refs.ancestors does (E16)", async () => {
+  const { refs, store } = engine();
+  const known = new Map<string, pdt.Head>();
+  // HLC round five, 2026-11-08 (E16): Java, Python, and Ruby add the root first reached at step
+  // MAX_BASE_STEPS to the walk and follow none of its bases, so a version shared at exactly that
+  // depth stays the common base: the key one side removed stays removed.
+  const shared = version(known, store, [["s", 1], ["gone", 1]], [], 1, "1000:0", "zA/a");
+  let left = shared;
+  for (let i = 1; i <= MAX_BASE_STEPS; i++) {
+    left = version(known, store, [["s", 1], ["gone", 1], ["l", i]], [left.root], i + 1, `${1000 + i}:0`, "zA/a");
+  }
+  const right = version(known, store, [["s", 1], ["r", 1]], [shared.root], 2, "9000:0", "zC/c");
+  const forks = await merged(refs, known, [left, right]);
+  assert.deepEqual([...forks.value.keys()].sort(), ["l", "r", "s"]);
+  assert.deepEqual(forks.reasons, []);
+});
+
+test("a history whose first version a revert recreated still merges from empty, as Python and Ruby merge it (E16)", async () => {
+  const { refs, store } = engine();
+  const known = new Map<string, pdt.Head>();
+  // HLC round five, 2026-11-08 (E16): a revert to the first version gives that root a base, so the
+  // walk holds no version with an empty base. The replica knows every version on the walk and the
+  // limit cut nothing off, so the history still began at the empty value, and the merge keeps every
+  // key of both writers.
+  const first = version(known, store, [["c", 1]], [], 1, "1000:0", "zA/a");
+  const second = version(known, store, [["c", 2]], [first.root], 2, "2000:0", "zA/a");
+  known.get(first.root)!.base = [second.root];
+  const b1 = version(known, store, [["b1", 1]], [], 1, "1100:0", "zB/b");
+  const b2 = version(known, store, [["b1", 1], ["b2", 2]], [b1.root], 2, "2100:0", "zB/b");
+  const both = await merged(refs, known, [second, b2]);
+  assert.deepEqual([...both.value.keys()].sort(), ["b1", "b2", "c"]);
+  assert.deepEqual(both.reasons, []);
+});
+
+/** A tree fetch that lands its root's nodes from `source` when awaited, or fails when `source` lacks them. */
+class FakeFetch {
+  done = false;
+  failure: string | null = null;
+  bytesReceived = 0;
+
+  constructor(private readonly root: string, private readonly source: pdt.NodeStore, private readonly target: pdt.NodeStore) {}
+
+  get complete(): boolean {
+    return this.done && this.failure === null;
+  }
+
+  async await(_timeoutMillis: number): Promise<boolean> {
+    if (!this.done) {
+      this.done = true;
+      if (this.source.complete(this.root)) {
+        for (const cid of this.source.reachable(this.root)) {
+          if (!this.target.has(cid)) {
+            this.target.putVerified(cid, this.source.get(cid)!);
+          }
+        }
+      } else {
+        this.failure = "no holder";
+      }
+    }
+    return this.complete;
+  }
+
+  cancel(): void {
+    this.done = true;
+    this.failure ??= "cancelled";
+  }
+}
+
+/** An exchange whose fetches copy from `source`; `asked` lists every root a fetch started for. */
+function fakeExchange(source: pdt.NodeStore, target: () => pdt.NodeStore): { exchange: TreeExchange; asked: string[]; fetches: FakeFetch[] } {
+  const asked: string[] = [];
+  const fetches: FakeFetch[] = [];
+  const exchange = {
+    fetchTree: (root: string) => {
+      asked.push(root);
+      const fetch = new FakeFetch(root, source, target());
+      fetches.push(fetch);
+      return fetch;
+    },
+    holdTree: () => {},
+    release: () => {},
+  };
+  return { exchange: exchange as unknown as TreeExchange, asked, fetches };
+}
+
+/** Copies every node `root` reaches from `from` into `to`. */
+function copyTree(from: pdt.NodeStore, to: pdt.NodeStore, root: string): void {
+  for (const cid of from.reachable(root)) {
+    if (!to.has(cid)) {
+      to.putVerified(cid, from.get(cid)!);
+    }
+  }
+}
+
+test("basesFetched counts a base fetch when it settles, as Java's Refs.settle counts it, and never one that failed (R4)", async () => {
+  // HLC round six, 2026-11-08 (R4): Java counts basesFetched when a base fetch completes and settles,
+  // and its ensureBases fetches only a base this engine saw a head of; this client counted every
+  // base fetch it started, failed ones and roots it never saw a record of included.
+  const source = pdt.NodeStore.inMemory();
+  let target: pdt.NodeStore | null = null;
+  const fake = fakeExchange(source, () => target!);
+  const { refs, store } = engine(NOW, fake.exchange);
+  target = store;
+  const state = refState(refs) as RefState & { pending: Map<string, unknown>; conflictListeners: ((e: pdt.PConflict) => void)[] };
+  const reasons: string[] = [];
+  state.conflictListeners.push((e) => reasons.push(e.reason));
+  const base = version(state.known, source, [["k", 1], ["gone", 1]], [], 1, "1000:0", "zA/a");
+  const left = version(state.known, source, [["k", 1], ["gone", 1], ["l", 1]], [base.root], 2, "2000:0", "zA/a");
+  const right = version(state.known, source, [["k", 1], ["r", 1]], [base.root], 2, "2100:0", "zC/c");
+  copyTree(source, store, left.root);
+  copyTree(source, store, right.root);
+  assert.equal(store.complete(base.root), false);
+  const materialize = (heads: pdt.Head[]): Promise<unknown> =>
+    (refs as unknown as { materialize(state: unknown, heads: pdt.Head[]): Promise<unknown> }).materialize(state, heads);
+
+  // the common base fetched and settled: one base, and the merge removes the key the right side removed
+  const value = await materialize([left, right]) as pdt.PMap<string, V>;
+  assert.deepEqual([...value.keys()].sort(), ["k", "l", "r"]);
+  assert.deepEqual([refs.basesFetched, reasons], [1, []]);
+
+  // a base fetch that fails counts nothing, and the merge has no base
+  const lost = version(state.known, pdt.NodeStore.inMemory(), [["lost", 1]], [], 1, "1000:0", "zA/a");
+  const l2 = version(state.known, source, [["l2", 1]], [lost.root], 2, "2000:0", "zA/a");
+  const r2 = version(state.known, source, [["r2", 1]], [lost.root], 2, "2100:0", "zC/c");
+  copyTree(source, store, l2.root);
+  copyTree(source, store, r2.root);
+  await materialize([l2, r2]);
+  assert.deepEqual([refs.basesFetched, reasons], [1, ["NO_COMMON_BASE"]]);
+
+  // a head that arrives held fetches only the bases this engine saw a record of; the count waits for the settle
+  const arrived = (head: pdt.Head): void =>
+    (refs as unknown as { arrived(state: unknown, head: pdt.Head, own: boolean): void }).arrived(state, head, false);
+  const seenBase = version(state.known, source, [["s", 1]], [], 1, "3000:0", "zA/a");
+  const unseen = pdt.cids.of(new TextEncoder().encode("never seen as a head"), 0x71);
+  const next = version(state.known, source, [["s", 2]], [seenBase.root, unseen], 2, "3100:0", "zA/a");
+  copyTree(source, store, next.root);
+  const before = fake.asked.length;
+  arrived(next);
+  assert.deepEqual(fake.asked.slice(before), [seenBase.root], "no fetch for a base never seen as a head");
+  assert.equal(refs.basesFetched, 1, "a base fetch under way counts nothing yet");
+  await fake.fetches.at(-1)!.await(0);
+  refs.tick();
+  assert.ok(store.complete(seenBase.root));
+  assert.equal(refs.basesFetched, 2, "the base counts when it settles");
+});
+
+test("a head whose fetch failed counts once per cause in headsLate across reads and ticks, and a seq of 2^53 is a head (R3)", async () => {
+  // HLC round six, 2026-11-08 (R3): Java counts an entry once, since its Set.add answers whether the
+  // entry is new; a JavaScript Set.add answers the set, so the deref and the tick each counted it.
+  const source = pdt.NodeStore.inMemory();
+  let target: pdt.NodeStore | null = null;
+  const fake = fakeExchange(source, () => target!);
+  const { refs, store, peer } = engine(NOW, fake.exchange);
+  target = store;
+  const ref = refs.ref<pdt.PMap<string, V>>(new Space(peer, "s"), "doc", "map");
+  const lost = pdt.PMap.empty<string, V>(pdt.NodeStore.inMemory()).assoc("lost", 1).root();
+  const head = pref({ name: "doc", kind: "map", root: lost, seq: MAX_SEQ, size: 1 });
+  peer.writeEntry("s", PREF_TYPE, head, "a", 60_000, null, pdt.prefTags(head));
+  assert.equal(ref.heads().length, 0);
+  assert.equal(refs.liveEntries((refs as unknown as { states: Map<string, never> }).states.get("s/doc")!).length, 1,
+    "a seq of 2^53 is within the bound, as Java's PRef.violation reads it");
+  assert.equal((await ref.deref()).count(), 0);
+  // swarm retries (ROBUSTNESS.md 10.3 E2): a root still loading is late, apart from the heads ignored for a fault
+  assert.equal(refs.headsIgnored, 0);
+  assert.equal(refs.headsLate.timeout + refs.headsLate.failedFetch, 1);
+  refs.tick();
+  await ref.deref();
+  refs.tick();
+  assert.equal(refs.headsIgnored, 0);
+  assert.ok(refs.headsLate.timeout <= 1 && refs.headsLate.failedFetch <= 1, "each cause counts once while the entry lives");
+});
+
+test("an entry ignored while it stays live counts once in headsIgnored across ticks, as Java prunes against every entry read (R3)", () => {
+  // HLC round six, 2026-11-08 (R3): Java's liveEntries keeps the id of every entry of the name it
+  // read, well formed or not, and prunes the ignored entries against those ids, so an entry of
+  // another kind counts once while it stays live. Pruned against the heads alone, each tick forgot
+  // the entry and the next read counted it again.
+  const { refs, peer } = engine();
+  const ref = refs.ref<pdt.PMap<string, V>>(new Space(peer, "s"), "doc", "map");
+  const root = pdt.PMap.empty<string, V>(pdt.NodeStore.inMemory()).assoc("x", 1).root();
+  const set = pref({ name: "doc", kind: "set", root, seq: 1, size: 1 });
+  peer.writeEntry("s", PREF_TYPE, set, "a", 60_000, null, pdt.prefTags(set));
+  assert.equal(ref.heads().length, 0);
+  assert.equal(refs.headsIgnored, 1);
+  for (let i = 0; i < 3; i++) {
+    refs.tick();
+  }
+  assert.equal(ref.heads().length, 0);
+  assert.equal(refs.headsIgnored, 1);
+});
+
+test("a version a later record recreates walks that record's bases first, as Java's Refs.toHead joins them (R4)", async () => {
+  // HLC round six, 2026-11-08 (R4): a record of a known root with a larger seq lists its own bases
+  // first and then the bases the version held, as Java's toHead joins them. The base walk visits the
+  // bases in that order, so the order picks the common base when two candidates tie.
+  const { refs, store } = engine();
+  const state = refState(refs);
+  const roots = new Map<string, string>();
+  const root = (label: string): string => {
+    if (!roots.has(label)) {
+      roots.set(label, pdt.PMap.empty<string, V>(store).assoc("v", label).root());
+    }
+    return roots.get(label)!;
+  };
+  const read = (label: string, base: string[], seq: number, entryId: string): pdt.Head =>
+    headOf(refs, state, dumps(pref({ name: "doc", kind: "map", root: root(label), base: base.map(root), seq, size: 1 })), entryId)!;
+  read("p", [], 1, "e-p");
+  read("q", [], 1, "e-q");
+  read("x", ["p"], 2, "e-x");
+  read("x", ["q", "p"], 5, "e-x-revert");
+  const a = read("a", ["x"], 6, "e-a");
+  const b = read("b", ["q", "p"], 3, "e-b");
+  assert.deepEqual(state.known.get(root("x"))!.base, [root("q"), root("p")]);
+  const base = await (refs as unknown as { commonBase(state: unknown, heads: pdt.Head[]): Promise<string | null> }).commonBase(state, [b, a]);
+  assert.equal(base, root("q"));
 });

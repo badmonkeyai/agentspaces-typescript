@@ -57,6 +57,7 @@ test("a tcp hub relays between dial-only peers and advertises its endpoint and r
     await a.connect(h, p);
     await b.connect(h, p);
     await until(() => host.peer.inbound.size === 2);
+    b.joinSpace("tasks"); // a member folds the spaces it joined (HLC round five, 2026-11-08)
     const id = a.writeEntry("tasks", TASK, { topic: "over tcp" }, "a");
     await until(() => b.states.has(id));
     assert.ok(host.peer.states.has(id));

@@ -23,12 +23,12 @@
  * host whose residency cannot carry a voter is refused at construction.
  */
 
-import { Peer, capabilities, cbor, deriveId, platform, requireResidency, wire } from "@agentspaces/client";
+import { Peer, capabilities, cbor, deriveId, platform, records, requireResidency, wire } from "@agentspaces/client";
 import type { Residency } from "@agentspaces/client";
 import { RaftLog, RaftOptions, TYPE } from "./raft.js";
 
 const { Pipes } = capabilities;
-const { dumps, loads } = cbor;
+const { dumps } = cbor;
 type Dict = wire.Dict;
 
 export type OrderedLogHostOptions = RaftOptions & {
@@ -50,7 +50,8 @@ export class OrderedLogHost {
   /**
    * Committed commands that were not well-formed claim commands, were not authentic, or carried a
    * claim stamp that wire.parseHlc refuses (HLC logical counter, 2026-11-08, Rust team report); the
-   * peer's foldStampsRefused counts each distinct refused claim whose proof verifies.
+   * peer's stampsLogicalRefused counts each distinct refused claim whose stamp decodes and whose proof
+   * verifies, and a stamp that does not decode counts here alone (HLC round four, 2026-11-08).
    */
   commandsDropped = 0;
   /** Committed claims installed, and those heard for an epoch the replica had already decided. */
@@ -150,20 +151,19 @@ export class OrderedLogHost {
    * generation installs nothing but is still announced when authentic, in the log's order.
    */
   private apply(command: Uint8Array): void {
-    let parsed: Dict;
-    try {
-      parsed = loads(command) as Dict;
-    } catch {
+    // HLC round six, 2026-11-08 (F1, F3): the command reads strictly as a ClaimCommand, a TakeClaim Java's
+    // record accepts inside, so OrderedTakes and this host drop the same commands before comparing epochs.
+    const parsed = records.readRecord(command, records.CLAIM_COMMAND);
+    if (parsed === null) {
       this.commandsDropped += 1;
       return;
     }
-    const entryId = parsed?.["entryId"];
-    const claim = parsed?.["claim"] as Dict | undefined;
-    const holderKey = parsed?.["holderKey"];
-    if (typeof entryId !== "string" || claim === null || typeof claim !== "object"
-        || !(holderKey instanceof Uint8Array) || holderKey.length !== 32 || !(parsed["signature"] instanceof Uint8Array)
+    const entryId = parsed["entryId"] as string;
+    const claim = parsed["claim"] as Dict;
+    const holderKey = parsed["holderKey"] as Uint8Array;
+    if (holderKey.length !== 32
         || claim["entryId"] !== entryId // ASF-002: a claim signed for one entry never commits against another
-        || String(claim["holder"] ?? "").split("/")[0] !== deriveId(holderKey)) {
+        || String(claim["holder"]).split("/")[0] !== deriveId(holderKey)) {
       this.commandsDropped += 1;
       return;
     }
@@ -189,7 +189,7 @@ export class OrderedLogHost {
       // never granted (seen as one decision minuted twice). Java's OrderedTakes.onCommand only
       // verifies here; this does the same.
       this.claimsRepeated += 1;
-      if (sameClaim(held, claim) || wire.verifyClaimProof(signed, this.peer.now())) {
+      if (sameClaim(held, claim) || wire.verifyClaimProof(signed)) {
         this.notify(entryId, claim);
       }
       return;

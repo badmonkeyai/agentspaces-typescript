@@ -26,8 +26,9 @@
  * voter lives in `@agentspaces/ordered`.
  */
 
-import { dumps, loads } from "../cbor.js";
+import { dumps, readDocument } from "../cbor.js";
 import { AgentIdentity, parseInstantMillis, spaceIdLocal } from "../identity.js";
+import { leaseExpiryOf, present } from "../peer.js";
 import type { Peer } from "../peer.js";
 import * as wire from "../wire.js";
 import type { Dict } from "../wire.js";
@@ -143,18 +144,19 @@ export class OrderedLog {
       const now = peer.now();
       for (const [entryId, dto] of peer.states) {
         const record = dto["record"] as Dict | undefined;
-        if (!record || record["type"] !== typeName || dto["completed"] || record["spaceId"] !== spaceId) {
-          continue;
-        }
-        const lease = (dto["leaseValue"] ?? record["lease"]) as Dict | undefined;
-        if (!lease || Number(lease["expiresAtMillis"]) <= now) {
-          continue;
+        if (!record || record["type"] !== typeName || !present(dto) || record["spaceId"] !== spaceId
+            || leaseExpiryOf(dto) <= now) {
+          continue; // the log takes no withdrawn entry (HLC round five, 2026-11-08)
         }
         const current = peer.claims.get(entryId)?.["claim"] as Dict | undefined;
         if (current && Number(current["expiresAtMillis"]) > now) {
           continue;
         }
-        const payload = loads((record["payload"] as Uint8Array) ?? new Uint8Array([0xf6])) as Dict;
+        const read = readDocument((record["payload"] as Uint8Array) ?? new Uint8Array([0xf6]));
+        if (read === null) {
+          continue; // a value no read can decode (HLC round six, 2026-11-08)
+        }
+        const payload = read.value as Dict;
         if (matches !== null && !matches(payload ?? {}, (record["tags"] as Dict) ?? {})) {
           continue;
         }

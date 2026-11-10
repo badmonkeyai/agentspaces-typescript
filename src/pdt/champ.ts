@@ -33,6 +33,7 @@ import { compare, concat } from "../bytes.js";
 import type { CborValue } from "../cbor.js";
 import { Embedded, KIND_KEY, KIND_M, KIND_MC, Link, NodeFormatError, decode } from "./nodes.js";
 import { NodeStore } from "./store.js";
+import { PText } from "./text.js";
 import { Codec, Ctx, Flusher, Ref, bytesEqual, checkKey, codecOf, equalHashed, hashKey, refOf, resolve, sameValue,
   spill } from "./values.js";
 
@@ -713,10 +714,17 @@ export function rawMerge3(mine: RawMap, base: RawMap, theirs: RawMap, resolver: 
     if (sameOutcome) {
       continue;
     }
+    const mineValue = myChange.after === undefined ? null : resolve(myChange.after, mine.ctx);
+    const theirValue = theirChange.after === undefined ? null : resolve(theirChange.after, theirs.ctx);
+    // PDT 2 phase 7 (P2-T-03): two texts that meet under one key take their union, which raises no conflict
+    const union = mineValue !== null && theirValue !== null && PText.isText(mineValue) && PText.isText(theirValue)
+      ? PText.union(mineValue, theirValue) : null;
+    if (union !== null) {
+      editor.assoc(theirChange.key, union);
+      continue;
+    }
     const kept = resolver(theirChange.key,
-      myChange.before === undefined ? null : resolve(myChange.before, base.ctx),
-      myChange.after === undefined ? null : resolve(myChange.after, mine.ctx),
-      theirChange.after === undefined ? null : resolve(theirChange.after, theirs.ctx));
+      myChange.before === undefined ? null : resolve(myChange.before, base.ctx), mineValue, theirValue);
     if (kept === null) {
       editor.dissoc(theirChange.key);
     } else {

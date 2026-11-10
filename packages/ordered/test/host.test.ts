@@ -28,7 +28,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { Identity, MemoryNetwork, Peer, capabilities, settle, wire } from "@agentspaces/client";
+import { Identity, MemoryNetwork, Peer, bytes, capabilities, cbor, settle, wire } from "@agentspaces/client";
 import type { Residency } from "@agentspaces/client";
 import { OrderedLogHost } from "../src/host.js";
 
@@ -278,7 +278,8 @@ test("a committed claim stamped above LOGICAL_LIMIT is dropped, never installed 
     const holder = Identity.generate();
     const command = (stamp: string): Uint8Array => {
       const claim = wire.takeClaim(entryId, spaceId, 1, stamp, holder.agent("clerk"), 0.0, Date.now() + 60_000);
-      return claimCommand(entryId, claim, holder.publicRaw, wire.signedClaim(claim, holder)["signature"] as Uint8Array, null);
+      // Signed directly: wire.signedClaim refuses a stamp outside the grammar (HLC round six, 2026-11-08, F1).
+      return claimCommand(entryId, claim, holder.publicRaw, holder.sign(cbor.dumps(claim)), null);
     };
     const apply = (c: Uint8Array): void => (host as unknown as { apply(c: Uint8Array): void }).apply(c);
     const hostile = command(`${Date.now()}:2147483647:${holder.peerId}`);
@@ -293,7 +294,7 @@ test("a committed claim stamped above LOGICAL_LIMIT is dropped, never installed 
     assert.equal(host.claimsRepeated, 0);
     assert.deepEqual(heard, [honest], "listeners hear only the honest claim");
     // HLC canonical stamps, 2026-11-08: the replica verified it and counted it once, on the first offer.
-    assert.equal(peer.foldStampsRefused, 1);
+    assert.equal(peer.stampsLogicalRefused, 1);
   } finally {
     host.close();
     peer.close();
@@ -312,7 +313,8 @@ test("the host drops a committed claim whose stamp fails the strict parse on bot
     const holder = Identity.generate();
     const command = (stamp: string): Uint8Array => {
       const claim = wire.takeClaim(entryId, spaceId, 1, stamp, holder.agent("clerk"), 0.0, Date.now() + 60_000);
-      return claimCommand(entryId, claim, holder.publicRaw, wire.signedClaim(claim, holder)["signature"] as Uint8Array, null);
+      // Signed directly: wire.signedClaim refuses a stamp outside the grammar (HLC round six, 2026-11-08, F1).
+      return claimCommand(entryId, claim, holder.publicRaw, holder.sign(cbor.dumps(claim)), null);
     };
     const apply = (c: Uint8Array): void => (host as unknown as { apply(c: Uint8Array): void }).apply(c);
     const now = Date.now();
@@ -334,8 +336,70 @@ test("the host drops a committed claim whose stamp fails the strict parse on bot
     assert.equal(host.commandsDropped, 2 * malformed.length);
     assert.equal(host.claimsRepeated, 0);
     assert.deepEqual(heard, [honest], "listeners hear only the honest claim");
-    // HLC canonical stamps, 2026-11-08: each distinct claim counts once, though each came twice.
-    assert.equal(peer.foldStampsRefused, malformed.length);
+    // HLC round four, 2026-11-08: a stamp that does not decode names no verified signer, so as in Java
+    // the host's commandsDropped is its only count, and the replica's stamp refusals stay at zero.
+    assert.equal(peer.stampsLogicalRefused, 0);
+  } finally {
+    host.close();
+    peer.close();
+  }
+});
+
+test("the host drops a committed claim whose stamp sits under a longer length header than it needs (HLC round five, 2026-11-08, E1)", async () => {
+  const peer = new Peer(Identity.generate(), "zOrderedLongHeaderGroup");
+  const host = new OrderedLogHost(peer, "jobs", [peer.identity.peerId], { residency: SERVICE });
+  try {
+    await host.ready();
+    const entryId = peer.writeEntry("jobs", TASK, { job: "j5" }, "writer");
+    const spaceId = String((peer.states.get(entryId)!["record"] as wire.Dict)["spaceId"]);
+    const holder = Identity.generate();
+    const stamp = `${Date.now()}:${wire.LOGICAL_LIMIT + 1}:${holder.peerId}`;
+    const claim = wire.takeClaim(entryId, spaceId, 1, stamp, holder.agent("clerk"), 0.0, Date.now() + 60_000);
+    const command = claimCommand(entryId, claim, holder.publicRaw, wire.signedClaim(claim, holder)["signature"] as Uint8Array, null);
+    const text = bytes.utf8(stamp);
+    const canonical = bytes.concat(Uint8Array.of(0x78, text.length), text);
+    const at = Buffer.from(command).indexOf(Buffer.from(canonical));
+    assert.ok(at > 0);
+    const longer = bytes.concat(command.subarray(0, at), Uint8Array.of(0x79, 0, text.length), text,
+      command.subarray(at + canonical.length));
+    (host as unknown as { apply(c: Uint8Array): void }).apply(longer);
+    assert.equal(host.commandsDropped, 1);
+    assert.equal(peer.claims.get(entryId), undefined);
+    assert.equal(peer.stampsLogicalRefused, 0, "a stamp that does not decode names no verified signer");
+    (host as unknown as { apply(c: Uint8Array): void }).apply(command);
+    assert.deepEqual([host.commandsDropped, peer.stampsLogicalRefused], [2, 1], "the shortest spelling verifies and counts");
+  } finally {
+    host.close();
+    peer.close();
+  }
+});
+
+test("the host drops a committed claim whose epoch Java's TakeClaim refuses on both paths (HLC round five, 2026-11-08, E13)", async () => {
+  const peer = new Peer(Identity.generate(), "zOrderedRefusedClaimGroup");
+  const host = new OrderedLogHost(peer, "jobs", [peer.identity.peerId], { residency: SERVICE });
+  try {
+    await host.ready();
+    const entryId = peer.writeEntry("jobs", TASK, { job: "j6" }, "writer");
+    const spaceId = String((peer.states.get(entryId)!["record"] as wire.Dict)["spaceId"]);
+    const heard: number[] = [];
+    host.onCommitted((_id, c) => heard.push(Number(c["epoch"])));
+    const holder = Identity.generate();
+    const command = (epoch: number): Uint8Array => {
+      const claim = wire.takeClaim(entryId, spaceId, epoch, `${Date.now()}:0:${holder.peerId}`, holder.agent("clerk"),
+        0.0, Date.now() + 60_000);
+      return claimCommand(entryId, claim, holder.publicRaw, holder.sign(cbor.dumps(claim)), null);
+    };
+    const apply = (c: Uint8Array): void => (host as unknown as { apply(c: Uint8Array): void }).apply(c);
+    // Java's codec cannot build a TakeClaim with an epoch below 1, so OrderedTakes drops the command
+    // before it compares epochs, and the host does the same.
+    apply(command(0));
+    apply(command(-1));
+    assert.deepEqual([host.commandsDropped, host.claimsRepeated], [2, 0]);
+    apply(command(1));
+    assert.equal(host.claimsInstalled, 1);
+    apply(command(0));
+    assert.deepEqual([host.commandsDropped, host.claimsRepeated], [3, 0]);
+    assert.deepEqual(heard, [1], "listeners hear only the claim Java decodes");
   } finally {
     host.close();
     peer.close();

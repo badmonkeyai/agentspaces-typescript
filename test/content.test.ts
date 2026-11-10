@@ -30,7 +30,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { Content, MemoryStore, Pipes } from "../src/capabilities/index.js";
+import { MemoryStore } from "../src/capabilities/index.js";
 import * as c from "../src/capabilities/content.js";
 import { dumps, loads } from "../src/cbor.js";
 import { Identity } from "../src/identity.js";
@@ -40,6 +40,8 @@ import { Space, Template, entry } from "../src/space.js";
 import * as wire from "../src/wire.js";
 import type { Dict } from "../src/wire.js";
 import "../src/node/index.js";
+import { Network, node as fleetNode, fleet as groupFleet, run } from "./content-fleet.js";
+import type { Node } from "./content-fleet.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const GOLDEN: { [key: string]: string } = JSON.parse(readFileSync(join(here, "..", "..", "test", "golden.json"), "utf8"));
@@ -113,68 +115,9 @@ test("have runs round-trip at every size", () => {
 type Internals = { fold(dto: Dict): void; foldClaim(entryId: string, signed: Dict): void;
   handle(env: Dict): void; send(kind: string, body: Uint8Array, to?: string | null): void; channel: unknown };
 
-class Network {
-  readonly peers = new Map<string, NetPeer>();
-}
-
-class NetPeer extends Peer {
-  constructor(readonly network: Network) {
-    super(Identity.generate(), GROUP);
-    network.peers.set(this.identity.peerId, this);
-    const self = this as unknown as Internals;
-    self.send = (kind: string, body: Uint8Array, to: string | null = null) => {
-      const env = wire.envelope(this.group, kind, this.identity.peerId,
-        wire.hlcNow(this.identity.peerId, this.now()), body, to);
-      const targets = to !== null ? [network.peers.get(to)!]
-        : [...network.peers.values()].filter((p) => p.identity.peerId !== this.identity.peerId);
-      for (const target of targets) {
-        if (target.accepts(env)) {
-          (target as unknown as Internals).handle(env);
-        }
-      }
-      if (kind === "RUMOR" && to === null) {
-        const rumor = loads(body) as Dict;
-        if (String(rumor["streamId"] ?? "").startsWith("space:")) {
-          const delta = loads(rumor["payload"] as Uint8Array) as Dict;
-          if (delta["state"] !== null && typeof delta["state"] === "object") {
-            self.fold(delta["state"] as Dict);
-          }
-        }
-      }
-    };
-  }
-
-  override pullSpace(_space: string): void {}
-  override pullRevocations(): void {}
-}
-
-type Node = { peer: NetPeer; space: Space; content: Content };
-
-function node(network: Network, store: c.PieceStore = new MemoryStore(), options: c.ContentOptions = {}): Node {
-  const peer = new NetPeer(network);
-  const space = new Space(peer, "content");
-  let seed = 7;
-  const random = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
-  const content = new Content(new Pipes(peer), space, store, { pieceSize: PIECE, random, ...options });
-  return { peer, space, content };
-}
-
-function fleet(n: number, options: c.ContentOptions = {}): Node[] {
-  const network = new Network();
-  const nodes = Array.from({ length: n }, () => node(network, new MemoryStore(), options));
-  for (const { peer } of nodes) {
-    peer.introduce();
-  }
-  return nodes;
-}
-
-function run(nodes: Node[], rounds = 20): void {
-  for (let r = 0; r < rounds; r++) {
-    for (const { content } of nodes) {
-      content.tick();
-    }
-  }
-}
+const node = (network: Network, store: c.PieceStore = new MemoryStore(), options: c.ContentOptions = {}): Node =>
+  fleetNode(network, GROUP, store, { pieceSize: PIECE, ...options });
+const fleet = (n: number, options: c.ContentOptions = {}): Node[] => groupFleet(n, GROUP, { pieceSize: PIECE, ...options });
 
 function pattern(length: number, mul: number, add: number): Uint8Array {
   const out = new Uint8Array(length);
@@ -183,6 +126,27 @@ function pattern(length: number, mul: number, add: number): Uint8Array {
   }
   return out;
 }
+
+test("PDT 2 phase 7 gate: a holding lives to its renewed lease, and a withdrawn holding is gone", () => {
+  // A reader judges a holding or a manifest as Java's EntryState does, by its present dots and its lease register: a
+  // renewal moves the register past the record's first lease (SPEC §7.3), as every holder renews at half-life, and a
+  // cancel's removes withdraw it, as Java cancels the holding a new one replaces. Checking `completed` and the
+  // record's lease alone kept a withdrawn holder and lost a renewed one.
+  const clock = { millis: Date.now() };
+  const network = new Network();
+  const [a, b] = [0, 1].map(() => fleetNode(network, GROUP, new MemoryStore(), { pieceSize: PIECE }, () => clock.millis)) as [Node, Node];
+  a.peer.introduce();
+  b.peer.introduce();
+  const root = String(a.content.publish(new TextEncoder().encode("held".repeat(100)))["root"]);
+  const [entryId] = [...b.peer.states].filter(([, dto]) => (dto["record"] as Dict)["type"] === c.HOLDING_TYPE).map(([id]) => id);
+  assert.ok(entryId !== undefined);
+  clock.millis += 60_000;
+  a.peer.renewEntry("content", entryId, 120_000);
+  clock.millis += 60_001; // past the holding's first lease of two minutes, inside the renewed one
+  assert.deepEqual(b.content.holdings(root).map((h) => h["holder"]), [a.peer.identity.peerId]);
+  a.peer.cancelEntry("content", entryId);
+  assert.deepEqual(b.content.holdings(root), []);
+});
 
 test("two peers fetch a published artifact from the publisher and each other", async () => {
   const nodes = fleet(3);
@@ -204,6 +168,55 @@ test("two peers fetch a published artifact from the publisher and each other", a
   assert.equal(b.content.describe(String(manifest["root"]))!["completeHolders"], 3);
   assert.deepEqual(cc.content.listManifests().map((m) => m["root"]), [manifest["root"]]);
   assert.ok(b.content.fetch(String(manifest["root"])).complete);
+});
+
+// ------------------------------------------------------------------ tree manifests (PDT 2 follow-ups, 2026-11-09, F3)
+
+type RecordWriter = { write(typeName: string, value: Dict, lease: number | string, tags: Dict): string };
+
+test("a tree manifest needs no piece table and names a dag-cbor root (F3)", () => {
+  const tree = loads(hex("content_manifest_tree_cbor")) as Dict;
+  assert.equal(c.manifestViolation(tree), null, "a tree manifest's table is not over its root, as Java reads it");
+  const tableless: Dict = { ...tree, table: null };
+  assert.equal(c.manifestViolation(tableless), null);
+  assert.equal(c.manifestViolation({ ...tableless, layout: "pieces" }), "exactly one of table and tableRef must be present");
+  const { layout: _layout, ...noLayout } = tableless;
+  assert.equal(c.manifestViolation(noLayout), "exactly one of table and tableRef must be present");
+  assert.equal(c.manifestViolation({ ...tree, tableRef: wire.contentId(new Uint8Array([1])) }),
+    "at most one of table and tableRef may be present");
+  assert.equal(c.manifestViolation({ ...tableless, root: GOLDEN["content_root_cidv1"]! }),
+    "a tree manifest's root is a dag-cbor CID");
+  assert.equal(c.manifestViolation({ ...tableless, root: "broot" }), "a tree manifest's root is a dag-cbor CID");
+  const flat = loads(hex("content_manifest_inline_cbor")) as Dict;
+  assert.equal(c.manifestViolation({ ...flat, layout: "pieces" }), null);
+  assert.equal(c.manifestViolation({ ...flat, layout: "blocks" }), "unknown layout blocks");
+});
+
+test("a tree manifest never sends a flat fetch after a table (F3)", async () => {
+  const nodes = fleet(3);
+  const [a, b, m] = nodes as [Node, Node, Node];
+  const data = pattern(2 * PIECE + 9, 7, 3);
+  const honest = a.content.publish(data, { replicate: false });
+  // a hostile member writes a table-less tree manifest for the flat root
+  const hostile: Dict = { ...honest, table: null, origin: m.peer.identity.peerId, layout: "tree" };
+  (m.content as unknown as RecordWriter).write(c.MANIFEST_TYPE, hostile, "1h", c.manifestTags(hostile));
+  run(nodes, 2);
+  assert.equal(b.content.manifestOf(String(honest["root"])), null, "no member reads the hostile manifest");
+  assert.deepEqual(b.content.listManifests(), []);
+  const fetched = b.content.fetch(String(honest["root"]));
+  run(nodes);
+  assert.ok(await fetched.await(5000), fetched.trace.join("\n"));
+  assert.deepEqual(fetched.readBytes(), data);
+  // a tree manifest's own root fetches by the tree exchange and never by a piece table
+  const tree: Dict = { ...(loads(hex("content_manifest_tree_cbor")) as Dict), table: null };
+  (a.content as unknown as RecordWriter).write(c.MANIFEST_TYPE, tree, "1h", c.manifestTags(tree));
+  run(nodes, 2);
+  assert.equal((b.content.describe(String(tree["root"]))!["manifest"] as Dict)["layout"], "tree");
+  assert.ok(b.content.listManifests().some((x) => x["root"] === tree["root"]));
+  const flatFetch = b.content.fetch(String(tree["root"]));
+  run(nodes, 2);
+  assert.equal(flatFetch.done, true);
+  assert.equal(flatFetch.failure, "the manifest names a blob tree, which the tree exchange fetches");
 });
 
 test("a file store resumes what it holds and a restarted holder republishes", async () => {

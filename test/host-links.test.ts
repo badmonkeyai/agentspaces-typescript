@@ -62,6 +62,7 @@ test("a hub relays one member's writes to the other and both see the hub's endpo
     assert.equal(hub.inbound.size, 2);
     assert.ok(hub.reachable.has(a.identity.peerId) && hub.reachable.has(b.identity.peerId), "both heard on their links");
     assert.deepEqual(hub.linkedMembers().sort(), [a.identity.peerId, b.identity.peerId].sort());
+    b.joinSpace("tasks"); // a member folds the spaces it joined (HLC round five, 2026-11-08)
     const id = a.writeEntry("tasks", TASK, { topic: "relayed" }, "a");
     await settle();
     assert.ok(hub.states.has(id), "the hub folded the write");

@@ -1,7 +1,7 @@
 {
   "name": "@agentspaces/workers",
-  "version": "0.5.0",
-  "description": "The cell host of the AgentSpaces JavaScript client (srad/agentspaces-js.md \u00a73.8, \u00a74.5, \u00a74.7): Durable Object cells on celld, workerd, and Cloudflare \u2014 the connector cell with its manifest and providers, once(), and the agent cell.",
+  "version": "0.6.0",
+  "description": "The cell host of the AgentSpaces JavaScript client (srad/agentspaces-js.md §3.8, §4.5, §4.7): Durable Object cells on celld, workerd, and Cloudflare — the connector cell with its manifest and providers, once(), and the agent cell.",
   "license": "Apache-2.0",
   "type": "module",
   "main": "build/src/index.js",

@@ -37,7 +37,7 @@ import { Identity, Peer, Space, Template, eq } from "@agentspaces/client";
 import type { wire } from "@agentspaces/client";
 import { AssetInvocationResult, DataQueryClient, assetCards, invoke } from "@agentspaces/connect";
 import type { StringMap } from "@agentspaces/connect";
-import { ServiceHost } from "@agentspaces/node";
+import { ServiceHost, WsListener } from "@agentspaces/node";
 import { bundleExample, startWorkerd, toolsPresent } from "./workers/workerd-run.js";
 import type { WorkerdRun } from "./workers/workerd-run.js";
 import { mkdtempSync } from "node:fs";
@@ -70,9 +70,9 @@ async function until(check: () => boolean, maxMillis = 15_000, what = "the condi
   assert.ok(check(), what);
 }
 
-/** The hub: a service host with a `ws` listener, serving the data space. */
-async function hub(): Promise<{ host: ServiceHost; port: number }> {
-  const host = new ServiceHost(Identity.generate(), GROUP, { listeners: [{ scheme: "ws", bind: "127.0.0.1:0" }],
+/** The hub: a service host with a `ws` listener (on `port`, or on any free port), serving the data space. */
+async function hub(port = 0): Promise<{ host: ServiceHost; port: number }> {
+  const host = new ServiceHost(Identity.generate(), GROUP, { listeners: [{ scheme: "ws", bind: `127.0.0.1:${port}` }],
     spaces: ["data", "claims"], log: null });
   await host.start();
   const address = host.addresses.get("ws")!;
@@ -98,7 +98,9 @@ test("the inventory cell on workerd: discovered, queried, reserved exactly once 
     t.skip(missing);
     return;
   }
-  const { host, port } = await hub();
+  const started = await hub();
+  let host = started.host;
+  const port = started.port;
   const dir = mkdtempSync(join(tmpdir(), "aspace-workers-"));
   await bundleExample(dir);
   let workerd: WorkerdRun = await startWorkerd({ group: GROUP, seeds: `ws://127.0.0.1:${port}/aspace`, profile: "dev-local" }, { dir });
@@ -126,7 +128,7 @@ test("the inventory cell on workerd: discovered, queried, reserved exactly once 
     assert.equal(classCard["uri"], "workers://inventory/do/Inventory");
     assert.equal(classCard["issuer"], cellId);
     assert.equal(classCard["freshness"], "PT30S");
-    assert.equal(classCard["ttl"], "PT60S");
+    assert.equal(classCard["ttl"], "PT1M");
     const access = classCard["access"] as StringMap;
     assert.equal(access["mode"], "read-only,invoke");
     assert.equal(access["query"], "aspace:cap/data-query");
@@ -243,6 +245,34 @@ test("the inventory cell on workerd: discovered, queried, reserved exactly once 
     for (const r of results) {
       assert.deepEqual(AssetInvocationResult.from(r.value).result, first.result);
     }
+
+    // Swarm retries: a cell turns the core's redial off, so its alarm owns every dial. The hub restarts on its
+    // port; the cell's alarm dials it again, and the core counts no reconnect of its own.
+    const linked = await workerd.get("/status") as Record<string, unknown>;
+    await host.stop();
+    host = (await hub(port)).host;
+    await until(() => host.peer.linkedMembers().includes(cellId), 30_000, `the cell dialed the restarted hub (${workerd.output()})`);
+    const relinked = await workerd.get("/status") as Record<string, unknown>;
+    assert.equal(relinked["connected"], true);
+    assert.equal(relinked["reconnects"], 0, "the core dialed nothing on its own");
+    assert.equal(relinked["dials"], Number(linked["dials"]) + 1, "the alarm's dial brought the link back");
+
+    // A seed that accepts each link and drops it at once, as one that refuses a peer does, gets each cell's next
+    // dial at the reconnect cadence and no dial loop (swarm retries, ROBUSTNESS.md §10.6).
+    agent.close();
+    await host.stop();
+    let accepted = 0;
+    const dropper = await new WsListener().listen(`127.0.0.1:${port}`, (channel) => {
+      accepted += 1;
+      channel.close();
+    });
+    try {
+      await until(() => accepted >= 1, 15_000, "a cell dialed the seed that drops its links");
+      await sleep(3_000);
+    } finally {
+      dropper();
+    }
+    assert.ok(accepted <= 4, `${accepted} links accepted from the two cells in 3 s`);
   } finally {
     agent.close();
     await workerd.stop();

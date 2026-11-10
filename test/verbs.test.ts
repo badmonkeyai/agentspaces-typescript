@@ -26,6 +26,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { Binder, Joined, agent, part, propose, spaceJoin, spaceNotify, spaceTake } from "../src/agents.js";
+import { concat } from "../src/bytes.js";
 import { canonicalMap, dumps, loads } from "../src/cbor.js";
 import { Identity } from "../src/identity.js";
 import { Peer } from "../src/peer.js";
@@ -135,8 +136,8 @@ test("tagged, fork, and motion returns dispatch as Java does", async () => {
       && new Space(peer, "fanout").readAll(new Template(Coverage)).length > 0));
     assert.ok([...peer.states.values()].some((dto) => dto["completed"]));
     foldFrom(other, "motions", "com.acme.Claim#v1", { claimId: "c3", amount: 9 }, peer);
-    assert.ok(await until(10_000, () => vote.proposals(peer.states).has("claim:c3")));
-    assert.equal(vote.proposals(peer.states).get("claim:c3")!.question, "pay c3?");
+    assert.ok(await until(10_000, () => vote.proposals(peer, "votes").has("claim:c3")));
+    assert.equal(vote.proposals(peer, "votes").get("claim:c3")!.question, "pay c3?");
   } finally {
     await bound.close();
   }
@@ -160,8 +161,8 @@ test("a propose cue opens one vote per key", async () => {
   const bound = new Binder(peer, { publishCard: false }).bind(lead);
   try {
     foldFrom(other, "claims", "com.acme.Claim#v1", { claimId: "c1", amount: 5 }, peer);
-    assert.ok(await until(5_000, () => vote.proposals(peer.states).has("claim:c1")));
-    const proposal = vote.proposals(peer.states).get("claim:c1")!;
+    assert.ok(await until(5_000, () => vote.proposals(peer, "votes").has("claim:c1")));
+    const proposal = vote.proposals(peer, "votes").get("claim:c1")!;
     assert.equal(proposal.question, "approve claim c1?");
     assert.deepEqual(proposal.options, ["approve", "deny"]);
     assert.equal(proposal.quorum, 2);
@@ -169,7 +170,7 @@ test("a propose cue opens one vote per key", async () => {
     foldFrom(other, "claims", "com.acme.Claim#v1", { claimId: "c2", amount: 0 }, peer);
     await sleep(300);
     assert.deepEqual(lead.asked, ["c1", "c2"]);
-    assert.deepEqual([...vote.proposals(peer.states).keys()], ["claim:c1"]);
+    assert.deepEqual([...vote.proposals(peer, "votes").keys()], ["claim:c1"]);
   } finally {
     await bound.close();
   }
@@ -216,11 +217,14 @@ test("a local join fires once per key when every required part is present", asyn
 
 test("canonical map order sorts keys by UTF-8 length then bytes (wire version 3)", () => {
   assert.equal(wire.WIRE_VERSION, 3);
-  assert.deepEqual(Object.keys(canonicalMap({ region: "eu", b: "1", aa: "2", a: "3", "é": "4" })),
-    ["a", "b", "aa", "é", "region"]);
+  // The encoder writes a canonical map's keys in that order, integer-like keys included (HLC round six, 2026-11-08).
+  const inOrder = (pairs: [string, string][]): Uint8Array =>
+    concat(Uint8Array.of(0xbf), ...pairs.flatMap(([k, v]) => [dumps(k), dumps(v)]), Uint8Array.of(0xff));
+  assert.deepEqual(dumps(canonicalMap({ region: "eu", b: "1", aa: "2", a: "3", "é": "4" })),
+    inOrder([["a", "3"], ["b", "1"], ["aa", "2"], ["é", "4"], ["region", "eu"]]));
   // A tagged record's signed view carries its tags in that order, whatever order they were given.
-  const view = wire.signView("e", "s", "T#v1", new Uint8Array(), "i", "1-0-i", null, { zz: "1", a: "2" });
-  assert.deepEqual(Object.keys(view["tags"] as Dict), ["a", "zz"]);
+  const view = wire.signView("e", "s", "T#v1", new Uint8Array(), "i", "1-0-i", null, { zz: "1", a: "2", 10: "3" });
+  assert.deepEqual(dumps(view["tags"] as Dict), inOrder([["a", "2"], ["10", "3"], ["zz", "1"]]));
 });
 
 // -------------------------------------------- notify kinds, contribution, produces

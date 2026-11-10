@@ -212,7 +212,7 @@ test("subordinate agent certificate and agent-signed record match Java (SPEC 4.2
   assert.deepEqual(dumps(dto), hex("entry_state_with_certificate_cbor"));
   assert.deepEqual(dumps({ state: dto, claimEntry: null, claim: null }),
     hex("delta_with_certificate_cbor"));
-  assert.equal(wire.verifyRecord(record, id.publicRaw, agent.certificate, nowMillis), true);
+  assert.equal(wire.verifyRecord(record, id.publicRaw, agent.certificate), true);
 
   // SPEC §11a.4 v0.1.13 (A6): that state is peer-signed on an agent-attested
   // entry and is refused; the agent-signed state is what lands.
@@ -251,11 +251,11 @@ test("three names from one peer tally as one voter (SPEC 8 QUORUM)", () => {
   }
   assert.equal(peer.states.size, 3);
   const proposal = GOLDEN["vote_three_names_one_peer_proposal"];
-  assert.deepEqual([...vote.tally(peer.states, proposal, ["approve", "reject"])],
+  assert.deepEqual([...vote.tally(peer, "tasks", proposal, ["approve", "reject"])],
     [["approve", 1], ["reject", 0]]);
-  assert.deepEqual([...vote.tally(peer.states, proposal, ["approve", "reject"], "AGENT")],
+  assert.deepEqual([...vote.tally(peer, "tasks", proposal, ["approve", "reject"], "AGENT")],
     [["approve", 0], ["reject", 0]]);
-  assert.equal(vote.tally(peer.states, proposal, null, "PEER", () => false).size, 0);
+  assert.equal(vote.tally(peer, "tasks", proposal, null, "PEER", () => false).size, 0);
 });
 
 test("take claims match Java, and decoded claims re-encode identically", () => {
@@ -288,8 +288,8 @@ test("agent-signed claims match Java (TECH-SPEC 7.6, QA4 A4-7 phase 3)", () => {
   assert.deepEqual(dumps(wire.signedClaim(claim, id)),
     dumps((loads(hex("claim_delta_cbor")) as Dict)["claim"] as Dict)); // no agent: unchanged
   const nowMillis = parseInstantMillis(GOLDEN["certificate_verify_at"]);
-  assert.equal(wire.verifyClaimProof(signed, nowMillis), true);
-  assert.equal(wire.verifyClaimProof({ ...signed, holderCertificate: null }, nowMillis), false);
+  assert.equal(wire.verifyClaimProof(signed), true);
+  assert.equal(wire.verifyClaimProof({ ...signed, holderCertificate: null }), false);
   // The peer folds the certified proof and drops each hostile one.
   const control = peerAt(GOLDEN["certificate_verify_at"]);
   const good = loads(hex("claim_delta_with_certificate_cbor")) as Dict;
@@ -500,15 +500,21 @@ test("int64 values beyond the safe range round-trip as BigInt", () => {
   const token = BigInt(GOLDEN["aggregate_roster_token"]);
   assert.deepEqual(dumps(token), Buffer.from("3b68e767e0853dc19a", "hex"));
   assert.equal(loads(Buffer.from("3b68e767e0853dc19a", "hex")), token);
-  // Extremes of the 64-bit range, both signs, minimal width.
-  const max = (1n << 64n) - 1n;
-  assert.deepEqual(dumps(max), Buffer.from("1bffffffffffffffff", "hex"));
+  // A Java long's extremes are plain integers under their shortest heads; past them a bigint goes
+  // out as Jackson writes a BigInteger, under tag 2 or 3 over the magnitude, and decodes back (HLC
+  // round six, 2026-11-08, S4 and S9).
+  const max = (1n << 63n) - 1n;
+  assert.deepEqual(dumps(max), Buffer.from("1b7fffffffffffffff", "hex"));
   assert.equal(loads(dumps(max)), max);
-  const min = -(1n << 64n);
-  assert.deepEqual(dumps(min), Buffer.from("3bffffffffffffffff", "hex"));
+  const min = -(1n << 63n);
+  assert.deepEqual(dumps(min), Buffer.from("3b7fffffffffffffff", "hex"));
   assert.equal(loads(dumps(min)), min);
-  assert.throws(() => dumps(max + 1n), RangeError);
-  assert.throws(() => dumps(min - 1n), RangeError);
+  assert.deepEqual(dumps(max + 1n), Buffer.from("c249008000000000000000", "hex"));
+  assert.equal(loads(dumps(max + 1n)), max + 1n);
+  assert.deepEqual(dumps(min - 1n), Buffer.from("c349008000000000000001", "hex"));
+  assert.equal(loads(dumps(min - 1n)), min - 1n);
+  assert.deepEqual(dumps(1n << 64n), Buffer.from("c249010000000000000000", "hex"));
+  assert.throws(() => loads(Buffer.from("1bffffffffffffffff", "hex")), RangeError);
   // Inside the safe range a bigint is just an integer: same bytes as the
   // number, and it decodes back as a number.
   assert.deepEqual(dumps(7n), dumps(7));
@@ -804,7 +810,7 @@ test("a record sealed under epoch two names its epoch (SPEC 11a.1 v0.1.13)", () 
   assert.deepEqual(dumps(wire.signView(String(record["entryId"]), String(record["spaceId"]),
     String(record["type"]), record["payload"] as Uint8Array, String(record["issuer"]),
     String(record["issued"]), 2)), hex("sign_view_key_epoch_cbor"));
-  assert.equal(wire.verifyRecord(record, identity().publicRaw, null, 0), true);
+  assert.equal(wire.verifyRecord(record, identity().publicRaw, null), true);
   const plain = ((loads(hex("entry_state_dto_cbor")) as Dict)["record"]) as Dict;
   assert.deepEqual(dumps(wire.signViewOf(plain)), hex("sign_view_cbor"));
 });
@@ -949,8 +955,7 @@ test("a state signed outside its window or beyond the drift ceiling is refused (
 test("an out-of-window agent claim is refused (SPEC 4.2 v0.1.13)", () => {
   const delta = loads(hex("adv_claim_cert_out_of_window_delta")) as Dict;
   assert.equal(((delta["claim"] as Dict)["claim"] as Dict)["stamp"], stampAt(-3_600_000));
-  assert.equal(wire.verifyClaimProof(delta["claim"] as Dict,
-    parseInstantMillis(GOLDEN["certificate_verify_at"])), false);
+  assert.equal(wire.verifyClaimProof(delta["claim"] as Dict), false);
   const peer = peerAt(GOLDEN["certificate_verify_at"]);
   foldClaimOf(peer, "adv_claim_cert_out_of_window_delta");
   assert.equal(peer.claims.size, 0);
@@ -963,8 +968,8 @@ test("a relabelled key epoch never verifies (SPEC 11a.1 v0.1.13)", () => {
   const genuine = loads(hex("entry_record_key_epoch_cbor")) as Dict;
   assert.equal(Number(relabelled["keyEpoch"]), 3);
   assert.deepEqual(dumps({ ...relabelled, keyEpoch: 2 }), hex("entry_record_key_epoch_cbor"));
-  assert.equal(wire.verifyRecord(genuine, identity().publicRaw, null, 0), true);
-  assert.equal(wire.verifyRecord(relabelled, identity().publicRaw, null, 0), false);
+  assert.equal(wire.verifyRecord(genuine, identity().publicRaw, null), true);
+  assert.equal(wire.verifyRecord(relabelled, identity().publicRaw, null), false);
   const peer = peerAt(GOLDEN["certificate_verify_at"]);
   foldState(peer, "adv_key_epoch_relabelled_delta");
   assert.equal(peer.states.size, 0);

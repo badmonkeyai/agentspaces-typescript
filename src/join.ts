@@ -34,6 +34,7 @@
 
 import type { OrderedLog } from "./capabilities/ordered.js";
 import { loads } from "./cbor.js";
+import { present } from "./peer.js";
 import type { Peer } from "./peer.js";
 import { Entry, EntryType, REAPPEARED, Space, SpaceEvent, Taken, Template, WRITTEN, entry, schemaOf,
   toPayload } from "./space.js";
@@ -313,8 +314,12 @@ export class KeyTickets {
 
   /**
    * ORDERED: the earliest committed ticket for the key that is still live
-   * (claimed or not, but not completed or lapsed), which is the one lock a
-   * reduce drains under.
+   * (claimed or not, but not completed or withdrawn), which is the one lock a
+   * reduce drains under. HLC round five, 2026-11-08: a withdrawn ticket gives
+   * the lock up at once, as Java's KeyTickets reads only present entries. HLC
+   * round six, 2026-11-08 (R9): a ticket whose write lease lapsed stays the lock
+   * until the replica collects it, as Java's recordOf answers for a present
+   * entry whatever its lease, so every member names the same lock.
    */
   earliestLive(key: string): string | null {
     this.resolvePendingClaims();
@@ -326,11 +331,10 @@ export class KeyTickets {
     while (order.length > 0) {
       const id = order[0]!;
       const state = peer.states.get(id);
-      const lease = ((state?.["leaseValue"] ?? (state?.["record"] as Dict | undefined)?.["lease"]) as Dict | undefined);
-      if (state !== undefined && !state["completed"] && Number(lease?.["expiresAtMillis"] ?? 0) > peer.now()) {
+      if (state !== undefined && present(state)) {
         return id;
       }
-      order.shift(); // completed or lapsed: no longer a lock
+      order.shift(); // completed, withdrawn, or collected: no longer a lock
     }
     return null;
   }

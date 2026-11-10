@@ -29,10 +29,11 @@
 import * as beacon from "./beacon.js";
 import { equals, fromBase64, toHex, utf8 } from "./bytes.js";
 import { cryptoPort } from "./crypto.js";
-import { CborValue, dumps, loads } from "./cbor.js";
+import { CborDouble, CborValue, canonicalMap, dumps, loads, readDocument } from "./cbor.js";
 import type { Pdt } from "./pdt/index.js";
 import * as pdtCids from "./pdt/cids.js";
-import { AgentIdentity, Identity, deriveId, instantIso, parseDurationMillis, parseInstantMillis, spaceIdLocal, verifyAgentCertificateAt, verifySignedGroupAd } from "./identity.js";
+import { AgentIdentity, Identity, deriveId, instantIso, parseDurationMillis, parseInstantMillis, spaceIdLocal, verifyAgentCertificateCovering, verifySignedGroupAd } from "./identity.js";
+import * as records from "./records.js";
 import * as revocation from "./revocation.js";
 import * as serving from "./serving.js";
 import { SESSION_HELLO_MAX_AGE_MILLIS, SESSION_HINT, Session, parseSessionHello } from "./session.js";
@@ -122,6 +123,8 @@ export interface BulkPayloads {
   publishOpaque(payload: Uint8Array, leaseMillis: number): string;
   local(root: string): Uint8Array | null;
   ensure(root: string): void;
+  /** Releases a root no held entry references any more, once its entry is collected (LB-E-04). */
+  unpin(root: string): void;
 }
 
 /**
@@ -135,10 +138,103 @@ export const RECORDLESS_HINT = "wire.recordless";
 export const MAX_PENDING_RECORDLESS = 1024;
 
 /**
+ * The hint a peer advertises once every decoder it runs reads the v0.1.32 schemas of the AppCard and the AgentCard
+ * (`wire.appcard=2`; SPEC §6.1a.2, §9; AppCard origin and formats, 2026-11-09): canonical decimal text, read as
+ * level N or above. An issuer writes a card's origin, formats, an `idp` host, and a spill reference only while every
+ * member it knows is at level 2.
+ */
+export const APPCARD_HINT = "wire.appcard";
+/** The AppCard level this build reads and, by default, advertises. */
+export const APPCARD_LEVEL = 2;
+
+/**
+ * The AppCard level a hint's text states, as Java's `PeerNode.appCardLevelOf` reads it: 1 for no hint, any text
+ * that is not canonical decimal (a leading zero, a sign, a space), or a value below 1; a value past nine digits reads
+ * as the largest int.
+ */
+export function appCardLevelOf(text: unknown): number {
+  if (typeof text !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(text)) {
+    return 1;
+  }
+  return text.length > 9 ? 2_147_483_647 : Math.max(1, Number(text));
+}
+
+/** The advertisement cache's default entry bound (ASF-019) and byte budget (SPEC §6.3, v0.1.32), as Java's AdCache. */
+export const AD_CACHE_MAX_ENTRIES = 8_192;
+export const AD_CACHE_MAX_BYTES = 33_554_432;
+
+/** How often a peer that holds parts documents for its stubs checks whether one may lapse. */
+const SPILL_SWEEP_MILLIS = 5_000;
+
+/**
+ * Where a publisher puts a stub card's parts document and a reader fetches it (SPEC §6.1a.5, v0.1.32;
+ * ISSUE-AppCardOriginFormats §9.8; AppCard origin and formats, 2026-11-09): the group's content swarm, whose
+ * `ContentSpillStore` (`capabilities/content`) installs itself on the peer it attaches to. With none installed a
+ * publisher never spills and {@link Peer.resolve} fails a stub.
+ */
+export interface SpillStore {
+  /**
+   * Publishes a parts document as a content-swarm artifact in 65,536-byte pieces, manifest `name`, media type
+   * `application/cbor`, sealing `none`, and keeps it served until {@link release}; returns its root. The same bytes
+   * give the same root. Throws when the swarm does not take the document.
+   */
+  put(name: string, document: Uint8Array): string;
+  /**
+   * Fetches a parts document, every piece verified against the root. Rejects with a {@link SpillRefusedError} when
+   * the artifact's length is not `size`, found from its manifest before a piece is fetched, and with another error
+   * when no holder serves it within the store's deadline.
+   */
+  get(root: string, size: number): Promise<Uint8Array>;
+  /** Stops keeping a root served on behalf of the cards that named it, so the artifact lapses. */
+  release(root: string): void;
+}
+
+/** A parts document that does not complete its stub (SPEC §6.1a.5, FR-15): counted in `spillsRefused`. */
+export class SpillRefusedError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "SpillRefusedError";
+  }
+}
+
+/**
+ * A card this peer issues under the AppCard level: the full card, its type, the last issue instant signed, and the
+ * gate it was last issued under (null before its first issue), so a change of the members' level reissues exactly the
+ * cards that went out under the other gate (AppCard origin and formats, 2026-11-09, adversary pass).
+ */
+interface IssuedCard { adType: "AppCard" | "AgentCard"; full: Dict; issued: number; open: boolean | null }
+
+/**
  * How many distinct refused states and claims a replica remembers so a re-offer counts no second
- * refusal, as Java's ReplicatedSpace REJECTED_OFFERS_CAP (HLC canonical stamps, 2026-11-08).
+ * refusal, as Java's ReplicatedSpace REJECTED_OFFERS_CAP (HLC canonical stamps, 2026-11-08); the
+ * same cap bounds the deferred offers (HLC round four, 2026-11-08). Past the cap each memory forgets
+ * its least recently offered key, as Java's access-ordered maps do (HLC round five, 2026-11-08, E14).
  */
 const MAX_REFUSED_STAMPS = 4096;
+
+/**
+ * How many refused-and-acknowledged digest lines a replica keeps, Java's ReplicatedSpace
+ * REFUSED_ACK_CAP (HLC round six, 2026-11-08, R7), the least recently refused forgotten first.
+ */
+export const MAX_REFUSED_ACK = 8192;
+
+/**
+ * How long an entry whose write lease lapsed stays held past its expiry, at most (SPEC §7.3, Java's
+ * SpaceStateCrdt.LAPSED_GRACE_MILLIS). HLC round five, 2026-11-08: a lapse needs no long tombstone,
+ * since every replica judges the same lease stamp lapsed; a completion or a withdrawal keeps twice
+ * the longest lease, so every replica that could still learn of it has two full leases to do so.
+ */
+export const LAPSED_GRACE_MILLIS = 5 * 60_000;
+
+/**
+ * The ceiling on the lease that feeds the collection horizon (SPEC §7.3, Java's
+ * MAX_TRACKED_LEASE_MILLIS, HLC round five, 2026-11-08): one member's century-long lease cannot stop
+ * collection fleet-wide.
+ */
+export const MAX_TRACKED_LEASE_MILLIS = 24 * 60 * 60_000;
+
+/** How often a replica collects its tombstones (SPEC §7.3). */
+const COLLECT_PERIOD_MILLIS = 1000;
 
 /** Whether a `b` reference names a persistent tree (dag-cbor) rather than a piece artifact. */
 function isTreeRoot(ref: string): boolean {
@@ -192,16 +288,45 @@ export class Peer {
   framesStale = 0;
   /**
    * States and claims this replica refused because a stamp they carry (a record's `issued`, a
-   * state's `leaseStamp`, a claim's `stamp`) is one wire.parseHlc refuses: not canonical, or a
-   * logical counter above wire.LOGICAL_LIMIT (HLC logical counter, 2026-11-08, Rust team report).
-   * Rumors, anti-entropy, snapshots and committed claims all fold through the same check. This peer
-   * keeps no strikes, so the count records each refusal: after the signatures verify, since an
-   * unverified carrier names no signer, and once per distinct state or claim, since a re-offer is
-   * no new refusal (HLC canonical stamps, 2026-11-08).
+   * state's `leaseStamp` or `signedAt`, a claim's `stamp`) decodes with a logical counter above
+   * wire.LOGICAL_LIMIT (HLC logical counter, 2026-11-08, Rust team report). Rumors, anti-entropy,
+   * snapshots and committed claims all fold through the same check. This peer keeps no strikes, so
+   * the count records each refusal: after the signatures verify, since an unverified carrier names
+   * no signer, and once per distinct offer, keyed on signed content alone, since a re-offer is no
+   * new refusal. The name is Java's ReplicatedSpace counter (HLC round four, 2026-11-08, D5).
    */
-  foldStampsRefused = 0;
-  /** The distinct states and claims counted in foldStampsRefused, the eldest forgotten past the cap. */
+  stampsLogicalRefused = 0;
+  /**
+   * States and gossiped claims this replica refused as hostile because a stamp they carry lies more
+   * than wire.FAR_FUTURE_HOSTILE_MILLIS past its wall + MAX_HLC_SKEW_MILLIS +
+   * FAR_FUTURE_MARGIN_MILLIS, counted as stampsLogicalRefused is (HLC round four, 2026-11-08, D4).
+   */
+  stampsFarFutureRefused = 0;
+  /**
+   * Distinct states and gossiped claims this replica deferred because a stamp lies past that
+   * margin by at most wire.FAR_FUTURE_HOSTILE_MILLIS: neither merged, acknowledged, nor taken for
+   * misbehaviour, each merges when anti-entropy offers it after this replica's wall catches up (HLC
+   * round four, 2026-11-08, D4). The names are Java's ReplicatedSpace counters.
+   */
+  stampsFarFutureDeferred = 0;
+  /** The distinct deferred states and claims counted above, the eldest forgotten past the cap. */
+  private readonly deferredStamps = new Set<string>();
+  /**
+   * Space deltas, by rumor or by anti-entropy, and snapshot entries this replica dropped because
+   * they did not decode: bytes that are no delta, or a delta holding a stamp that is no canonical
+   * CBOR text (HLC round four, 2026-11-08, D3). Such a carrier names no verified signer. The name
+   * is Java's ReplicatedSpace counter.
+   */
+  deltasUndecodable = 0;
+  /** The distinct refused states and claims counted above, the eldest forgotten past the cap. */
   private readonly refusedStamps = new Set<string>();
+  /**
+   * The digest lines (`e:<entry>=<state hash>`) of verified states this replica refused for their
+   * stamps, by line with the state's SpaceId, the eldest forgotten past the cap. Each digest names
+   * them as `a:<line>`, as Java's acknowledges them, so partners stop re-offering them (HLC round
+   * four, 2026-11-08, D5).
+   */
+  private readonly refusedAck = new Map<string, string>();
   /** The dialers this peer dials with, by scheme; the registered defaults at construction. */
   readonly dialers = new Map<string, Dialer>();
   private pendingFounding: PendingFounding | null = null;
@@ -264,12 +389,17 @@ export class Peer {
   /** The dialed channel a CHANNEL_HELLO went out on, so one announcement serves one connection. */
   private helloSentOn: FrameChannel | null = null;
   malformedFrames = 0;
-  // A lost socket is reconnected to the seeds in turn (the next seed first, a pause of
-  // reconnectIntervalMs after every full round, for reconnectWindowMs) and the peer
-  // re-introduced and re-pulled; a close() by the owner is final.
+  // A lost socket is reconnected to the seeds in turn (the next seed first, a pause after every
+  // full round that backs off from reconnectIntervalMs to six times it with a random spread) and
+  // the peer re-introduced and re-pulled, until a close() by the owner, which is final (swarm retries).
   reconnects = 0;
+  /** The pause after the first full round of reconnect dials; each later round doubles it, up to six times it. */
   reconnectIntervalMs = 5000;
-  reconnectWindowMs = 600_000;
+  /**
+   * Whether a lost link re-dials the seeds on its own. A host whose own durable timer owns every dial, as the
+   * workers cell's alarm does, turns it off and dials again with `connectAny` (swarm retries, ROBUSTNESS.md §10.3 E5).
+   */
+  redial = true;
   /** The seeds this peer dials, in order; `seeds[seedIndex]` is the one in use or tried last. */
   seeds: Seed[] = [];
   seedIndex = 0;
@@ -301,10 +431,63 @@ export class Peer {
   private readonly blockAsked = new Map<string, number>();
   /** The content swarm attached to this peer (`capabilities/content`): resolves `b` references and takes payloads above its bound. */
   content: BulkPayloads | null = null;
+  /**
+   * Where a stub card's parts document goes and comes from (SPEC §6.1a.5, v0.1.32): a content swarm installs its
+   * `ContentSpillStore` when it attaches; null, and this peer never spills and fails to resolve a stub.
+   */
+  spillStore: SpillStore | null = null;
+  /** The largest parts document {@link resolve} fetches (16 MiB by default). */
+  spillMaxFetchBytes = wire.CARD_SPILL_MAX_FETCH_BYTES;
+  /** AppCards issued without a gated field because a member is below the AppCard level (SPEC §6.1a.2). */
+  appCardsDowngraded = 0;
+  /** Cards issued as stubs (SPEC §6.1a.5). */
+  cardsSpilled = 0;
+  /** Cards above the spill threshold issued inline: a closed gate, no spill store, a refused document, or nothing to move. */
+  cardsOversizeInline = 0;
+  /** Resolutions that failed a check of the parts document. */
+  spillsRefused = 0;
+  /** Resolutions refused because the stub's `size` passed {@link spillMaxFetchBytes}. */
+  spillsOverLimit = 0;
+  /** Where this peer's warnings go: the soft warning of a card near the spill threshold (FR-13), and a refused spill. */
+  onWarning: (message: string) => void = (message) => console.warn(message);
+  private level = APPCARD_LEVEL;
+  /** The cards this peer issues under the AppCard level, by id, so a change of the members' level reissues them. */
+  private readonly issuedCards = new Map<string, IssuedCard>();
+  /** The size each card id last warned at, so a refresh at the same size stays quiet. */
+  private readonly warnedSizes = new Map<string, number>();
+  /** Each parts-document root this peer named, to the moment the last card that named it expires. */
+  private readonly spillHolds = new Map<string, number>();
+  private spillSweep: Repeating | null = null;
+
+  /**
+   * The AppCard level this peer advertises (`wire.appcard`), 1 or 2; 1 advertises no hint, so a test builds a mixed
+   * fleet. Advertise a change with {@link introduce}.
+   */
+  get appCardLevel(): number {
+    return this.level;
+  }
+
+  set appCardLevel(level: number) {
+    if (level !== 1 && level !== APPCARD_LEVEL) {
+      throw new RangeError(`this build reads AppCard levels 1 to ${APPCARD_LEVEL}: ${level}`);
+    }
+    this.level = level;
+    this.appCardLevelChanged();
+  }
   /** The persistent data structures attached to this peer (`pdt`): refs, values, and the tree exchange (PD-C-05). */
   pdt: Pdt | null = null;
   private running = false;
   private readonly pulledSpaces = new Set<string>();
+  /**
+   * The spaces this peer joined: pulled, written to, or opened as a Space. HLC round five,
+   * 2026-11-08: this peer relays a rumor of any other space without decoding or folding it, as
+   * Java's GossipBus relays a stream it holds no handler for.
+   */
+  private readonly joinedSpaces = new Set<string>();
+  /** The longest lease observed per space id, capped at MAX_TRACKED_LEASE_MILLIS, for the collection horizon (SPEC §7.3, HLC round five, 2026-11-08). */
+  private readonly longestLease = new Map<string, number>();
+  /** The periodic tombstone collection, started by the first state this replica stores. */
+  private collector: Repeating | null = null;
   private pulledAds = false;
 
   private founderId(): string | null {
@@ -608,11 +791,15 @@ export class Peer {
     if (!group.founding) {
       throw new Error(`the beacon document carries no founding for ${group.name}`);
     }
-    let signed: CborValue;
+    let bytes: Uint8Array;
     try {
-      signed = loads(fromBase64(group.founding));
+      bytes = fromBase64(group.founding);
     } catch {
-      throw new Error(`the founding of ${group.name} is not CBOR`);
+      throw new Error(`the founding of ${group.name} is not base64`);
+    }
+    const signed = records.readRecord(bytes, records.SIGNED_GROUP_ADVERTISEMENT);
+    if (signed === null) {
+      throw new Error(`the founding of ${group.name} is no SignedGroupAdvertisement in the wire encoding`);
     }
     const verified = verifySignedGroupAd(signed);
     if (verified === null) {
@@ -625,7 +812,7 @@ export class Peer {
     if (wanted !== null && verified !== wanted) {
       throw new Error(`the founding of ${group.name} is ${verified}, not ${wanted}`);
     }
-    return { group: verified, signed: signed as Dict };
+    return { group: verified, signed };
   }
 
   /** Whether the seed connection is up (a reconnect may be in progress while it is not). */
@@ -634,13 +821,15 @@ export class Peer {
   }
 
   /**
-   * After a lost socket: dials the seed again until the window runs out, then introduces this
-   * peer again and pulls what it had pulled before, so a network hiccup costs a few seconds
-   * rather than the membership (ROBUSTNESS.md §3.6).
+   * After a lost socket: dials the seeds again, then introduces this peer again and pulls what it
+   * had pulled before, so a network hiccup costs a few seconds rather than the membership
+   * (ROBUSTNESS.md §3.6). The pauses between rounds back off 5, 10, 20, 30 s with a random spread,
+   * so the clients of a seed that restarts do not all dial it at once, and the dials go on until the
+   * owner closes the peer (swarm retries, ROBUSTNESS.md §10.3 E5).
    */
   private reconnecting = false;
 
-  private reconnect(deadline: number, lastTried: number): void {
+  private reconnect(rounds: number, lastTried: number): void {
     if (!this.running || this.seeds.length === 0) {
       this.reconnecting = false;
       return;
@@ -663,20 +852,30 @@ export class Peer {
         this.pullSpace(space);
       }
     }).catch(() => {
-      if (!this.running || Date.now() >= deadline) {
+      if (!this.running) {
         this.reconnecting = false;
         return;
       }
       // One dial at a time, never a tight loop: the seeds of a round are tried back to back and
-      // every full round of refusals waits reconnectIntervalMs.
+      // every full round of refusals waits its backoff.
       const endOfRound = (tried + 1) % this.seeds.length === this.roundStart;
-      const timer = setTimeout(() => this.reconnect(deadline, tried), endOfRound ? this.reconnectIntervalMs : 0);
+      const done = endOfRound ? rounds + 1 : rounds;
+      const pause = endOfRound ? this.reconnectPause(done) : 0;
+      const timer = setTimeout(() => this.reconnect(done, tried), pause);
       unref(timer);
     });
   }
 
+  /** The pause after the `rounds`-th failed round of dials: the interval doubling to six times it, with a spread of up to a quarter. */
+  private reconnectPause(rounds: number): number {
+    return Math.min(6 * this.reconnectIntervalMs, this.reconnectIntervalMs * 2 ** Math.min(rounds - 1, 3)) * (1 + Math.random() / 4);
+  }
+
   /** Where the current round of reconnect dials began: the seed after the one that dropped. */
   private roundStart = 0;
+  /** When the current link was dialed, and how many links in a row ended within the reconnect interval (swarm retries). */
+  private linkSince = 0;
+  private quickDrops = 0;
 
   private onChannelClosed(channel: FrameChannel): void {
     if (this.channel !== channel) {
@@ -690,9 +889,19 @@ export class Peer {
         this.reachable.delete(peer);
       }
     }
-    if (this.running && this.seeds.length > 0 && !this.reconnecting) {
+    if (this.running && this.redial && this.seeds.length > 0 && !this.reconnecting) {
       this.roundStart = (this.seedIndex + 1) % this.seeds.length;
-      this.reconnect(Date.now() + this.reconnectWindowMs, this.seedIndex);
+      // A link that ended within the reconnect interval counts as a failed round of dials, so a seed that accepts each
+      // dial and drops it at once gets the backoff and no dial loop (swarm retries, ROBUSTNESS.md §10.6).
+      const quick = Date.now() - this.linkSince < this.reconnectIntervalMs;
+      this.quickDrops = quick ? this.quickDrops + 1 : 0;
+      const last = this.seedIndex;
+      if (quick) {
+        this.reconnecting = true;
+        unref(setTimeout(() => this.reconnect(0, last), this.reconnectPause(this.quickDrops)));
+      } else {
+        this.reconnect(0, last);
+      }
     }
   }
 
@@ -762,20 +971,11 @@ export class Peer {
     if (pending === null || env["kind"] !== "GROUP_AD" || env["group"] !== pending.group) {
       return false;
     }
-    const body = env["body"];
-    if (!(body instanceof Uint8Array)) {
-      return false;
-    }
-    let signed: CborValue;
-    try {
-      signed = loads(body);
-    } catch {
-      return false;
-    }
-    if (verifySignedGroupAd(signed) !== pending.group) {
+    const signed = records.readRecord(env["body"], records.SIGNED_GROUP_ADVERTISEMENT);
+    if (signed === null || verifySignedGroupAd(signed) !== pending.group) {
       return false; // not the self-certifying founding document of this group
     }
-    pending.resolve(signed as Dict);
+    pending.resolve(signed);
     return true;
   }
 
@@ -820,9 +1020,13 @@ export class Peer {
   /** This peer's advertisement as of now: its endpoints, hints, and lease (whole seconds, as always stamped). */
   private selfAd(): Dict {
     const now = this.now();
-    const hints = this.channelAuth === "session"
-      ? { ...this.resourceHints, [RECORDLESS_HINT]: "1", [SESSION_HINT]: "1" }
-      : { ...this.resourceHints, [RECORDLESS_HINT]: "1" };
+    const hints: { [key: string]: string } = { ...this.resourceHints, [RECORDLESS_HINT]: "1" };
+    if (this.channelAuth === "session") {
+      hints[SESSION_HINT] = "1";
+    }
+    if (this.level > 1) {
+      hints[APPCARD_HINT] = String(this.level); // AppCard origin and formats, 2026-11-09
+    }
     const ad = wire.peerAdvertisement(this.group, this.identity, instantIso(now - (now % 1000)),
       "PT10M", hints);
     ad["endpoints"] = this.endpoints.map((e) => ({ ...e }));
@@ -858,11 +1062,14 @@ export class Peer {
       payloadRef = this.putBlock(payload);
       payload = null;
     }
+    this.joinSpace(space);
     const { entryId, body } = wire.entryDelta(space, this.group, typeName,
       payload, this.identity, agentName, leaseMillis, agent, this.now(), tags, payloadRef);
     // The writer holds its own entry too, folded into the verified local
     // replica before transport, so a local read sees it at once.
-    this.foldDelta(loads((loads(body) as Dict)["payload"] as Uint8Array) as Dict);
+    // HLC round six, 2026-11-08 (F3): read strictly, as a receiver reads it, so a write this client
+    // could not deliver to a strict receiver fails here, loudly.
+    this.foldDelta(records.decodeRecord((loads(body) as Dict)["payload"] as Uint8Array, records.SPACE_DELTA) as Dict);
     this.send("RUMOR", body);
     return entryId;
   }
@@ -870,9 +1077,44 @@ export class Peer {
   /**
    * Publishes an advertisement this peer issued (an AgentCard, an AssetCard)
    * on the `ads` stream as DiscoveryService.publish does: the stored form,
-   * under the advertisement's id and issue time.
+   * under the advertisement's id and issue time. An AppCard or an AgentCard is
+   * issued under the AppCard level and the card spill (SPEC §6.1a.2, §6.1a.5,
+   * v0.1.32; AppCard origin and formats, 2026-11-09): pass the full card, and
+   * the peer strips the gated fields while a member it knows is below level 2,
+   * sends a card above 65,536 bytes as a stub behind an open gate, and reissues
+   * the card at once when the members' level changes.
    */
   publishAd(adType: string, ad: Dict): void {
+    if (adType === "AppCard" || adType === "AgentCard") {
+      if (ad["spill"] !== undefined) {
+        throw new Error("publish the full card: the peer decides whether it travels as a stub");
+      }
+      // read as the record before it is kept, so a card that fails its schema throws here and never reaches a
+      // reissue (AppCard origin and formats, 2026-11-09, adversary pass)
+      records.conform(ad, adType === "AppCard" ? records.APP_CARD : records.AGENT_CARD);
+      const id = String(ad["id"]);
+      this.pruneIssuedCards();
+      const previous = this.issuedCards.get(id);
+      this.issuedCards.set(id, { adType, full: ad, issued: previous?.issued ?? Number.NEGATIVE_INFINITY,
+        open: previous?.open ?? null });
+      this.issueCard(id);
+      return;
+    }
+    this.sendAd(adType, ad);
+  }
+
+  /**
+   * Stops reissuing a card published with {@link publishAd} (AppCardPublisher.withdraw; AppCard origin and formats,
+   * 2026-11-09, adversary pass): the last card signed lapses at its ttl, and a parts document it named is released
+   * once that card expires.
+   */
+  withdrawAd(id: string): void {
+    this.issuedCards.delete(id);
+    this.warnedSizes.delete(id);
+  }
+
+  /** Signs an advertisement, holds it in this peer's own cache, and sends it on the `ads` stream. */
+  private sendAd(adType: string, ad: Dict): void {
     const stored = wire.storedAd(adType, ad, this.identity);
     this.acceptAd(stored); // our own cache holds it too, as DiscoveryService.publish does
     const itemId = `${String(ad["id"])}:${parseInstantMillis(ad["issued"])}`;
@@ -890,10 +1132,31 @@ export class Peer {
    * same seed) is not among them; the seed drops, not relays, a frame to it.
    */
   readonly reachable = new Set<string>();
-  /** The advertisements the `ads` stream carried, by id. */
+  /**
+   * The advertisements the `ads` stream carried, by id, bounded by {@link adCacheMaxEntries} and by
+   * {@link adCacheMaxBytes} of encoded advertisements (SPEC §6.3, v0.1.32).
+   */
   readonly ads = new Map<string, CachedAd>();
+  /** The most advertisements the cache holds (8,192 by default). */
+  adCacheMaxEntries = AD_CACHE_MAX_ENTRIES;
+  /** The most bytes of advertisement encodings the cache holds (32 MiB by default). */
+  adCacheMaxBytes = AD_CACHE_MAX_BYTES;
+  /** Advertisements the cache refused under its entry bound or its byte budget. */
+  adsRefusedCacheFull = 0;
+  private cachedBytes = 0;
+
+  /** The sum of the cached advertisements' encodings, expired ones included until a refusal evicts them. */
+  get adCacheBytes(): number {
+    return this.cachedBytes;
+  }
   /** Capability frame handlers by capability type: `(fromPeerId, payload)`. */
   readonly pipeHandlers = new Map<string, (from: string, payload: Uint8Array) => void>();
+  /**
+   * Handlers of gossip streams by stream id (PDT 2 phase 7, P2-P-02): a push follower takes the bundles of a ref's
+   * stream `pdt:<space>:<name>`, and the handler's answer says whether this peer forwards the rumour, so a follower
+   * forwards only what it took. A stream without a handler is relayed unread (rule 16).
+   */
+  readonly streamHandlers = new Map<string, (from: string, payload: Uint8Array) => boolean>();
 
   /** Anti-entropy pull of the `ads` stream (SPEC §6.2): the cards and capability advertisements the group holds. */
   pullAds(): void {
@@ -902,31 +1165,28 @@ export class Peer {
   }
 
   /**
-   * Admits a StoredAd as AdCache.accept does: the signature over the canonical
-   * bytes under the carried key, the issuer derived from that key, and the TTL
-   * not yet passed. Returns the cached entry, or null.
+   * Admits a StoredAd as AdCache.accept does: an advertisement type Java registers, the advertisement
+   * read strictly as that type (HLC round six, 2026-11-08, F3), the signature over its bytes under
+   * the carried key, the issuer derived from that key, and the TTL not yet passed. Returns the
+   * cached entry, or null.
    */
   acceptAd(stored: unknown): CachedAd | null {
-    if (typeof stored !== "object" || stored === null) {
+    const s = records.conformed(stored, records.STORED_AD);
+    const schema = s === null ? undefined : records.AD_TYPES.get(String(s["adType"]));
+    if (s === null || schema === undefined) {
       return null;
     }
-    const s = stored as Dict;
-    const adBytes = s["adBytes"];
-    const key = s["publicKey"];
-    const signature = s["signature"];
-    if (!(adBytes instanceof Uint8Array) || !(key instanceof Uint8Array) || !(signature instanceof Uint8Array)) {
+    const adBytes = s["adBytes"] as Uint8Array;
+    const key = s["publicKey"] as Uint8Array;
+    if (key.length !== 32 || !Identity.verify(key, adBytes, s["signature"] as Uint8Array)) {
       return null;
     }
-    if (!Identity.verify(key, adBytes, signature)) {
+    const ad = records.readRecord(adBytes, schema);
+    if (ad === null || ad["issuer"] !== deriveId(key)) {
       return null;
     }
-    let ad: Dict;
     let expires: number;
     try {
-      ad = loads(adBytes) as Dict;
-      if (typeof ad !== "object" || ad === null || ad["issuer"] !== deriveId(key)) {
-        return null;
-      }
       expires = parseInstantMillis(ad["issued"]) + parseDurationMillis(ad["ttl"]);
     } catch {
       return null;
@@ -937,10 +1197,229 @@ export class Peer {
     const entry: CachedAd = { type: String(s["adType"]), ad, stored: s, issuer: String(ad["issuer"]), expires };
     const id = String(ad["id"]);
     const previous = this.ads.get(id);
-    if (previous === undefined || parseInstantMillis(previous.ad["issued"]) <= parseInstantMillis(ad["issued"])) {
-      this.ads.set(id, entry);
+    if (previous !== undefined && parseInstantMillis(previous.ad["issued"]) > parseInstantMillis(ad["issued"])) {
+      return previous; // an older version leaves the held one in place
     }
-    return this.ads.get(id)!;
+    // SPEC §6.3 (v0.1.32; AppCard origin and formats, 2026-11-09): a new id that would pass either bound, or a version
+    // that would pass the byte budget, is refused once the expired entries leave; nothing live is evicted for it
+    if (!this.fitsCache(id, adBytes.length)) {
+      this.evictExpiredAds();
+      if (!this.fitsCache(id, adBytes.length)) {
+        this.adsRefusedCacheFull += 1;
+        return null;
+      }
+    }
+    this.cachedBytes += adBytes.length - (this.ads.get(id)?.stored["adBytes"] as Uint8Array | undefined ?? new Uint8Array()).length;
+    this.ads.set(id, entry);
+    return entry;
+  }
+
+  /** Whether an advertisement of `length` bytes fits both bounds, given what the cache holds for its id. */
+  private fitsCache(id: string, length: number): boolean {
+    const held = this.ads.get(id);
+    if (held === undefined) {
+      return this.ads.size < this.adCacheMaxEntries && this.cachedBytes + length <= this.adCacheMaxBytes;
+    }
+    return this.cachedBytes - (held.stored["adBytes"] as Uint8Array).length + length <= this.adCacheMaxBytes;
+  }
+
+  /** Drops the cached advertisements whose TTL has passed. */
+  private evictExpiredAds(): void {
+    const now = this.now();
+    for (const [id, entry] of this.ads) {
+      if (entry.expires <= now) {
+        this.ads.delete(id);
+        this.cachedBytes -= (entry.stored["adBytes"] as Uint8Array).length;
+      }
+    }
+  }
+
+  /**
+   * Whether this peer and every member it knows read the AppCard level (SPEC §6.1a.2, FR-6): the gate under which
+   * it writes a card's origin, formats, an `idp` host, and a spill reference. A member heard before its
+   * advertisement arrives counts as level 1.
+   */
+  appCardGateOpen(): boolean {
+    if (this.level < APPCARD_LEVEL) {
+      return false;
+    }
+    for (const ad of this.members.values()) {
+      if (appCardLevelOf((ad["resourceHints"] as Dict | undefined)?.[APPCARD_HINT]) < APPCARD_LEVEL) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * The full card of a stub (SPEC §6.1a.5, FR-15): a card without `spill` as it is, and otherwise the stub with its
+   * parts document's values in place, read strictly as the card's record. A `size` above {@link spillMaxFetchBytes}
+   * fails before any fetch (`spillsOverLimit`); a document of the wrong length, one that does not read as the kind's
+   * parts record, or one whose non-empty fields are not exactly `spill.parts` fails (`spillsRefused`, a
+   * {@link SpillRefusedError}). A document nobody serves in time fails uncounted. Nothing is struck, and a cached
+   * stub stays cached.
+   */
+  async resolve(card: Dict): Promise<Dict> {
+    const spill = card["spill"] as Dict | undefined;
+    if (spill === undefined) {
+      return card;
+    }
+    const kind = wire.spillKindOf(card);
+    const id = String(card["id"]);
+    const size = Number(spill["size"]);
+    if (size > this.spillMaxFetchBytes) {
+      this.spillsOverLimit += 1;
+      throw new Error(`the parts document of ${id} is ${size} bytes, above the fetch bound of ${this.spillMaxFetchBytes}`);
+    }
+    const store = this.spillStore;
+    if (store === null) {
+      throw new Error(`no content swarm serves this group, so the stub ${id} stays a stub`);
+    }
+    let document: Uint8Array;
+    try {
+      document = await store.get(String(spill["root"]), size);
+    } catch (e) {
+      if (e instanceof SpillRefusedError) {
+        this.spillsRefused += 1;
+      }
+      throw e;
+    }
+    try {
+      if (document.length !== size) {
+        throw new SpillRefusedError(`the parts document of ${id} is ${document.length} bytes; the stub states ${size}`);
+      }
+      const parts = records.decodeRecord(document, kind === "AppCard" ? records.APP_CARD_PARTS : records.AGENT_CARD_PARTS);
+      return records.conform(wire.cardComplete(card, parts as Dict), kind === "AppCard" ? records.APP_CARD : records.AGENT_CARD) as Dict;
+    } catch (e) {
+      this.spillsRefused += 1;
+      throw e instanceof SpillRefusedError ? e
+        : new SpillRefusedError(`the parts document of ${id} does not complete its stub`, { cause: e });
+    }
+  }
+
+  /**
+   * Issues one kept card (FR-7, FR-12, FR-13): under a strictly newer `issued` than the last one signed, without the
+   * gated fields when the gate is closed, and as a stub when it passes the spill threshold behind an open gate with
+   * a spill store that takes its parts document; otherwise inline in full.
+   */
+  private issueCard(id: string): void {
+    const kept = this.issuedCards.get(id)!;
+    const open = this.appCardGateOpen();
+    kept.open = open;
+    const issued = Math.max(parseInstantMillis(kept.full["issued"]), kept.issued + 1);
+    kept.issued = issued;
+    const current: Dict = { ...kept.full, issued: instantIso(issued) };
+    const card = kept.adType === "AppCard" ? wire.appCardForView(current, open) : current;
+    if (Object.keys(card).length !== Object.keys(current).length) {
+      this.appCardsDowngraded += 1;
+    }
+    const schema = kept.adType === "AppCard" ? records.APP_CARD : records.AGENT_CARD;
+    const size = dumps(records.conform(card, schema)).length;
+    const parts = size > wire.CARD_SPILL_THRESHOLD_BYTES ? wire.cardSpillParts(card) : [];
+    const store = this.spillStore;
+    // a card whose size sits outside the spill set (a long name or description) has nothing to move
+    const spills = parts.length > 0 && open && store !== null;
+    this.warnCard(kept.adType, card, size, spills);
+    let signed = card;
+    if (size > wire.CARD_SPILL_THRESHOLD_BYTES) {
+      signed = spills ? this.spill(kept.adType, card, parts, store!) : card;
+      if (signed === card) {
+        this.cardsOversizeInline += 1;
+      }
+    }
+    this.sendAd(kept.adType, signed);
+  }
+
+  /** The stub of a full card once its parts document is on the swarm, or the card itself when the swarm refuses it. */
+  private spill(adType: "AppCard" | "AgentCard", card: Dict, parts: string[], store: SpillStore): Dict {
+    const partsSchema = adType === "AppCard" ? records.APP_CARD_PARTS : records.AGENT_CARD_PARTS;
+    const document = dumps(records.conform(wire.cardParts(card), partsSchema));
+    let root: string;
+    try {
+      root = store.put(String(card["id"]), document);
+    } catch (e) {
+      this.onWarning(`the content swarm refused the parts document of ${String(card["id"])}; the card travels inline: ${String(e)}`);
+      return card;
+    }
+    this.holdSpill(root, parseInstantMillis(card["issued"]) + parseDurationMillis(card["ttl"]));
+    this.cardsSpilled += 1;
+    return wire.cardStub(card, { root, size: document.length, parts });
+  }
+
+  /** FR-13: one warning per card id and encoded size past 57,344 bytes, naming the card and saying what happens. */
+  private warnCard(adType: string, card: Dict, size: number, spills: boolean): void {
+    const id = String(card["id"]);
+    if (size <= wire.CARD_SPILL_WARN_BYTES || this.warnedSizes.get(id) === size) {
+      return;
+    }
+    this.warnedSizes.set(id, size);
+    const kind = adType === "AppCard" ? `AppCard (kind ${String(card["kind"])})` : adType;
+    const fate = size <= wire.CARD_SPILL_THRESHOLD_BYTES ? "it travels inline until it passes the threshold"
+      : spills ? "it spills its large parts to the content swarm"
+        : "it travels inline, since a member is below the AppCard level, no content swarm serves the group,"
+          + " or no field of its spill set holds anything";
+    this.onWarning(`${kind} ${id} encodes to ${size} bytes, past the ${wire.CARD_SPILL_WARN_BYTES}-byte warning`
+      + ` and ${size <= wire.CARD_SPILL_THRESHOLD_BYTES ? "within" : "past"} the ${wire.CARD_SPILL_THRESHOLD_BYTES}-byte`
+      + ` spill threshold; ${fate}`);
+  }
+
+  /** Keeps a parts document served until the last card that names it expires. */
+  private holdSpill(root: string, until: number): void {
+    this.spillHolds.set(root, Math.max(this.spillHolds.get(root) ?? 0, until));
+    this.spillSweep ??= this.every(SPILL_SWEEP_MILLIS, () => this.sweepSpills());
+  }
+
+  /** Releases every parts document whose last naming card has expired. */
+  private sweepSpills(): void {
+    const now = this.now();
+    for (const [root, until] of [...this.spillHolds]) {
+      if (now >= until) {
+        this.spillHolds.delete(root);
+        this.spillStore?.release(root);
+      }
+    }
+    if (this.spillHolds.size === 0) {
+      this.spillSweep?.stop();
+      this.spillSweep = null;
+    }
+  }
+
+  /** Forgets the kept cards whose last issue has expired: this peer issues them no more. */
+  private pruneIssuedCards(): void {
+    const now = this.now();
+    for (const [id, kept] of [...this.issuedCards]) {
+      if (kept.issued + parseDurationMillis(kept.full["ttl"]) <= now) {
+        this.issuedCards.delete(id);
+        this.warnedSizes.delete(id);
+      }
+    }
+  }
+
+  /**
+   * A member's AppCard level may have changed (its advertisement arrived or changed, it left, or this peer's own
+   * level changed): every kept card last issued under the other gate whose form depends on the gate goes out again at
+   * once. A card issued while a member heard only by its frames held the gate closed thus follows when that member's
+   * advertisement arrives, whatever the gate of the cards issued since.
+   */
+  private appCardLevelChanged(): void {
+    if (this.issuedCards.size === 0) {
+      return;
+    }
+    const open = this.appCardGateOpen();
+    this.pruneIssuedCards();
+    for (const [id, kept] of this.issuedCards) {
+      if (kept.open === open) {
+        continue;
+      }
+      const schema = kept.adType === "AppCard" ? records.APP_CARD : records.AGENT_CARD;
+      const gated = kept.adType === "AppCard"
+        && Object.keys(wire.appCardForView(kept.full, false)).length !== Object.keys(kept.full).length;
+      if (gated || dumps(records.conform(kept.full, schema)).length > wire.CARD_SPILL_THRESHOLD_BYTES) {
+        this.issueCard(id);
+      } else {
+        kept.open = open; // its form is the same under either gate
+      }
+    }
   }
 
   /** The live AgentCards the ads stream carried. */
@@ -1142,17 +1621,23 @@ export class Peer {
     }
   }
 
-  /** A `peers` stream item (PeerNode.SignedPeerAd): kept under its issuer when it verifies. */
+  /**
+   * A `peers` stream item (PeerNode.SignedPeerAd): kept under its issuer when it and its
+   * PeerAdvertisement read strictly (HLC round six, 2026-11-08, F3) and its signature verifies.
+   */
   private acceptPeerAd(payload: Uint8Array): void {
     try {
-      const signed = loads(payload) as Dict;
-      const adBytes = signed["adBytes"] as Uint8Array;
-      const key = signed["publicKey"] as Uint8Array;
-      if (!Identity.verify(key, adBytes, signed["signature"] as Uint8Array)) {
+      const signed = records.readRecord(payload, records.SIGNED_PEER_AD);
+      if (signed === null) {
         return;
       }
-      const ad = loads(adBytes) as Dict;
-      if (typeof ad === "object" && ad !== null && ad["issuer"] === deriveId(key)
+      const adBytes = signed["adBytes"] as Uint8Array;
+      const key = signed["publicKey"] as Uint8Array;
+      if (key.length !== 32 || !Identity.verify(key, adBytes, signed["signature"] as Uint8Array)) {
+        return;
+      }
+      const ad = records.readRecord(adBytes, records.PEER_ADVERTISEMENT);
+      if (ad !== null && ad["issuer"] === deriveId(key)
           && ad["issuer"] !== this.identity.peerId) {
         const issuer = String(ad["issuer"]);
         const previous = this.members.get(issuer);
@@ -1162,6 +1647,7 @@ export class Peer {
         }
         this.members.set(issuer, ad);
         this.heldPeerAds.set(issuer, payload);
+        this.appCardLevelChanged();
         const hints = (ad["resourceHints"] ?? {}) as Dict;
         if (this.channelAuth === "session" && hints[SESSION_HINT] === "1") {
           this.sessionPeers.add(String(ad["issuer"]));
@@ -1174,8 +1660,12 @@ export class Peer {
     }
   }
 
-  /** Called after a state folds (the merged state), for spaces and watches. */
-  onState: ((dto: Dict) => void) | null = null;
+  /**
+   * Called after a state folds, for spaces and watches: the merged state, and the state this replica held
+   * before, when it held one (core cancel events, 2026-11-09: a space raises EXPIRED for a withdrawal of an
+   * entry that was present).
+   */
+  onState: ((dto: Dict, previous?: Dict) => void) | null = null;
   /** Takes waiting for the next fold (JS-V-02): woken by a state or a claim, or by their own deadline. */
   private readonly foldWaiters = new Set<() => void>();
   /** When the last anti-entropy pull of each space went out, so a waiting take pulls at most once per settle window. */
@@ -1218,6 +1708,8 @@ export class Peer {
   }
   /** Called after a claim folds (the merged signed claim). */
   onClaim: ((entryId: string, signed: Dict) => void) | null = null;
+  /** Called with the entry ids a tombstone collection dropped, so spaces forget what they judged of them. */
+  onCollected: ((entryIds: string[]) => void) | null = null;
 
   /**
    * Installs a claim the ordered log committed (OrderedTakes.onCommand, SPEC §7.4 ORDERED):
@@ -1226,7 +1718,7 @@ export class Peer {
    * claim is now the one held for the entry.
    */
   applyCommittedClaim(space: string, entryId: string, signed: Dict): boolean {
-    this.foldClaim(entryId, signed);
+    this.foldClaim(entryId, signed, true);
     const held = this.claims.get(entryId);
     if (held === undefined || !equals(dumps((held["claim"] as Dict) ?? {}), dumps((signed["claim"] as Dict) ?? {}))) {
       return false;
@@ -1237,13 +1729,113 @@ export class Peer {
   }
 
   /**
+   * Joins a space by name: its rumors and anti-entropy answers fold here from now on. Pulling,
+   * writing, and opening a Space join it; this peer relays a rumor of a space it has not joined
+   * without decoding it (HLC round five, 2026-11-08).
+   */
+  joinSpace(space: string): void {
+    this.joinedSpaces.add(space);
+  }
+
+  /**
+   * Collects tombstones (SPEC §7.3, ReplicatedSpace's sweep): drops every entry past its collection
+   * horizon, with its claim and any block or bulk payload no remaining entry names, and tells
+   * `onCollected`. HLC round five, 2026-11-08: without it the replica held every entry ever written,
+   * and each sweep, digest, and read grew with them. HLC round six, 2026-11-08: a collected entry's
+   * bulk payload is released through the content seam (R9, Java's LB-E-04), and a claim on an entry
+   * this replica collected or never held goes once its expiry passes, so the claim map stays bounded
+   * (R10). Returns the collected entry ids.
+   */
+  collectTombstones(): string[] {
+    const now = this.now();
+    for (const [entryId, signed] of this.claims) {
+      if (!this.states.has(entryId) && Number((signed["claim"] as Dict)["expiresAtMillis"]) <= now) {
+        this.claims.delete(entryId);
+      }
+    }
+    const collected: string[] = [];
+    for (const [entryId, dto] of this.states) {
+      if (collectable(dto, now, this.longestLeaseOf(dto))) {
+        collected.push(entryId);
+      }
+    }
+    if (collected.length === 0) {
+      return collected;
+    }
+    const released = new Set<string>();
+    for (const entryId of collected) {
+      const ref = (this.states.get(entryId)!["record"] as Dict | undefined)?.["payloadRef"];
+      if (typeof ref === "string" && (this.blocks.has(ref) || this.isBulk(ref))) {
+        released.add(ref);
+      }
+      this.states.delete(entryId);
+      this.claims.delete(entryId);
+    }
+    if (released.size > 0) {
+      for (const dto of this.states.values()) {
+        released.delete(String((dto["record"] as Dict | undefined)?.["payloadRef"]));
+      }
+      for (const ref of released) {
+        if (this.isBulk(ref)) {
+          this.content!.unpin(ref);
+        } else {
+          this.blocks.delete(ref);
+          this.blockAsked.delete(ref);
+        }
+      }
+    }
+    this.onCollected?.(collected);
+    return collected;
+  }
+
+  /** Whether `ref` names a payload the content seam holds: a `b` root that is no persistent tree. */
+  private isBulk(ref: string): boolean {
+    return this.content !== null && ref.startsWith("b") && !isTreeRoot(ref);
+  }
+
+  /** The longest lease observed in the space of `dto`, the horizon's measure (SPEC §7.3). */
+  private longestLeaseOf(dto: Dict): number {
+    return this.longestLease.get(String((dto["record"] as Dict | undefined)?.["spaceId"])) ?? 0;
+  }
+
+  /**
+   * Records the lease `dto` grants, from its lease stamp to its expiry, as the longest of its space
+   * when it is (SPEC §7.3, HLC round five, 2026-11-08), capped at MAX_TRACKED_LEASE_MILLIS; a
+   * non-positive lease records nothing.
+   */
+  private observeLease(dto: Dict): void {
+    this.observeGrant(String((dto["record"] as Dict)["spaceId"]), leaseExpiryOf(dto) - wire.hlcPhysical(dto["leaseStamp"]));
+  }
+
+  /**
+   * Records the hold a claim this replica merges grants, from its stamp to its expiry, as Java's
+   * ReplicatedSpace observes every claim it merges and every take it makes (SPEC §7.3, HLC round
+   * five, 2026-11-08): a space of short writes and long holds keeps its tombstones two holds.
+   */
+  private observeClaimLease(signed: Dict): void {
+    const claim = signed["claim"] as Dict;
+    this.observeGrant(String(claim["spaceId"]), Number(claim["expiresAtMillis"]) - wire.hlcPhysical(claim["stamp"]));
+  }
+
+  /** Raises the longest lease of `spaceId` to `grantedMillis`, capped at MAX_TRACKED_LEASE_MILLIS. */
+  private observeGrant(spaceId: string, grantedMillis: number): void {
+    const granted = Math.min(grantedMillis, MAX_TRACKED_LEASE_MILLIS);
+    if (granted > (this.longestLease.get(spaceId) ?? 0)) {
+      this.longestLease.set(spaceId, granted);
+    }
+  }
+
+  /**
    * Anti-entropy pull (spec §5.3): offer an empty digest. The revocation
    * streams ride along: a partner answers only the streams a digest names, so
    * a late joiner learns the group's revocations here.
    */
   pullSpace(space: string): void {
+    this.joinSpace(space);
     this.pulledSpaces.add(space);
-    this.send("DIGEST", wire.digestBody({ [`space:${space}`]: new Uint8Array(),
+    // HLC round four, 2026-11-08 (D5): the digest names no entry, so the partner answers with every
+    // state but those this replica refused and acknowledges.
+    this.send("DIGEST", wire.digestBody({ [`space:${space}`]: utf8(this.acknowledgedLines(space)),
       ...revocationDigests() }), null, "dial");
   }
 
@@ -1298,10 +1890,10 @@ export class Peer {
     const results: Dict[] = [];
     for (const dto of this.states.values()) {
       const record = dto["record"] as Dict | undefined;
-      if (record && record["type"] === typeName && !dto["completed"]) {
-        const payload = this.payloadOf(dto);
-        if (payload !== null) {
-          results.push(loads(payload) as Dict);
+      if (record && record["type"] === typeName && present(dto)) {
+        const read = applicationValue(this.payloadOf(dto));
+        if (read !== null) {
+          results.push(read.value);
         }
       }
     }
@@ -1331,14 +1923,13 @@ export class Peer {
       const now = this.now();
       for (const [entryId, dto] of this.states) {
         const record = dto["record"] as Dict | undefined;
-        if (!record || record["type"] !== typeName || dto["completed"]
+        if (!record || record["type"] !== typeName || !present(dto)
             || (record["group"] !== undefined && record["group"] !== this.group)
             || record["spaceId"] !== wireSpaceId(this.group, space)
             || (exactEntryId !== null && entryId !== exactEntryId)) {
           continue;
         }
-        const lease = (dto["leaseValue"] ?? record["lease"]) as Dict | undefined;
-        if (!lease || Number(lease["expiresAtMillis"]) <= now) {
+        if (leaseExpiryOf(dto) <= now) {
           continue;
         }
         const current = this.claims.get(entryId)?.["claim"] as Dict | undefined;
@@ -1346,11 +1937,11 @@ export class Peer {
           continue;
         }
         // A template narrows the candidates; a bid function prices the claim (AUCTION).
-        const raw = this.payloadOf(dto);
-        if (raw === null) {
-          continue; // its block or artifact is still on its way
+        const read = applicationValue(this.payloadOf(dto));
+        if (read === null) {
+          continue; // its block or artifact is still on its way, or its value is unreadable
         }
-        const payload = loads(raw) as Dict;
+        const payload = read.value;
         if (matches !== null && !matches(payload ?? {}, (record["tags"] as Dict) ?? {})) {
           continue;
         }
@@ -1359,6 +1950,7 @@ export class Peer {
         const claim = wire.takeClaim(entryId, String(record["spaceId"]), epoch,
           wire.hlcNow(holder, now), holder, price, now + leaseMillis);
         const signed = wire.signedClaim(claim, this.identity, agent);
+        this.observeClaimLease(signed);
         this.claims.set(entryId, wire.mergeClaims(this.claims.get(entryId), signed));
         this.send("RUMOR", wire.rumorBody(`space:${space}`,
           `c:${entryId}:${claim["stamp"]}`, 6, wire.claimDelta(entryId, signed)));
@@ -1369,8 +1961,11 @@ export class Peer {
         if (winner && winner["holder"] === holder
             && Number(winner["epoch"]) === epoch
             && Number(winner["expiresAtMillis"]) > this.now()
-            && !this.states.get(entryId)?.["completed"]
+            // core cancel events, 2026-11-09: an entry completed or withdrawn during the settle window is nobody's
+            && present(this.states.get(entryId) ?? {})
             && !this.revocations.refuses(holder, agent?.publicRaw ?? null, null)) {
+          // As Java's take fires TAKEN for the claim it won (HLC round six, 2026-11-08, R9).
+          this.onClaim?.(entryId, this.claims.get(entryId)!);
           return entryId;
         }
       }
@@ -1386,10 +1981,10 @@ export class Peer {
   completeEntry(space: string, entryId: string, agent: AgentIdentity | null = null): void {
     this.requireHeld(space, entryId, agent);
     // A claim taken as an agent must be completed as that agent (A6, v0.1.13).
-    const dto = wire.signState({ ...this.states.get(entryId)!, completed: true },
-      this.identity, agent, this.now());
+    const previous = this.states.get(entryId)!;
+    const dto = wire.signState({ ...previous, completed: true }, this.identity, agent, this.now());
     this.states.set(entryId, dto);
-    this.onState?.(dto);
+    this.onState?.(dto, previous);
     const proof = this.claims.get(entryId) ?? null;
     this.send("RUMOR", wire.rumorBody(`space:${space}`, `d:${entryId}`, 6,
       dumps({ state: dto, claimEntry: proof ? entryId : null, claim: proof })));
@@ -1406,7 +2001,8 @@ export class Peer {
       && signed?.["holderKey"] instanceof Uint8Array
       && equals(signed["holderKey"] as Uint8Array, this.identity.publicRaw));
     if (!record || (record["group"] !== undefined && record["group"] !== this.group) || record["spaceId"] !== wireSpaceId(this.group, space)
-        || !localPeerHolder || state?.["completed"] || !claim || claim["entryId"] !== entryId
+        // core cancel events, 2026-11-09: a completed or withdrawn entry is held by nobody, as in Java
+        || !localPeerHolder || !present(state ?? {}) || !claim || claim["entryId"] !== entryId
         || claim["spaceId"] !== record["spaceId"] || claim["holder"] !== holder
         || !Number.isFinite(Number(claim["expiresAtMillis"])) || Number(claim["expiresAtMillis"]) <= this.now()
         || Number(((state?.["leaseValue"] ?? record["lease"]) as Dict)?.["expiresAtMillis"]) <= this.now()
@@ -1423,6 +2019,7 @@ export class Peer {
     const claim = wire.takeClaim(entryId, String(previous["spaceId"]), Number(previous["epoch"]) + 1,
       wire.hlcNow(agent.agentId, this.now()), agent.agentId, 0.0, this.now() + leaseMillis);
     const signed = wire.signedClaim(claim, this.identity, agent);
+    this.observeClaimLease(signed);
     this.claims.set(entryId, wire.mergeClaims(this.claims.get(entryId), signed));
     this.send("RUMOR", wire.rumorBody(`space:${space}`, `c:${entryId}:${claim["stamp"]}`, 6,
       wire.claimDelta(entryId, signed)));
@@ -1435,12 +2032,23 @@ export class Peer {
   restoreSnapshot(snapshot: Dict): void {
     if (snapshot["group"] !== this.group) throw new Error("Snapshot group mismatch");
     this.revocations.restoreSigned((snapshot["revocations"] ?? {}) as Dict, this.now());
-    for (const [id, claim] of Object.entries((snapshot["claims"] ?? {}) as Dict)) {
-      this.foldClaim(id, claim as Dict);
+    // HLC round six, 2026-11-08 (F1): a claim or state that is no conformed SignedClaim or
+    // EntryStateDto counts as an undecodable carrier, as a delta bringing it would.
+    for (const [id, held] of Object.entries((snapshot["claims"] ?? {}) as Dict)) {
+      const claim = records.conformed(held, records.SIGNED_CLAIM);
+      if (claim === null) {
+        this.deltasUndecodable += 1;
+        continue;
+      }
+      this.foldClaim(id, claim);
     }
-    for (const dto of (snapshot["states"] ?? []) as Dict[]) {
-      const record = dto["record"] as Dict | undefined;
-      if (record && (record["group"] === undefined || record["group"] === this.group)) this.fold(dto);
+    for (const held of (snapshot["states"] ?? []) as Dict[]) {
+      const dto = records.conformed(held, records.ENTRY_STATE);
+      if (dto === null) {
+        this.deltasUndecodable += 1;
+        continue;
+      }
+      if (dto["record"] !== undefined) this.fold(dto);
     }
   }
 
@@ -1452,9 +2060,12 @@ export class Peer {
    */
   /**
    * Cancels an entry this peer (or `agent`) wrote, as `EntryHandle.cancel` does in Java: a state whose
-   * `removes` cover its `adds`, signed by the issuer, so every replica drops the entry. The TypeScript
-   * replica reads such a state as dead where it consults the dot sets (the PDT refs do); elsewhere the
-   * entry lapses with its lease.
+   * `removes` cover its `adds`, signed by the issuer, so every replica drops the entry. Reads, finds,
+   * takes, and watches here skip it at once, and the replica keeps its tombstone until the collection
+   * horizon (SPEC §7.3, HLC round five, 2026-11-08). Watches here hear EXPIRED at once, and every other
+   * member's when the withdrawal folds there (core cancel events, 2026-11-09). An entry this replica holds
+   * completed or withdrawn stays as it is and nothing goes out, as Java's `EntryHandle.cancel` leaves it: an
+   * issuer's signature over a completed state verifies nowhere (SPEC §11a.4).
    */
   cancelEntry(space: string, entryId: string, agent: AgentIdentity | null = null): void {
     const previous = this.states.get(entryId);
@@ -1469,11 +2080,14 @@ export class Peer {
     if (agent === null && !issuer.startsWith(this.identity.peerId + "/")) {
       throw new Error(`${entryId} was written by ${issuer}, not by this peer`);
     }
+    if (!present(previous)) {
+      return;
+    }
     const now = this.now();
     const dto = wire.signState({ ...previous, removes: unionDots(previous["removes"], previous["adds"]) },
       this.identity, agent, now);
     this.states.set(entryId, dto);
-    this.onState?.(dto);
+    this.onState?.(dto, previous);
     this.send("RUMOR", wire.rumorBody(`space:${space}`, `x:${entryId}:${now}`, 6,
       dumps({ state: dto, claimEntry: null, claim: null })));
   }
@@ -1493,6 +2107,7 @@ export class Peer {
     const dto = wire.signState({ ...previous, leaseStamp: wire.hlcNow(issuer, now),
       leaseValue: { holder: issuer, expiresAtMillis: now + leaseMillis, kind: "WRITE" } },
     this.identity, agent, now);
+    this.observeLease(dto);
     this.states.set(entryId, dto);
     this.send("RUMOR", wire.rumorBody(`space:${space}`, `r:${entryId}:${now}`, 6,
       dumps({ state: dto, claimEntry: null, claim: null })));
@@ -1514,6 +2129,7 @@ export class Peer {
     }
     this.channel = channel;
     this.session = null;
+    this.linkSince = Date.now();
     channel.onFrame((frame) => this.onFrame(frame, null));
     channel.onClose(() => this.onChannelClosed(channel));
   }
@@ -1657,7 +2273,7 @@ export class Peer {
     }
     if (this.accepts(env)) {
       try {
-        this.handle(env, link);
+        this.handle(env, link, false, decoded!.body);
       } catch {
         // One undecodable frame never stops the peer.
       }
@@ -1675,14 +2291,22 @@ export class Peer {
       && (env["to"] == null || env["to"] === this.identity.peerId);
   }
 
-  private handle(env: Dict, link: Link | null = null, relayedFrame = false): void {
+  /**
+   * A verified frame for this peer; `decoded` is its body read strictly as its kind's record, and a
+   * body that does not read makes the frame undecodable (HLC round six, 2026-11-08, F3).
+   */
+  private handle(env: Dict, link: Link | null = null, relayedFrame = false,
+                 decoded: Dict | null = wire.decodeBody(env)): void {
+    if (decoded === null) {
+      this.malformedFrames += 1;
+      return;
+    }
     if (!this.frames.admit(env, this.now())) {
       return; // stale, far ahead, or a replay: dropped and counted, nothing more
     }
     let reintroduce = false;
     wire.hlcObserve(this.identity.peerId, env["stamp"], this.now());
     const kind = env["kind"];
-    const body = (env["body"] as Uint8Array) ?? new Uint8Array();
     const sender = env["from"];
     if (typeof sender === "string" && sender !== this.identity.peerId) {
       if (!this.members.has(sender)) {
@@ -1714,96 +2338,101 @@ export class Peer {
     if (kind === "SESSION_HELLO") {
       this.onSessionHello(env, link);
     } else if (kind === "RELAY_FRAME") {
-      this.onRelayFrame(env, link);
+      this.onRelayFrame(decoded, link);
     } else if (kind === "DIGEST") {
-      this.onDigest(String(sender), loads(body) as Dict);
+      this.onDigest(String(sender), decoded);
     } else if (kind === "PING_REQ") {
-      this.onPingReq(String(sender), loads(body) as Dict);
+      this.onPingReq(String(sender), decoded);
     } else if (kind === "ACK") {
-      this.onAck(String(sender), loads(body) as Dict);
+      this.onAck(String(sender), decoded);
     } else if (kind === "PIPE_DATA") {
-      const frame = loads(body) as Dict;
-      if (typeof frame === "object" && frame !== null && frame["capability"] === wire.RELAY_SIGNAL_CAPABILITY) {
-        const signal = loads((frame["payload"] as Uint8Array) ?? new Uint8Array([0xf6]));
-        if (typeof signal === "object" && signal !== null) {
-          this.relaySignals.push(signal as Dict);
+      if (decoded["capability"] === wire.RELAY_SIGNAL_CAPABILITY) {
+        const signal = records.readRecord(decoded["payload"], records.RELAY_SIGNAL);
+        if (signal !== null) {
+          this.relaySignals.push(signal);
           this.relaySignals.splice(0, Math.max(0, this.relaySignals.length - 64));
         }
         return;
       }
-      const handler = typeof frame === "object" && frame !== null
-        ? this.pipeHandlers.get(String(frame["capability"])) : undefined;
+      const handler = this.pipeHandlers.get(String(decoded["capability"]));
       if (handler !== undefined) {
-        handler(String(sender), (frame["payload"] as Uint8Array) ?? new Uint8Array());
+        handler(String(sender), decoded["payload"] as Uint8Array);
       }
     } else if (kind === "PING") {
-      const ping = loads(body) as Dict;
       // Java's probe nonces are random 64-bit longs: echo the decoded integer
       // as is (a bigint beyond 2^53), since a Number would lose it and the
       // encoder would refuse it, leaving the probe unanswered and this peer evicted.
-      this.send("ACK", wire.ackBody((ping["nonce"] as number | bigint | undefined) ?? 0));
+      this.send("ACK", wire.ackBody(decoded["nonce"] as number | bigint));
     } else if (kind === "GROUP_AD") {
       this.offerGroupAd(env); // only a join in progress cares (§10.1)
     } else if (kind === "RUMOR") {
-      const rumor = loads(body) as Dict;
+      const rumor = decoded;
+      let forward = true;
       if (revocation.STREAMS.includes(String(rumor["streamId"]))) {
         this.revocations.accept(String(rumor["streamId"]), rumor["payload"], this.now());
       } else if (rumor["streamId"] === "peers") {
-        this.acceptPeerAd((rumor["payload"] as Uint8Array) ?? new Uint8Array());
+        this.acceptPeerAd(rumor["payload"] as Uint8Array);
       } else if (rumor["streamId"] === "ads") {
-        this.acceptAd(loads((rumor["payload"] as Uint8Array) ?? new Uint8Array([0xf6])));
-      } else if (String(rumor["streamId"] ?? "").startsWith("space:")) {
-        const delta = loads((rumor["payload"] as Uint8Array) ?? new Uint8Array([0xf6])) as Dict;
-        if (delta !== null && typeof delta === "object" && delta["state"] !== null && typeof delta["state"] === "object") {
-          nameRecordless(delta["state"] as Dict, rumor["itemId"]);
+        this.acceptAd(records.readRecord(rumor["payload"], records.STORED_AD));
+      } else if (this.streamHandlers.has(String(rumor["streamId"])) && rumor["payload"] instanceof Uint8Array) {
+        forward = this.streamHandlers.get(String(rumor["streamId"]))!(String(sender), rumor["payload"]);
+      } else if (String(rumor["streamId"] ?? "").startsWith("space:")
+          && this.joinedSpaces.has(String(rumor["streamId"]).substring("space:".length))) {
+        // a rumor of a space not joined is relayed undecoded (HLC round five, 2026-11-08); a PDT
+        // facade joins its ref spaces itself (HLC round six, 2026-11-08, R11)
+        const delta = this.decodeDelta(rumor["payload"], records.SPACE_DELTA);
+        if (delta === null) {
+          forward = false; // counted, and carried no further from here
+        } else {
+          if (isDict(delta["state"])) {
+            nameRecordless(delta["state"] as Dict, rumor["itemId"]);
+          }
+          this.foldDelta(delta);
         }
-        this.foldDelta(delta);
       }
-      this.forwardRumor(rumor, link);
+      if (forward) {
+        this.forwardRumor(rumor, link);
+      }
     } else if (kind === "BLOCK_WANT") {
-      const want = loads(body) as Dict;
-      const data = typeof want === "object" && want !== null ? this.blocks.get(String(want["cid"])) : undefined;
+      const data = this.blocks.get(String(decoded["cid"]));
       if (data !== undefined) {
-        this.sendAddressed("BLOCK", wire.blockBody(String(want["cid"]), data), String(sender));
+        this.sendAddressed("BLOCK", wire.blockBody(String(decoded["cid"]), data), String(sender));
       }
     } else if (kind === "BLOCK") {
-      const block = loads(body) as Dict;
-      if (typeof block === "object" && block !== null && block["bytes"] instanceof Uint8Array
-          && this.blockAsked.has(String(block["cid"])) && wire.contentId(block["bytes"]) === block["cid"]) {
-        this.blocks.set(String(block["cid"]), block["bytes"]);
+      const bytes = decoded["bytes"] as Uint8Array;
+      if (this.blockAsked.has(String(decoded["cid"])) && wire.contentId(bytes) === decoded["cid"]) {
+        this.blocks.set(String(decoded["cid"]), bytes);
         this.wakeFoldWaiters();
       }
     } else if (kind === "PULL_RESP") {
-      const resp = loads(body) as Dict;
-      const deltas = (resp["deltas"] as Dict) ?? {};
+      const deltas = decoded["deltas"] as { [stream: string]: Uint8Array };
       for (const [stream, deltaBytes] of Object.entries(deltas)) {
-        if (revocation.STREAMS.includes(stream) && deltaBytes instanceof Uint8Array
-            && deltaBytes.length > 0) {
-          for (const signed of (loads(deltaBytes) as CborValue[]) ?? []) {
+        if (revocation.STREAMS.includes(stream) && deltaBytes.length > 0) {
+          for (const signed of (records.readList(deltaBytes, records.SIGNED_REVOCATION) ?? [])) {
             this.revocations.acceptSigned(stream, signed, this.now());
           }
           continue;
         }
-        if (stream === "view" && deltaBytes instanceof Uint8Array && deltaBytes.length > 0) {
-          for (const payload of (loads(deltaBytes) as CborValue[]) ?? []) {
-            if (payload instanceof Uint8Array) {
-              this.acceptPeerAd(payload);
-            }
+        if (stream === "view" && deltaBytes.length > 0) {
+          for (const payload of (records.readList(deltaBytes, "bytes") ?? []) as Uint8Array[]) {
+            this.acceptPeerAd(payload);
           }
           continue;
         }
-        if (stream === "ads" && deltaBytes instanceof Uint8Array && deltaBytes.length > 0) {
-          const delta = loads(deltaBytes) as Dict;
-          for (const stored of ((delta?.["ads"] as unknown[]) ?? [])) {
+        if (stream === "ads" && deltaBytes.length > 0) {
+          for (const stored of ((records.readRecord(deltaBytes, records.AD_CACHE_DELTA)?.["ads"] as Dict[]) ?? [])) {
             this.acceptAd(stored);
           }
           continue;
         }
-        if (!stream.startsWith("space:") || !(deltaBytes instanceof Uint8Array)
+        if (!stream.startsWith("space:") || !this.joinedSpaces.has(stream.substring("space:".length))
             || deltaBytes.length === 0) {
-          continue;
+          continue; // HLC round five, 2026-11-08: an answer for a space not joined folds nothing
         }
-        const sync = loads(deltaBytes) as Dict;
+        const sync = this.decodeDelta(deltaBytes, records.SYNC_DELTA);
+        if (sync === null) {
+          continue; // counted: as in Java, one undecodable state or claim drops the whole sync delta
+        }
         // Claims before states: a completion authenticates against the holder's
         // claim, which must be folded first.
         const claims = (sync["claims"] as Dict) ?? {};
@@ -1916,7 +2545,7 @@ export class Peer {
         summary.set(`c:${entryId}`, serving.claimHash((signed["claim"] as Dict) ?? {}));
       }
     }
-    return utf8(serving.digestLines(summary));
+    return utf8(serving.digestLines(summary) + this.acknowledgedLines(space));
   }
 
   /** `ReplicatedSpace.deltaFor`: the states and claims the remote digest does not name, as a SyncDelta. */
@@ -1943,7 +2572,8 @@ export class Peer {
     if (states.length === 0 && Object.keys(claims).length === 0) {
       return new Uint8Array();
     }
-    return dumps({ states, claims });
+    // HLC round six, 2026-11-08 (P2): `claims` is a protocol map field, written in the RFC 8949 order.
+    return dumps({ states, claims: canonicalMap(claims) });
   }
 
   /** `AdCache.digest`: the live advertisements by id and issue instant. */
@@ -2053,7 +2683,7 @@ export class Peer {
     }
     if (Object.keys(deltas).length > 0) {
       this.pullsAnswered += 1;
-      this.send("PULL_RESP", dumps({ deltas }), from);
+      this.send("PULL_RESP", dumps({ deltas: canonicalMap(deltas) }), from); // P2, HLC round six, 2026-11-08
     }
   }
 
@@ -2071,20 +2701,12 @@ export class Peer {
    * forwarded verbatim there, which is what a service host that advertises the RELAY role does
    * for the browsers behind it. Anyone else's is dropped.
    */
-  private onRelayFrame(env: Dict, link: Link | null): void {
-    let body: Dict;
-    try {
-      body = loads((env["body"] as Uint8Array) ?? new Uint8Array()) as Dict;
-    } catch {
-      return;
-    }
-    const target = body?.["target"];
-    const frame = body?.["frame"];
-    if (typeof target !== "string" || !(frame instanceof Uint8Array)) {
-      return;
-    }
+  private onRelayFrame(body: Dict, link: Link | null): void {
+    const target = body["target"] as string;
+    const frame = body["frame"] as Uint8Array;
     if (target === this.identity.peerId) {
-      const inner = wire.decodeFrame(frame); // fully signed, whatever the link's session
+      const decoded = wire.decodeFrameDetailed(frame, {}); // fully signed, whatever the link's session
+      const inner = decoded?.env ?? null;
       if (inner === null || inner["kind"] === "RELAY_FRAME" || !this.accepts(inner)) {
         return;
       }
@@ -2093,7 +2715,7 @@ export class Peer {
         this.noteRelayed(inner["from"]); // JS-W-11: the other direction of the pair
       }
       try {
-        this.handle(inner, link, true);
+        this.handle(inner, link, true, decoded!.body);
       } catch {
         // one bad inner frame never stops the peer
       }
@@ -2182,6 +2804,9 @@ export class Peer {
       this.reachable.delete(peer);
       this.sessionPeers.delete(peer);
     }
+    if (gone.length > 0) {
+      this.appCardLevelChanged();
+    }
     return gone;
   }
 
@@ -2197,31 +2822,72 @@ export class Peer {
   }
 
   private fold(dto: Dict): void {
+    // HLC round five, 2026-11-08 (E7): a state without its lease stamp or its lease value decodes,
+    // but a lease register holds nothing without both, so the replica drops it before it judges
+    // anything, as Java's mergeState does: it merges nothing, waits for nothing, no digest
+    // acknowledges it, and it counts in no counter.
+    if (dto["leaseStamp"] === null || dto["leaseStamp"] === undefined
+        || dto["leaseValue"] === null || dto["leaseValue"] === undefined) {
+      return;
+    }
     if (dto["record"] === null || dto["record"] === undefined) {
       this.foldRecordless(dto);
       return;
     }
     const record = dto["record"] as Dict;
     const entryId = record["entryId"];
-    if (typeof entryId !== "string" || !this.verifyState(dto, record)) {
+    // ASF-025, as Java's ReplicatedSpace.dotsBoundToIssuer and before the signatures (HLC round six,
+    // 2026-11-08, reference rule): only an entry's writer mints its dots, so a dot naming another
+    // replica is fabricated provenance and the state is dropped, counted nowhere.
+    if (typeof entryId !== "string" || !dotsBoundToIssuer(dto, record) || !this.verifyState(dto, record)) {
       return; // unauthenticated record or forged mutable state: drop it
     }
     // HLC logical counter, 2026-11-08 (Rust team report): every implementation refuses a state
     // whose issue or lease stamp fails the strict parse, so the replicas converge and no such
-    // stamp reaches the lease's last-writer-wins join; a missing lease stamp is refused too. The
-    // check follows the signatures, and a re-offered state counts once (HLC canonical stamps,
-    // 2026-11-08).
-    if (wire.parseHlc(record["issued"]) === null || wire.parseHlc(dto["leaseStamp"]) === null) {
-      this.countStampRefusal(`s:${entryId}`, dto);
+    // stamp reaches the lease's last-writer-wins join. HLC round four, 2026-11-08: an agent-signed
+    // state's signedAt is a stamp like any other (D1), and a stamp that does not decode was counted
+    // with the carrier that brought it (D3), so it is dropped here uncounted. The check follows the
+    // signatures, and a re-offered state counts once.
+    // A peer-signed state carries no signedAt, so only the stamps the state names are judged.
+    const stamps = [record["issued"], dto["leaseStamp"], dto["signedAt"]]
+      .filter((stamp) => stamp !== null && stamp !== undefined);
+    if (stamps.some((stamp) => wire.decodeHlc(stamp) === null)) {
       return;
     }
+    // HLC round five, 2026-11-08 (E6): revocation comes before the stamp checks, so a revoked actor's
+    // state counts in no stamp counter, whatever its stamps.
     const pending = this.pendingStates.get(entryId);
-    this.pendingStates.delete(entryId);
     if (this.refusedForRevocation(dto, record)) {
       // Authentic, but its actor is revoked here (SPEC §5.6): what is already
       // held stays as held, and this state is not merged.
+      this.pendingStates.delete(entryId);
       return;
     }
+    if (stamps.some((stamp) => wire.parseHlc(stamp) === null)) {
+      this.refuseState(dto, record, false);
+      return;
+    }
+    // HLC round four, 2026-11-08 (D4), as Java's ReplicatedSpace: a record or lease stamp past the
+    // far-future margin waits for this replica's wall, unmerged and unacknowledged, and counts only
+    // as deferred, unless it lies so far ahead that no honest clock reaches it. HLC round six,
+    // 2026-11-08 (F4): an agent-signed state's signedAt is judged the same way.
+    const ahead = this.farFuture(record["issued"], dto["leaseStamp"], dto["signedAt"]);
+    if (ahead === "hostile") {
+      this.refuseState(dto, record, true);
+      return;
+    }
+    if (ahead === "deferred") {
+      this.countOnce(this.deferredStamps, stateOfferKey(dto, record), () => this.stampsFarFutureDeferred++);
+      return;
+    }
+    // SPEC §7.3, as Java's ReplicatedSpace (HLC round five, 2026-11-08): this replica refuses at the
+    // door a state past the collection horizon that a lagging replica re-offers, so a collected
+    // tombstone never returns.
+    this.observeLease(dto);
+    if (collectable(dto, this.now(), this.longestLeaseOf(dto))) {
+      return;
+    }
+    this.pendingStates.delete(entryId);
     // ASF-017: states JOIN, mirroring the Java CRDT — dot sets union, the
     // lease is last-writer-wins by HLC stamp, and completed is monotone. A
     // replayed early state (validly signed by its author) can therefore never
@@ -2229,7 +2895,10 @@ export class Peer {
     const previous = this.states.get(entryId);
     this.states.set(entryId,
         previous === undefined ? dto : joinStates(previous, dto));
-    this.onState?.(this.states.get(entryId)!);
+    if (this.collector === null) {
+      this.collector = this.every(COLLECT_PERIOD_MILLIS, () => this.collectTombstones());
+    }
+    this.onState?.(this.states.get(entryId)!, previous);
     this.wakeFoldWaiters();
     if (pending !== undefined) {
       this.foldRecordless(pending);
@@ -2284,10 +2953,9 @@ export class Peer {
     if (!(issuerKey instanceof Uint8Array) || issuerKey.length !== 32) {
       return false;
     }
-    const now = this.now();
     // The record: peer-signed, or agent-signed under a peer certificate
     // (TECH-SPEC §7.2's two-key rule, QA4 A4-7), judged at its issue stamp.
-    if (!wire.verifyRecord(record, issuerKey, dto["agentCertificate"], now)) {
+    if (!wire.verifyRecord(record, issuerKey, dto["agentCertificate"])) {
       return false;
     }
     const stateSig = dto["stateSig"];
@@ -2307,7 +2975,7 @@ export class Peer {
       const claim = signed["claim"] as Dict;
       if (claim["entryId"] !== record["entryId"]
           || claim["spaceId"] !== record["spaceId"]
-          || !wire.verifyClaimProof(signed, now)) {
+          || !wire.verifyClaimProof(signed)) {
         return false;
       }
       signerKey = signed["holderKey"];
@@ -2322,22 +2990,18 @@ export class Peer {
       return false;
     }
     const signer = dto["signer"] ?? null;
-    const signedAt = dto["signedAt"] ?? null;
-    const view = dumps(wire.stateSignView(String(record["spaceId"]),
-      String(record["entryId"]), (dto["adds"] as Dict[]) ?? [],
-      (dto["removes"] as Dict[]) ?? [], String(dto["leaseStamp"]),
-      dto["leaseValue"] as Dict, Boolean(dto["completed"]),
-      signer === null ? null : String(signer), signedAt === null ? null : String(signedAt)));
+    const view = dumps(stateViewOf(dto, record));
     if (signer !== null) {
       const certificate = dto["stateCertificate"];
-      let signedMillis: number;
-      try {
-        signedMillis = wire.hlcPhysical(signedAt);
-      } catch {
+      // HLC round four, 2026-11-08 (D1): judged at a signedAt that decodes, so one above the limit
+      // verifies and fold then refuses and counts it. HLC round six, 2026-11-08 (F4): the certificate
+      // no longer drops a signedAt past the drift ceiling in silence; fold judges it by D4's rule.
+      const signedMillis = wire.decodedPhysical(dto["signedAt"]);
+      if (signedMillis === null) {
         return false;
       }
       return signer === party && typeof certificate === "object" && certificate !== null
-        && verifyAgentCertificateAt(certificate, signerKey, String(party), signedMillis, now)
+        && verifyAgentCertificateCovering(certificate, signerKey, String(party), signedMillis)
         && Identity.verify((certificate as Dict)["agentPublicKey"] as Uint8Array, view, stateSig);
     }
     if (partyAttested) {
@@ -2353,94 +3017,209 @@ export class Peer {
    * the keys it signed with. A peer-signed state (no `signedAt`) is judged at
    * its `leaseStamp`, the stamp of the last write or renewal (the record's
    * issue stamp for an unrenewed write), so a renewal after the effective
-   * instant is refused while the original history still folds.
+   * instant is refused while the original history still folds. A refused state's digest line is
+   * acknowledged, as Java's ReplicatedSpace acknowledges it, so partners stop re-offering it (HLC
+   * round five, 2026-11-08, E12). The times are those of stamps that decode, a counter above the
+   * limit included, since this judgement comes before the stamp checks (E6).
    */
   private refusedForRevocation(dto: Dict, record: Dict): boolean {
     // An unreadable time is an unknown one: refused under any revocation.
-    const signedAt = dto["signedAt"] != null ? physicalOrNull(dto["signedAt"]) : null;
+    const signedAt = dto["signedAt"] != null ? wire.decodedPhysical(dto["signedAt"]) : null;
+    let refused: boolean;
     if (dto["completed"]) {
       const signed = this.claims.get(String(record["entryId"]));
       const claim = (signed?.["claim"] ?? {}) as Dict;
       const certificate = (signed?.["holderCertificate"] ?? {}) as Dict;
-      return claim["holder"] != null
+      refused = claim["holder"] != null
         && this.revocations.refuses(claim["holder"], certificate["agentPublicKey"], signedAt);
+    } else {
+      const certificate = (dto["agentCertificate"] ?? {}) as Dict;
+      const stateCertificate = (dto["stateCertificate"] ?? {}) as Dict;
+      refused = this.revocations.refuses(record["issuer"], certificate["agentPublicKey"],
+        signedAt ?? wire.decodedPhysical(dto["leaseStamp"]))
+        || (dto["signer"] != null
+          && this.revocations.refuses(record["issuer"], stateCertificate["agentPublicKey"], signedAt));
     }
-    const certificate = (dto["agentCertificate"] ?? {}) as Dict;
-    const stateCertificate = (dto["stateCertificate"] ?? {}) as Dict;
-    return this.revocations.refuses(record["issuer"], certificate["agentPublicKey"],
-      signedAt ?? physicalOrNull(dto["leaseStamp"]))
-      || (dto["signer"] != null
-        && this.revocations.refuses(record["issuer"], stateCertificate["agentPublicKey"], signedAt));
+    if (refused) {
+      this.acknowledge(dto, record);
+    }
+    return refused;
   }
 
   /**
-   * Whether a claim's stamp is one wire.parseHlc refuses. When it is and the claim's proof
-   * verifies, the replica counts the refusal in foldStampsRefused, once per distinct claim on the
-   * entry (HLC canonical stamps, 2026-11-08). The ordered-log host asks this of every committed
+   * Whether a claim's stamp is one the replica refuses: a stamp item that does not decode (E1, D3)
+   * or one wire.parseHlc refuses. The replica counts a refusal in stampsLogicalRefused, once per
+   * distinct claim on the entry (HLC canonical stamps, 2026-11-08), only when the stamp decodes, the
+   * claim's proof verifies, and its holder is not revoked: signatures, then revocation, then the
+   * stamp (HLC round five, 2026-11-08, E6). A stamp that does not decode names no verified signer
+   * and counts where its carrier was decoded: as a space delta, or as the ordered-log host's dropped
+   * command (HLC round four, 2026-11-08, D3). The ordered-log host asks this of every committed
    * claim before it installs or announces one.
    */
   refusesClaimStamp(entryId: string, signed: Dict): boolean {
     const claim = (signed["claim"] ?? {}) as Dict;
+    if (wire.decodeHlc(claim["stamp"]) === null) {
+      return true;
+    }
     if (wire.parseHlc(claim["stamp"]) !== null) {
       return false;
     }
-    if (wire.verifyClaimProof(signed, this.now())) {
-      this.countStampRefusal(`c:${entryId}`, claim);
+    if (wire.verifyClaimProof(signed) && !this.holderRevoked(signed)) {
+      this.countRefusal(claimOfferKey(entryId, claim), false);
     }
     return true;
   }
 
-  /** Counts a verified carrier refused for its stamps, once per distinct `kind` and content. */
-  private countStampRefusal(kind: string, content: Dict): void {
-    const key = `${kind}=${toHex(cryptoPort().sha256(dumps(content)))}`;
-    if (this.refusedStamps.has(key)) {
-      return;
-    }
-    this.refusedStamps.add(key);
-    if (this.refusedStamps.size > MAX_REFUSED_STAMPS) {
-      const eldest = this.refusedStamps.values().next().value;
-      if (eldest !== undefined) {
-        this.refusedStamps.delete(eldest);
-      }
-    }
-    this.foldStampsRefused += 1;
+  /**
+   * SPEC §5.6 v0.1.13 (review M-1): a revoked holder takes nothing, whatever the claim's stamp,
+   * since a renewal keeps it.
+   */
+  private holderRevoked(signed: Dict): boolean {
+    const claim = (signed["claim"] ?? {}) as Dict;
+    const certificate = (signed["holderCertificate"] ?? {}) as Dict;
+    return this.revocations.refuses(claim["holder"], certificate["agentPublicKey"], null);
   }
 
-  private foldClaim(entryId: string, signed: Dict): void {
-    const claim = signed["claim"] as Dict | undefined;
-    const holderKey = signed["holderKey"];
-    if (!claim || !(holderKey instanceof Uint8Array)) {
+  /**
+   * Refuses a verified state for its stamps: counts it once per distinct state, keyed on its entry
+   * id, issue stamp and signed state view alone, so no unsigned field a relay changes makes a second
+   * refusal, and acknowledges its digest line so partners stop re-offering it (HLC round four,
+   * 2026-11-08, D5).
+   */
+  private refuseState(dto: Dict, record: Dict, farFuture: boolean): void {
+    this.countRefusal(stateOfferKey(dto, record), farFuture);
+    this.acknowledge(dto, record);
+  }
+
+  /** Names a verified, refused state's digest line as acknowledged. */
+  private acknowledge(dto: Dict, record: Dict): void {
+    this.acknowledgeLine(`e:${String(record["entryId"])}=${serving.stateHash(dto)}`, String(record["spaceId"]));
+  }
+
+  /**
+   * Names a digest line of the space `spaceId` as refused and acknowledged, the newest past
+   * MAX_REFUSED_ACK, as Java's access-ordered refusedAck keeps them.
+   */
+  private acknowledgeLine(line: string, spaceId: string): void {
+    this.refusedAck.delete(line); // re-offered: kept as the newest
+    this.refusedAck.set(line, spaceId);
+    if (this.refusedAck.size > MAX_REFUSED_ACK) {
+      this.refusedAck.delete(this.refusedAck.keys().next().value!);
+    }
+  }
+
+  /** Counts a verified refusal once per distinct offer `key`, as far-future or as a logical refusal. */
+  private countRefusal(key: string, farFuture: boolean): void {
+    this.countOnce(this.refusedStamps, key, farFuture
+      ? () => this.stampsFarFutureRefused++ : () => this.stampsLogicalRefused++);
+  }
+
+  /**
+   * Runs `count` the first time `seen` meets `key`. A key met again becomes the most recent, and
+   * `seen` forgets its least recently met key past the cap (HLC round five, 2026-11-08, E14).
+   */
+  private countOnce(seen: Set<string>, key: string, count: () => void): void {
+    if (seen.delete(key)) {
+      seen.add(key);
       return;
     }
-    // The claim's signed bindings and numeric fields are validated before the
-    // lattice sees them: a claim transplanted under a foreign map key is
-    // dropped (ASF-002), and a NaN epoch/bid cannot win every comparison by
-    // making the total order lie (ASF-033).
-    if (claim["entryId"] !== entryId) {
+    seen.add(key);
+    if (seen.size > MAX_REFUSED_STAMPS) {
+      seen.delete(seen.values().next().value!);
+    }
+    count();
+  }
+
+  /**
+   * Where the latest of `stamps` lies against this replica's wall (HLC round four, 2026-11-08, D4):
+   * `inside` up to wall + MAX_HLC_SKEW_MILLIS + FAR_FUTURE_MARGIN_MILLIS, `deferred` up to
+   * FAR_FUTURE_HOSTILE_MILLIS past that, and `hostile` beyond. The stamps are acceptable ones.
+   */
+  private farFuture(...stamps: CborValue[]): "inside" | "deferred" | "hostile" {
+    const ceiling = BigInt(Math.trunc(this.now()) + wire.MAX_HLC_SKEW_MILLIS + wire.FAR_FUTURE_MARGIN_MILLIS);
+    let lead = 0n;
+    for (const stamp of stamps) {
+      const parsed = wire.parseHlc(stamp);
+      if (parsed !== null && parsed.physical - ceiling > lead) {
+        lead = parsed.physical - ceiling;
+      }
+    }
+    return lead === 0n ? "inside" : lead <= BigInt(wire.FAR_FUTURE_HOSTILE_MILLIS) ? "deferred" : "hostile";
+  }
+
+  /** The `a:` lines of one space's digest: its refused states, acknowledged in Java's order. */
+  private acknowledgedLines(space: string): string {
+    const spaceId = spaceIdLocal(`${this.group}/${space}`);
+    const lines = [...this.refusedAck].filter(([, id]) => id === spaceId).map(([line]) => line);
+    return lines.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).map((line) => `a:${line}\n`).join("");
+  }
+
+  /**
+   * The space delta in `bytes` read strictly as `schema`, or null once it is counted in
+   * deltasUndecodable (HLC round six, 2026-11-08, F1 and F3): bytes that are no document in the wire
+   * encoding, a record with a field the schema does not name, absent, out of order or of the wrong
+   * kind, or any form other than the one its value encodes to. Such a delta names no verified signer.
+   */
+  private decodeDelta(bytes: CborValue | undefined, schema: records.Schema): Dict | null {
+    const delta = records.readRecord(bytes, schema);
+    if (delta === null) {
+      this.deltasUndecodable += 1;
+    }
+    return delta;
+  }
+
+  /**
+   * Whether a gossiped claim breaks Java's time bounds on a claim (HLC round six, 2026-11-08, R6): its
+   * stamp lies more than MAX_CLAIM_PREDATES_ISSUE_MILLIS before the held entry's issue stamp, or it
+   * contests `current`, another holder's claim, with a stamp before now - MAX_HLC_SKEW_MILLIS -
+   * CLAIM_SETTLE_WINDOW_MILLIS. The claim's stamp parses, as foldClaim refused it otherwise.
+   */
+  private claimOutOfTime(entryId: string, claim: Dict, current: Dict | undefined): boolean {
+    const physical = wire.parseHlc(claim["stamp"])!.physical;
+    const issued = wire.parseHlc((this.states.get(entryId)?.["record"] as Dict | undefined)?.["issued"]);
+    if (issued !== null && physical < issued.physical - BigInt(wire.MAX_CLAIM_PREDATES_ISSUE_MILLIS)) {
+      return true;
+    }
+    return current !== undefined && current["holder"] !== claim["holder"]
+      && physical < BigInt(Math.trunc(this.now()) - wire.MAX_HLC_SKEW_MILLIS - wire.CLAIM_SETTLE_WINDOW_MILLIS);
+  }
+
+  private foldClaim(entryId: string, signed: Dict, committed = false): void {
+    // The claim is a conformed TakeClaim before the lattice sees it, so a NaN or infinite bid and a
+    // non-positive epoch never reach it (ASF-033; HLC round six, 2026-11-08, F1), and a claim
+    // transplanted under a foreign map key is dropped (ASF-002).
+    const claim = wire.canonicalClaim(signed["claim"]);
+    if (claim === null || claim["entryId"] !== entryId) {
       return;
     }
     const epoch = wire.claimNumber(claim["epoch"]);
-    const bid = wire.claimNumber(claim["bid"]);
     const expires = wire.claimNumber(claim["expiresAtMillis"]);
-    if (!Number.isFinite(epoch) || epoch <= 0 || !Number.isFinite(bid)
-        || !Number.isFinite(expires)) {
+    // The proof: peer-signed, or agent-signed under a peer certificate
+    // (TECH-SPEC §7.6's two-key rule, QA4 A4-7 phase 3).
+    if (!wire.verifyClaimProof(signed)) {
+      return;
+    }
+    // ASF-047, as Java's mergeClaim: a revoked holder takes nothing, whatever the claim's stamp, and
+    // the refusal is acknowledged in the digest so partners stop re-offering it (HLC round six,
+    // 2026-11-08, R7).
+    if (this.holderRevoked(signed)) {
+      this.acknowledgeLine(`c:${entryId}=${serving.claimHash(claim)}`, String(claim["spaceId"]));
       return;
     }
     // HLC logical counter, 2026-11-08 (Rust team report): every implementation refuses a claim
     // whose stamp fails the strict parse, so the lattice decides alike everywhere and
-    // wire.compareClaims never sees an unparsed stamp.
+    // wire.compareClaims never sees an unparsed stamp. The refusal counts only after the proof
+    // and the revocation check (HLC round five, 2026-11-08, E6).
     if (this.refusesClaimStamp(entryId, signed)) {
       return;
     }
-    // The proof: peer-signed, or agent-signed under a peer certificate
-    // (TECH-SPEC §7.6's two-key rule, QA4 A4-7 phase 3).
-    if (!wire.verifyClaimProof(signed, this.now())) {
-      return;
-    }
-    // SPEC §5.6 v0.1.13 (review M-1): a revoked holder takes nothing, whatever
-    // the claim's stamp, since a renewal keeps it.
-    const certificate = (signed["holderCertificate"] ?? {}) as Dict;
-    if (this.revocations.refuses(claim["holder"], certificate["agentPublicKey"], null)) {
+    // HLC round four, 2026-11-08 (D4), in Java's order: a gossiped claim stamped far beyond the
+    // far-future margin is refused and counted before the bounds below, and one past the margin
+    // that meets them waits for this replica's wall. A claim the ordered log committed skips this
+    // wall-dependent rule, so every member installs it alike.
+    const ahead = committed ? "inside" : this.farFuture(claim["stamp"]);
+    if (ahead === "hostile") {
+      this.countRefusal(claimOfferKey(entryId, claim), true);
       return;
     }
     // ASF-004, mirroring ReplicatedSpace: bound what a remote claim may assert
@@ -2451,7 +3230,22 @@ export class Peer {
         || expires > this.now() + wire.MAX_CLAIM_HOLD_MILLIS) {
       return;
     }
+    // HLC round six, 2026-11-08 (R6), Java's two checks in mergeClaim's order, on gossip alone as Java's
+    // log path skips them: a claim cannot predate the entry it answers by more than the drift ceiling,
+    // and a claim contesting another holder's claim with a stamp older than the ceiling plus one settle
+    // window is a queue-jump, since LEASE_RACE picks the lowest stamp. Each drop counts nothing.
+    if (!committed && this.claimOutOfTime(entryId, claim, current)) {
+      return;
+    }
+    if (ahead === "deferred") {
+      this.countOnce(this.deferredStamps, claimOfferKey(entryId, claim), () => this.stampsFarFutureDeferred++);
+      return;
+    }
+    this.observeClaimLease(signed);
     this.claims.set(entryId, wire.mergeClaims(this.claims.get(entryId), signed));
+    if (this.collector === null) {
+      this.collector = this.every(COLLECT_PERIOD_MILLIS, () => this.collectTombstones()); // R10: claims expire too
+    }
     this.onClaim?.(entryId, this.claims.get(entryId)!);
     this.wakeFoldWaiters();
   }
@@ -2462,13 +3256,44 @@ function revocationDigests(): Dict {
   return Object.fromEntries(revocation.STREAMS.map((stream) => [stream, new Uint8Array()]));
 }
 
-/** An HLC stamp's physical milliseconds, or null when it is not a stamp. */
-function physicalOrNull(stamp: unknown): number | null {
-  try {
-    return wire.hlcPhysical(stamp);
-  } catch {
-    return null;
-  }
+/** The value of an entry's payload, or null when it is not here yet or unreadable ({@link readDocument}). */
+function applicationValue(raw: Uint8Array | null): { value: Dict } | null {
+  return raw === null ? null : readDocument(raw) as { value: Dict } | null;
+}
+
+/** Whether a decoded item is a map, the shape of a delta, a state, and a claim. */
+function isDict(value: unknown): value is Dict {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    && !(value instanceof Uint8Array) && !(value instanceof CborDouble);
+}
+
+/**
+ * The state view a state signature covers (SPEC §11a.4): the one verifyState checks, and the signed
+ * content a refusal is keyed on (HLC round four, 2026-11-08, D5).
+ */
+function stateViewOf(dto: Dict, record: Dict): Dict {
+  const signer = dto["signer"] ?? null;
+  const signedAt = dto["signedAt"] ?? null;
+  return wire.stateSignView(String(record["spaceId"]), String(record["entryId"]), (dto["adds"] as Dict[]) ?? [],
+    (dto["removes"] as Dict[]) ?? [], wire.leaseStampOf(dto), dto["leaseValue"] as Dict,
+    Boolean(dto["completed"]), signer === null ? null : String(signer), signedAt === null ? null : String(signedAt));
+}
+
+/**
+ * The key a state offer is judged under, its signed content alone (HLC round four, 2026-11-08, D5),
+ * as Java's: the entry, the issue stamp, and the SHA-256 of the signed state view.
+ */
+function stateOfferKey(dto: Dict, record: Dict): string {
+  return `state:${String(record["entryId"])}=${String(record["issued"])}/${toHex(cryptoPort().sha256(dumps(stateViewOf(dto, record))))}`;
+}
+
+/**
+ * The key a claim offer is judged under, as Java's: the SHA-256 of its canonical TakeClaim encoding,
+ * the bytes its signature covers whatever order the map arrived in (HLC round five, 2026-11-08,
+ * E13), and its entry.
+ */
+function claimOfferKey(entryId: string, claim: Dict): string {
+  return `claim:${toHex(cryptoPort().sha256(dumps(wire.canonicalClaim(claim) ?? claim)))}@${entryId}`;
 }
 
 /** The state join (ASF-017), exported so the conformance suite can prove it. */
@@ -2484,6 +3309,65 @@ export function nameRecordless(state: Dict, itemId: unknown): void {
   if (parts.length >= 2 && ["r", "d", "x", "c"].includes(parts[0]) && parts[1].length > 0) {
     state["entryId"] = parts[1];
   }
+}
+
+/**
+ * When the entry of `dto` lapses: its lease register, which a renewal moves, else its record's first
+ * lease (HLC round five, 2026-11-08: every read, take, and sweep judges the renewed lease).
+ */
+export function leaseExpiryOf(dto: Dict): number {
+  const lease = (dto["leaseValue"] ?? (dto["record"] as Dict | undefined)?.["lease"]) as Dict | undefined;
+  return Number(lease?.["expiresAtMillis"] ?? 0);
+}
+
+/**
+ * Whether the entry of `dto` is present (Java's EntryState.present, HLC round five, 2026-11-08):
+ * uncompleted, with an add dot no remove covers.
+ */
+export function present(dto: Dict): boolean {
+  if (dto["completed"]) {
+    return false;
+  }
+  const adds = (dto["adds"] as Dict[] | undefined) ?? [];
+  const removes = (dto["removes"] as Dict[] | undefined) ?? [];
+  if (removes.length === 0) {
+    return adds.length > 0; // the common case, judged on every sweep without a set
+  }
+  const removed = new Set(removes.map(dotKey));
+  return adds.some((dot) => !removed.has(dotKey(dot)));
+}
+
+/**
+ * Whether `dto` lies past its collection horizon (SPEC §7.3, Java's SpaceStateCrdt.collectable, HLC
+ * round five, 2026-11-08): the entry is no longer live, and its lease expired LAPSED_GRACE_MILLIS ago
+ * (at most twice the longest lease) for a lapse, or twice the longest lease ago for a completion or a
+ * withdrawal.
+ */
+export function collectable(dto: Dict, nowMillis: number, longestLeaseMillis: number): boolean {
+  const expiry = leaseExpiryOf(dto);
+  const live = present(dto);
+  if (live && expiry > nowMillis) {
+    return false;
+  }
+  const twice = 2 * Math.max(0, longestLeaseMillis);
+  return expiry + (live ? Math.min(twice, LAPSED_GRACE_MILLIS) : twice) <= nowMillis;
+}
+
+/**
+ * Whether every dot in a state's adds and removes names the record issuer's peer as its replica (ASF-025,
+ * Java's ReplicatedSpace.dotsBoundToIssuer). The issuer is an AgentId, `<peerId>/<localName>` (R5).
+ */
+function dotsBoundToIssuer(dto: Dict, record: Dict): boolean {
+  const issuer = String(record["issuer"]);
+  const peer = issuer.substring(0, issuer.indexOf("/"));
+  const dots = [...((dto["adds"] as Dict[] | undefined) ?? []), ...((dto["removes"] as Dict[] | undefined) ?? [])];
+  return dots.every((dot) => dot["replica"] === peer);
+}
+
+/** The identity of a dot, its replica and counter, as unionDots keys it. */
+function dotKey(dot: unknown): string {
+  const d = (dot ?? {}) as Dict;
+  return `${String(d["replica"] ?? "")}\u0000${Number(d["counter"] ?? 0)}`;
 }
 
 export function joinStates(previous: Dict, incoming: Dict): Dict {
@@ -2506,7 +3390,7 @@ function unionDots(a: unknown, b: unknown): Dict[] {
   for (const dot of [...(Array.isArray(a) ? a : []), ...(Array.isArray(b) ? b : [])]) {
     if (dot !== null && typeof dot === "object") {
       const d = dot as Dict;
-      seen.set(`${String(d["replica"] ?? "")}\u0000${Number(d["counter"] ?? 0)}`, d);
+      seen.set(dotKey(d), d);
     }
   }
   return [...seen.entries()]

@@ -7,6 +7,7 @@
 import assert from "node:assert/strict";
 import { createServer, Server, Socket } from "node:net";
 import test from "node:test";
+import { concat } from "../src/bytes.js";
 import { dumps } from "../src/cbor.js";
 import { Identity } from "../src/identity.js";
 import { Peer } from "../src/peer.js";
@@ -88,7 +89,7 @@ test("stale and far-ahead frames are dropped quietly (ROBUSTNESS.md §3.3)", () 
     stamp(now + wire.MAX_HLC_SKEW_MILLIS + 60_000)));
   assert.deepEqual(peer.kinds(), []);
   assert.equal(peer.frames.stale, 1);
-  assert.equal(peer.frames.ahead, 1);
+  assert.equal(peer.frames.framesFarFuture, 1);
   // Inside both windows the frames are live.
   peer.drive(frame(other, "PING", wire.pingBody(3), peer.identity.peerId,
     stamp(now - wire.MAX_FRAME_AGE_MILLIS / 2)));
@@ -97,12 +98,12 @@ test("stale and far-ahead frames are dropped quietly (ROBUSTNESS.md §3.3)", () 
   assert.deepEqual(peer.kinds(), ["ACK", "ACK"]);
 });
 
-test("unknown kinds are ignored and counted, never fatal (ROBUSTNESS.md §3.5)", () => {
+test("kinds this client does not speak are ignored and counted, never fatal (ROBUSTNESS.md §3.5)", () => {
   const peer = new CapturingPeer();
   const other = Identity.generate();
   const now = peer.now();
   // SESSION_HELLO is spoken since 0.4.0 (a malformed one is ignored, neither counted nor fatal).
-  const kinds = ["HAVE", "GRAFT", "PRUNE", "BATCH", "FUTURE_KIND"];
+  const kinds = ["HAVE", "GRAFT", "PRUNE", "BATCH"];
   kinds.forEach((kind, i) => {
     peer.drive(frame(other, kind, dumps({ anything: i }), peer.identity.peerId, stamp(now, i)));
   });
@@ -110,6 +111,14 @@ test("unknown kinds are ignored and counted, never fatal (ROBUSTNESS.md §3.5)",
   for (const kind of kinds) {
     assert.equal(peer.ignoredKinds.get(kind), 1, kind);
   }
+  // HLC round six, 2026-11-08 (P2): a kind is a constant of Envelope.Kind, so a name outside the enum
+  // makes the frame undecodable, as Java's decoder refuses it, and the peer counts it as malformed.
+  const future = wire.encodeFrame(wire.envelope(GROUP, "FUTURE_KIND", other.peerId, stamp(now, 50), dumps({}),
+    peer.identity.peerId), other);
+  assert.equal(wire.decodeFrame(future), null);
+  peer.feed(concat(new Uint8Array(4), future));
+  assert.equal(peer.malformedFrames, 1);
+  assert.equal(peer.ignoredKinds.get("FUTURE_KIND"), undefined);
   peer.drive(frame(other, "PING", wire.pingBody(9), peer.identity.peerId, stamp(now, 99)));
   assert.deepEqual(peer.kinds(), ["ACK"], "the reader is still alive");
 });
@@ -261,4 +270,77 @@ test("close by the owner is final (ROBUSTNESS.md §3.6)", async () => {
   } finally {
     seed.close();
   }
+});
+
+test("with its redial off a peer leaves a lost link to its owner's next dial (swarm retries, ROBUSTNESS.md §10.3 E5)", async () => {
+  // A host whose own durable timer owns every dial, as the workers cell's alarm does, turns the core's redial off.
+  const seed = new FakeSeed();
+  await seed.listen();
+  const peer = new Peer(Identity.generate(), GROUP);
+  peer.reconnectIntervalMs = 100;
+  peer.redial = false;
+  try {
+    await peer.connect("127.0.0.1", seed.port);
+    assert.ok(await until(() => seed.kindsOn(0).length >= 2, 5000));
+    seed.connections[0].destroy();
+    assert.ok(await until(() => !peer.connected(), 5000), "the link is down");
+    await new Promise((r) => setTimeout(r, 400)); // past every pause of a quick drop
+    assert.equal(seed.connections.length, 1, "the core dialed nothing on its own");
+    assert.equal(peer.reconnects, 0);
+    await peer.connect("127.0.0.1", seed.port);
+    assert.ok(peer.connected(), "the owner's dial brings the link back");
+    assert.ok(await until(() => seed.kindsOn(1).length >= 2, 5000), "and the peer introduces itself on it");
+  } finally {
+    peer.close();
+    seed.close();
+  }
+});
+
+test("reconnect rounds back off and go on until the owner closes the peer (swarm retries, ROBUSTNESS.md §10.3 E5)", async () => {
+  const peer = new Peer(Identity.generate(), GROUP);
+  peer.reconnectIntervalMs = 20;
+  const internals = peer as unknown as {
+    running: boolean;
+    dial(seed: unknown): Promise<void>;
+    reconnect(rounds: number, lastTried: number): void;
+  };
+  const dials: number[] = [];
+  internals.running = true;
+  peer.seeds = [{ host: "127.0.0.1", port: 9, scheme: "tcp" } as never];
+  internals.dial = () => {
+    dials.push(Date.now());
+    if (dials.length >= 8) {
+      internals.running = false; // the owner closes the peer
+    }
+    return Promise.reject(new Error("refused"));
+  };
+  internals.reconnect(0, 0);
+  assert.ok(await until(() => dials.length >= 8, 5000), `the dials went on: ${dials.length}`);
+  const gaps = dials.slice(1).map((t, i) => t - dials[i]!);
+  assert.ok(gaps[0]! >= 18 && gaps[2]! >= 75, `the pauses back off: ${gaps}`);
+  assert.ok(gaps.every((g) => g <= 120 * 1.25 + 60), `and stop growing at six times the interval: ${gaps}`);
+});
+
+test("a seed that drops each link at once gets the backoff and no dial loop (swarm retries, ROBUSTNESS.md §10.6)", async () => {
+  // A seed that accepts every dial and closes it at once, as one that refuses this peer or is still starting does:
+  // a link that ends within the reconnect interval counts as a failed round of dials.
+  const dials: number[] = [];
+  const server = createServer((socket: Socket) => {
+    dials.push(Date.now());
+    socket.destroy();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as { port: number }).port;
+  const peer = new Peer(Identity.generate(), GROUP);
+  peer.reconnectIntervalMs = 100;
+  try {
+    await peer.connect("127.0.0.1", port);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  } finally {
+    peer.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+  assert.ok(dials.length >= 2 && dials.length <= 8, `${dials.length} dials in 1.5 s`);
+  const gaps = dials.slice(1).map((t, i) => t - dials[i]!);
+  assert.ok(gaps.every((g) => g >= 90), `each dial waits its pause: ${gaps}`);
 });

@@ -47,13 +47,26 @@ import { HOLDING_TYPE, REASON_NOT_HELD, REASON_OVER_BUDGET, REASON_POLICY, REASO
   SEALING_GROUP_KEY, SEALING_NONE, TYPE as CONTENT_TYPE, holdingTags } from "../capabilities/content.js";
 import { instantIso } from "../identity.js";
 import type { Peer } from "../peer.js";
+import { readRecord, type Schema } from "../records.js";
 import { durationMillis } from "../space.js";
 import type { Dict } from "../wire.js";
 import * as cids from "./cids.js";
+import * as dcz from "./dcz.js";
 import { NodeStore } from "./store.js";
+import { SketchServer, SketchSession, SketchSet, MAX_SKETCH_BYTES } from "./sync.js";
+import type { Outcome } from "./sync.js";
 
 export const NODE_WANT = 8, NODES = 9, TREE_WANT = 10, TREE_END = 11;
+/**
+ * A possession challenge (PDT 2 phase 7, P2-C-01; srad/agentspaces-pdt2.md §3.2.4, §6.10.3 row 15): a level-2 form,
+ * answered with `NODES` for the picks held and `REJECT` reason 1 for a root held not at all.
+ */
+export const CHALLENGE = 12;
 export const END_DONE = 1, END_BUDGET = 2, END_HAVES_NOT_HELD = 3, END_WALK_CAP = 4;
+/** A reconciliation round answering a sketch `TREE_WANT`: an empty frontier and the reply in `sketch` (rule 13). */
+export const END_SKETCH = 5;
+/** The most picks one `CHALLENGE` names (§3.2.4). */
+export const MAX_PICKS = 16;
 export const MAX_WANT_CIDS = 256;
 export const MAX_NODES_BYTES = 4 * 1024 * 1024;
 export const MAX_HAVES = 64;
@@ -64,6 +77,32 @@ export const MAX_WALK_NODES = 100_000;
 export const TREE_INDEX = -1;
 export const TREES_PARAMETER = "trees";
 export const TREES_VERSION = "1";
+/**
+ * The PDT feature level on the content-swarm advertisement (PDT 2 phase 0, P2-F-05; srad/agentspaces-pdt2.md
+ * §6.10.2): a member sends a level-2 form (`TREE_WANT.sketch`, `TREE_END.sketch`, `NODES.deltas`, tag 12)
+ * only to a member whose newest unexpired advertisement states 2 or above. `trees` stays "1", which 0.5.0
+ * peers compare exactly. This client advertises no level, so it stands at level 1 until its decoders carry
+ * every level-2 schema of §6.10.4 (P2-C-01).
+ */
+export const PDT_PARAMETER = "pdt";
+/** The PDT feature level this client stands at by default (PDT 2 phase 7, P2-C-01). */
+export const PDT_LEVEL = 2;
+/** "0", or a non-zero ASCII digit followed by ASCII digits: the one spelling of each level. */
+const CANONICAL_DECIMAL = /^(?:0|[1-9][0-9]*)$/;
+
+/**
+ * The PDT feature level a content-swarm advertisement states (P2-F-05): its `pdt` parameter as canonical
+ * decimal text, and level 1 for an absent advertisement, an absent parameter, or any other value, since
+ * every 0.5.0 peer that advertises `trees = "1"` stands there. A level past 2^53 - 1 reads as 2^53 - 1.
+ */
+export function featureLevel(ad: Dict | null): number {
+  const parameters = ad?.["parameters"];
+  const text = typeof parameters === "object" && parameters !== null ? (parameters as Dict)[PDT_PARAMETER] : undefined;
+  if (typeof text !== "string" || !CANONICAL_DECIMAL.test(text)) {
+    return 1;
+  }
+  return Math.max(1, Math.min(Number(text), Number.MAX_SAFE_INTEGER));
+}
 export const SEALING_AAD_PREFIX = "aspace:pdt|";
 export const CAPABILITY_AD_TYPE = "CapabilityAdvertisement";
 export const ADVERTISEMENT_TTL_MILLIS = 15 * 60 * 1000;
@@ -81,7 +120,56 @@ export const sealedNodes = (req: number, sealed: Uint8Array, epoch: number, miss
 export const treeWant = (req: number, root: string, haves: string[], budget = MAX_BUDGET): Dict =>
   ({ t: TREE_WANT, req, root, haves, budget, sketch: null });
 export const treeEnd = (req: number, frontier: string[], reason: number): Dict => ({ t: TREE_END, req, frontier, reason });
+/** A sketch `TREE_WANT` (rule 12, P2-K-02): root `""`, no haves, and the sketch; sent only to a level-2 member. */
+export const sketchWant = (req: number, sketch: Uint8Array, budget = 64 * 1024): Dict =>
+  ({ t: TREE_WANT, req, root: "", haves: [], budget, sketch });
+/** A reconciliation round's answer (rule 13): reason 5, an empty frontier, and the reply appended last. */
+export const sketchEnd = (req: number, sketch: Uint8Array): Dict => ({ t: TREE_END, req, frontier: [], reason: END_SKETCH, sketch });
+/** A possession challenge (P2-S-07): picks of nodes by CID, or of chunk groups by `{cid, offset, length}`. */
+export const challengeMessage = (req: number, root: string, picks: Dict[]): Dict => ({ t: CHALLENGE, req, root, picks });
 export const treeReject = (root: string, reason: number): Dict => ({ t: REJECT, root, index: TREE_INDEX, reason });
+
+/**
+ * The tree messages and the tree `REJECT` as Java's `Messages` records declare them (PDT 2 phase 1,
+ * P2-X-09): every field present in this order, a null written as null, and no other field, so a receiver
+ * reads a frame as Java's `fromWire` does and a relabelled one is undecodable.
+ */
+const NODE_DELTA: Schema = { record: "Messages.NodeDelta", fields: [["cid", "String", "nonNull"], ["base", "String", "nonNull"],
+  ["dcz", "bytes", "nonNull"]] };
+const PICK: Schema = { record: "Messages.Pick", fields: [["cid", "String", "nonNull"], ["offset", "Long", "omitNull"],
+  ["length", "Integer", "omitNull"]] };
+/**
+ * The level-2 schemas of §6.10.4 (PDT 2 phase 7, P2-C-01, P2-F-07) join the level-1 fields: `NODES.deltas` and
+ * `TREE_END.sketch` appended last and absent when null, so a message without them keeps its level-1 bytes, and the
+ * `CHALLENGE` of tag 12.
+ */
+const TREE_SCHEMAS: ReadonlyMap<number, Schema> = new Map<number, Schema>([
+  [NODE_WANT, { record: "Messages.NodeWant", fields: [["t", "int"], ["req", "int"], ["cids", { listOf: "String" }]] }],
+  [NODES, { record: "Messages.Nodes", fields: [["t", "int"], ["req", "int"], ["nodes", { listOf: "bytes" }],
+    ["sealed", "bytes"], ["epoch", "Long"], ["missing", { listOf: "String" }], ["deltas", { listOf: NODE_DELTA }, "omitNull"]] }],
+  [TREE_WANT, { record: "Messages.TreeWant", fields: [["t", "int"], ["req", "int"], ["root", "String"],
+    ["haves", { listOf: "String" }], ["budget", "long"], ["sketch", "bytes"]] }],
+  [TREE_END, { record: "Messages.TreeEnd", fields: [["t", "int"], ["req", "int"], ["frontier", { listOf: "String" }],
+    ["reason", "int"], ["sketch", "bytes", "omitNull"]] }],
+  [CHALLENGE, { record: "Messages.Challenge", fields: [["t", "int"], ["req", "int"], ["root", "String"],
+    ["picks", { listOf: PICK }]] }],
+  [REJECT, { record: "Messages.Reject", fields: [["t", "int"], ["root", "String"], ["index", "int"], ["reason", "int"]] }],
+]);
+
+/**
+ * A tree message or tree `REJECT` read strictly (PDT 2 phase 1, P2-X-09): the frame's tag names its
+ * schema, the bytes are exactly that record's wire encoding, and a tree message keeps every bound of
+ * {@link treeViolation}; null for anything else, which the receiver counts and strikes nobody for.
+ */
+export function readTreeMessage(payload: Uint8Array): Dict | null {
+  const tag = peekTag(payload);
+  const schema = TREE_SCHEMAS.get(tag);
+  const msg = schema === undefined ? null : readRecord(payload, schema);
+  if (msg === null || msg["t"] !== tag) {
+    return null;
+  }
+  return tag === REJECT || treeViolation(msg) === null ? msg : null;
+}
 
 /** The tag of a content-swarm frame from its first bytes (the map's first key is `t`), or 0. */
 export function peekTag(payload: Uint8Array): number {
@@ -113,6 +201,25 @@ function cidList(value: unknown, max: number): string[] | null {
   return value as string[];
 }
 
+/** Whether a `TREE_WANT` is a reconciliation round (rule 12): root `""` with a sketch. */
+export function isSketchWant(msg: Dict): boolean {
+  return msg["t"] === TREE_WANT && msg["root"] === "" && msg["sketch"] instanceof Uint8Array;
+}
+
+/** Whether text is a BLAKE3 identity in its canonical form: CIDv1 `raw` over multihash 0x1e, 32 bytes (P2-B-01). */
+function isIdentity(text: unknown): boolean {
+  if (typeof text !== "string" || !text.startsWith("b")) {
+    return false;
+  }
+  try {
+    const binary = cids.base32Decode(text.slice(1));
+    return binary.length === 36 && binary[0] === 0x01 && binary[1] === cids.RAW && binary[2] === 0x1e && binary[3] === 0x20
+      && "b" + cids.base32Lower(binary) === text;
+  } catch {
+    return false;
+  }
+}
+
 /** The first bound a tree message breaks (PD-X-02), or null. */
 export function treeViolation(msg: Dict): string | null {
   const req = msg["req"];
@@ -131,6 +238,10 @@ export function treeViolation(msg: Dict): string | null {
       }
       if ((sealed != null) !== (msg["epoch"] != null)) {
         return "epoch is present iff sealed is";
+      }
+      if (sealed != null && msg["deltas"] != null) {
+        // PDT 2 phase 4 measures (srad/agentspaces-pdt2.md §10.14): frames travel in plaintext answers only
+        return "a sealed NODES carries no deltas";
       }
       let bytes = 0;
       if (nodes != null) {
@@ -151,10 +262,33 @@ export function treeViolation(msg: Dict): string | null {
       if (bytes > MAX_NODES_BYTES) {
         return `a NODES carries at most ${MAX_NODES_BYTES} bytes of nodes, got ${bytes}`;
       }
+      const deltas = msg["deltas"];
+      if (deltas != null) {
+        if (!Array.isArray(deltas) || deltas.length > MAX_WANT_CIDS) {
+          return `a NODES carries at most ${MAX_WANT_CIDS} deltas`;
+        }
+        for (const delta of deltas as Dict[]) {
+          if (!cids.isCid(delta["cid"]) || !cids.isCid(delta["base"]) || !(delta["dcz"] instanceof Uint8Array)) {
+            return "deltas holds an entry without a CID, a base CID, and a frame";
+          }
+          bytes += delta["dcz"].length;
+        }
+        if (bytes > MAX_NODES_BYTES) {
+          return `a NODES carries at most ${MAX_NODES_BYTES} bytes of nodes and deltas, got ${bytes}`;
+        }
+      }
       const missing = cidList(msg["missing"], MAX_WANT_CIDS);
       return missing === null ? `a NODES names at most ${MAX_WANT_CIDS} missing CIDs` : null;
     }
     case TREE_WANT: {
+      if (isSketchWant(msg)) {
+        const listed = msg["haves"];
+        if (Array.isArray(listed) && listed.length > 0) {
+          return "a sketch TREE_WANT names no haves";
+        }
+        const sketchBudget = Number(msg["budget"]);
+        return sketchBudget > 0 && sketchBudget <= MAX_BUDGET ? null : `budget is outside (0, ${MAX_BUDGET}]`;
+      }
       if (!cids.isCid(msg["root"])) {
         return "root is not a CID";
       }
@@ -171,7 +305,35 @@ export function treeViolation(msg: Dict): string | null {
         return `a TREE_END names at most ${MAX_FRONTIER} frontier cids`;
       }
       const reason = Number(msg["reason"]);
-      return reason >= END_DONE && reason <= END_WALK_CAP ? null : "unknown reason";
+      if (reason < END_DONE || reason > END_SKETCH) {
+        return "unknown reason";
+      }
+      if ((reason === END_SKETCH) !== (msg["sketch"] != null)) {
+        return `a TREE_END carries a sketch exactly when its reason is ${END_SKETCH}`;
+      }
+      return reason === END_SKETCH && frontier.length > 0 ? "a sketch TREE_END carries an empty frontier" : null;
+    }
+    case CHALLENGE: {
+      if (!cids.isCid(msg["root"])) {
+        return "root is not a CID";
+      }
+      const picks = msg["picks"];
+      if (!Array.isArray(picks) || picks.length === 0 || picks.length > MAX_PICKS) {
+        return `a CHALLENGE names 1 to ${MAX_PICKS} picks`;
+      }
+      for (const pick of picks as Dict[]) {
+        const offset = pick["offset"], length = pick["length"];
+        if ((offset == null) !== (length == null)) {
+          return "a pick carries both or neither of offset and length";
+        }
+        if (offset == null ? !cids.isCid(pick["cid"]) : !isIdentity(pick["cid"])) {
+          return "a node pick names a sha2-256 CID and a chunk-group pick a BLAKE3 identity";
+        }
+        if (offset != null && (Number(offset) < 0 || Number(length) <= 0 || Number(length) > MAX_NODES_BYTES)) {
+          return `a chunk-group pick holds an offset of at least 0 and a length in (0, ${MAX_NODES_BYTES}]`;
+        }
+      }
+      return null;
     }
     default:
       return "unknown tag";
@@ -446,6 +608,63 @@ export class TreeServer {
     this.host.send(from, treeEnd(req, frontier, reason));
   }
 
+  /**
+   * Answers a `CHALLENGE` (PDT 2 phase 7, P2-C-01, P2-S-07; Java's TreeServer.serve(Challenge)): each pick is granted
+   * as a `NODE_WANT`'s CID is, the held picks go back in `NODES` under the challenge's `req` with the rest in
+   * `missing`, and a holder of no pick refuses the root with `REJECT` reason 1. A chunk-group pick is answered missing.
+   */
+  async serveChallenge(from: string, challenge: Dict): Promise<void> {
+    if (treeViolation(challenge) !== null) {
+      this.dropped += 1;
+      return;
+    }
+    const root = String(challenge["root"]);
+    const req = Number(challenge["req"]);
+    const picks = challenge["picks"] as Dict[];
+    if (!this.host.mayServe(from, root) || picks.some((p) => !this.host.mayServe(from, String(p["cid"])))) {
+      this.reject(from, root, REASON_POLICY);
+      return;
+    }
+    if (!(await this.canSeal(from, req))) {
+      this.reject(from, root, REASON_POLICY);
+      return;
+    }
+    const held: Uint8Array[] = [];
+    const missing: string[] = [];
+    let total = 0;
+    for (const pick of picks) {
+      const bytes = pick["offset"] == null ? this.store.get(String(pick["cid"])) : undefined;
+      if (bytes === undefined) {
+        missing.push(String(pick["cid"]));
+      } else {
+        held.push(bytes);
+        total += bytes.length;
+      }
+    }
+    if (held.length === 0) {
+      this.reject(from, root, REASON_NOT_HELD);
+      return;
+    }
+    if (!this.host.withinUploadBudget(total)) {
+      this.reject(from, root, REASON_OVER_BUDGET);
+      return;
+    }
+    let batch: Uint8Array[] = [];
+    let packed = MESSAGE_FRAMING_BYTES;
+    for (const bytes of held) {
+      if (packed + bytes.length + NODE_FRAMING_BYTES > MAX_NODES_BYTES && batch.length > 0) {
+        if (!(await this.flush(from, req, root, batch, null))) {
+          return;
+        }
+        batch = [];
+        packed = MESSAGE_FRAMING_BYTES;
+      }
+      batch.push(bytes);
+      packed += bytes.length + NODE_FRAMING_BYTES;
+    }
+    await this.flush(from, req, root, batch, missing);
+  }
+
   private reachableFor(have: string, limit: number): Set<string> {
     const now = this.now();
     const cached = this.pruneCache.get(have);
@@ -512,6 +731,13 @@ export class TreeServer {
 
 // ------------------------------------------------------------------ the fetch
 
+/**
+ * The first bench of a source that answered `missing` for a CID, in milliseconds; each later such answer doubles it up
+ * to {@link MISSING_BENCH_MAX_MILLIS} (swarm retries, ROBUSTNESS.md §10.3 B6 and E4).
+ */
+export const MISSING_BENCH_MILLIS = 1000;
+export const MISSING_BENCH_MAX_MILLIS = 16_000;
+
 class Source {
   window = 2;
   inFlight = 0;
@@ -519,13 +745,34 @@ class Source {
   timeouts = 0;
   droppedUntil = 0;
   bytesVerified = 0;
-  /** CIDs this source answered `missing` for. */
-  readonly lacks = new Set<string>();
+  /** Whether a frame of this source did not open, so the fetch opens none of its later frames (P2-Q-SEC-05). */
+  framesRefused = false;
+  /**
+   * CIDs this source answered `missing` for, each with the clock time its bench ends and the answers so far: a holder
+   * that lacked a node may hold it later, so the fetch asks it again once the bench ends, with a random spread.
+   */
+  private readonly benched = new Map<string, { until: number; answers: number }>();
 
   constructor(readonly peer: string, public via: string[] | null) {}
 
   usable(now: number): boolean {
     return this.droppedUntil <= now;
+  }
+
+  lacks(cid: string, now: number): boolean {
+    const bench = this.benched.get(cid);
+    return bench !== undefined && now < bench.until;
+  }
+
+  lack(cid: string, now: number): void {
+    const bench = this.benched.get(cid) ?? { until: 0, answers: 0 };
+    this.benched.set(cid, bench);
+    if (now < bench.until) {
+      return;
+    }
+    bench.answers += 1;
+    const wait = Math.min(MISSING_BENCH_MAX_MILLIS, MISSING_BENCH_MILLIS * 2 ** (bench.answers - 1));
+    bench.until = now + wait + Math.random() * wait / 2;
   }
 }
 
@@ -564,6 +811,8 @@ export interface FetchHost {
   open(from: string, req: number, msg: Dict): Promise<Uint8Array[] | null>;
   strike(peer: string, reason: string): void;
   nowMillis(): number;
+  /** Whether this peer reads the level-2 forms (P2-F-05), so a fetch applies `NODES.deltas` (P2-Z-01). */
+  readsDeltas(): boolean;
 }
 
 /**
@@ -595,6 +844,9 @@ export class TreeFetch {
   bytesReceived = 0;
   nodesReceived = 0;
   roundTrips = 0;
+  /** Chunks rebuilt from an intra-chunk delta and verified, and deltas refused (PDT 2 phase 7, P2-Z-01). */
+  deltasApplied = 0;
+  deltasRefused = 0;
   private readonly started: number;
   private sourcesReadAt = 0;
   private stalledSince = 0;
@@ -786,7 +1038,7 @@ export class TreeFetch {
     // the root first, once, while its answer is outstanding
     if (this.root !== null && !this.host.store.has(this.root)) {
       if (!this.rootAsked) {
-        const source = usable.find((s) => !s.lacks.has(this.root!));
+        const source = usable.find((s) => !s.lacks(this.root!, now));
         if (source !== undefined) {
           this.rootAsked = true;
           this.frontier.delete(this.root);
@@ -816,7 +1068,7 @@ export class TreeFetch {
       while (source.inFlight < source.window) {
         const batch: string[] = [];
         for (const cid of this.frontier) {
-          if (!source.lacks.has(cid) && !this.host.store.has(cid)) {
+          if (!source.lacks(cid, now) && !this.host.store.has(cid)) {
             batch.push(cid);
             if (batch.length >= MAX_WANT_CIDS) {
               break;
@@ -853,7 +1105,7 @@ export class TreeFetch {
         continue;
       }
       const other = usable.find((s) => s !== request.source && s.inFlight < s.window
-        && request.cids.some((cid) => !s.lacks.has(cid)));
+        && request.cids.some((cid) => !s.lacks(cid, now)));
       if (other === undefined) {
         continue;
       }
@@ -974,7 +1226,7 @@ export class TreeFetch {
       }
       for (const cid of missing) {
         if (request.cids.includes(cid)) {
-          s.lacks.add(cid);
+          s.lack(cid, this.host.nowMillis());
           if (!this.host.store.has(cid)) {
             this.frontier.add(cid);
           }
@@ -984,6 +1236,9 @@ export class TreeFetch {
       if (closed) {
         this.roundTrips += 1;
         this.release(request, false);
+        if (this.root !== null && missing.includes(this.root)) {
+          this.rootAsked = false; // asked again of another source, or of this one once its bench ends (swarm retries)
+        }
         request.cids.forEach((cid, i) => {
           if (!request.matched.has(i) && !this.host.store.has(cid) && !missing.includes(cid)) {
             this.frontier.add(cid);
@@ -1005,9 +1260,18 @@ export class TreeFetch {
         request.delivered += 1;
         this.accept(match, node, s, request.subtree);
       }
+      const deltas = msg["deltas"] as Dict[] | undefined;
+      if (deltas !== undefined && this.host.readsDeltas()) {
+        for (const delta of deltas) {
+          if (!this.acceptDelta(request, delta)) {
+            this.schedule();
+            return true;
+          }
+        }
+      }
       for (const cid of missing) {
         if (this.expected.has(cid)) {
-          s.lacks.add(cid);
+          s.lack(cid, this.host.nowMillis());
           if (!this.host.store.has(cid)) {
             this.frontier.add(cid);
           }
@@ -1068,15 +1332,67 @@ export class TreeFetch {
       s.droppedUntil = this.host.nowMillis() + TreeFetch.DROP_MILLIS;
       this.note(`source ${s.peer.slice(0, 10)} rejected (${reason}); dropped for a while`);
     } else {
-      s.lacks.add(root);
+      s.lack(root, this.host.nowMillis());
     }
     this.schedule();
     return true;
   }
 
-  private accept(cid: string, node: Uint8Array, s: Source, subtree: string | null): void {
-    this.bytesReceived += node.length;
-    s.bytesVerified += node.length;
+  /**
+   * Applies one delta of a `TREE_WANT` answer (PDT 2 phase 7, P2-Z-01, Java's TreeFetchSession.acceptDelta): the chunk
+   * it names must be one a verified node links, or its sender is struck; a delta over a base this store lacks, or
+   * that names no two chunks, is ignored and the chunk asked for by `NODE_WANT`; a frame that does not open costs no
+   * strike, and the fetch opens no later frame of that source (P2-Q-SEC-05); a frame that opens to bytes the chunk's
+   * CID does not name strikes its sender. Only the verified chunk is stored. Returns false when the source was struck.
+   */
+  private acceptDelta(request: Request, delta: Dict): boolean {
+    const s = request.source;
+    const cid = String(delta["cid"]), base = String(delta["base"]);
+    const frame = delta["dcz"] as Uint8Array;
+    if (!this.expected.has(cid)) {
+      this.strike(s, `a delta of TREE_WANT ${request.req} under ${request.subtree} names ${cid}, which no verified node links to`);
+      this.release(request, true);
+      return false;
+    }
+    if (this.host.store.has(cid)) {
+      this.bytesReceived += frame.length; // a duplicate delivery still costs its bytes
+      return true;
+    }
+    if (cids.parse(cid).codec !== cids.RAW || cids.parse(base).codec !== cids.RAW) {
+      this.deltasRefused += 1;
+      this.frontier.add(cid);
+      return true;
+    }
+    const held = this.host.store.get(base);
+    if (s.framesRefused || held === undefined) {
+      this.frontier.add(cid); // asked for whole by NODE_WANT
+      return true;
+    }
+    let chunk: Uint8Array;
+    try {
+      chunk = dcz.decode(held, frame);
+    } catch (e) {
+      this.deltasRefused += 1;
+      s.framesRefused = true;
+      this.note(`a delta for ${cid.slice(0, 16)} refused (${e instanceof Error ? e.message : String(e)}); asking for the chunk whole`);
+      this.frontier.add(cid);
+      return true;
+    }
+    if (cids.of(chunk, cids.RAW) !== cid) {
+      this.deltasRefused += 1;
+      this.strike(s, `a delta of TREE_WANT ${request.req} rebuilds bytes that do not hash to ${cid}`);
+      this.release(request, true);
+      return false;
+    }
+    this.deltasApplied += 1;
+    this.accept(cid, chunk, s, request.subtree, frame.length);
+    return true;
+  }
+
+  /** Stores a verified node and follows its links; `wireBytes` is what it cost to receive (a delta's frame). */
+  private accept(cid: string, node: Uint8Array, s: Source, subtree: string | null, wireBytes = node.length): void {
+    this.bytesReceived += wireBytes;
+    s.bytesVerified += wireBytes;
     if (this.host.store.has(cid)) {
       return;
     }
@@ -1119,7 +1435,7 @@ export class TreeFetch {
     const usable = this.ordered(now);
     const anything = this.frontier.size > 0 || this.subtreesPending.length > 0 || (this.root !== null && !this.host.store.has(this.root));
     const stalled = this.requests.size === 0 && anything && (usable.length === 0
-      || [...this.frontier].every((cid) => usable.every((s) => s.lacks.has(cid))));
+      || [...this.frontier].every((cid) => usable.every((s) => s.lacks(cid, now))));
     if (!stalled) {
       this.stalledSince = 0;
       return;
@@ -1153,9 +1469,24 @@ export interface TreeExchangeOptions {
   advertises?: ((peer: string) => boolean) | null;
   /** Whether the group seals, when no advertisement says so (a keyless holder refuses in a sealing group). */
   groupSeals?: boolean;
+  /**
+   * The PDT feature level this member stands at (P2-F-05): {@link PDT_LEVEL} by default, or 1 for a member that reads
+   * and sends no level-2 form, as a 0.5.0 peer does.
+   */
+  level?: number;
 }
 
 interface HolderState { entryId: string | null; writtenAt: number; count: number; complete: boolean }
+
+/** The outcome of a possession challenge (P2-S-07): whether every pick verified within the deadline, and why not. */
+export interface ChallengeResult { passed: boolean; proven: number; picks: number; failure: string | null; millis: number }
+
+interface Challenge { root: string; store: string; req: number; picks: Set<string>; proven: Set<string>; sent: number;
+  deadline: number; resolve: (result: ChallengeResult) => void }
+
+/** The fixed part of a challenge's deadline (§3.2.4), and the round trip one hop of the path is taken to cost. */
+export const CHALLENGE_DEADLINE_MILLIS = 2000;
+const CHALLENGE_HOP_MILLIS = 250;
 
 /**
  * The tree exchange attached to a `Content`: routes tags 8 to 11 (and tree `REJECT`s) from the content
@@ -1171,12 +1502,19 @@ export class TreeExchange {
   private readonly mayServe: ((peer: string, cid: string) => boolean) | null;
   private readonly advertises: ((peer: string) => boolean) | null;
   private readonly groupSealsOption: boolean;
+  private readonly levelOption: number;
   private readonly holderState = new Map<string, HolderState>();
   private req = 0;
   private advertisedAt = 0;
   treeMessagesDropped = 0;
   nodesStruck = 0;
   bytesServed = 0;
+  /** The holder's side of a reconciliation, over the roots this member holds complete (PDT 2 phase 7, P2-K-02). */
+  readonly sketches: SketchServer;
+  private readonly sessions = new Set<SketchSession>();
+  private readonly challenges = new Map<string, Challenge>();
+  /** Reconciliation rounds started again after a late answer (swarm retries, ROBUSTNESS.md §10.2). */
+  sketchRetries = 0;
 
   constructor(readonly content: Content, readonly store: NodeStore, options: TreeExchangeOptions = {}) {
     this.peer = content.peer;
@@ -1185,6 +1523,8 @@ export class TreeExchange {
     this.mayServe = options.mayServe ?? null;
     this.advertises = options.advertises ?? null;
     this.groupSealsOption = options.groupSeals ?? false;
+    this.levelOption = options.level ?? PDT_LEVEL;
+    this.sketches = new SketchServer(() => this.heldRoots(), () => this.peer.now());
     this.server = new TreeServer(store, {
       mayServe: (from, cid) => this.mayServe === null || this.mayServe(from, cid),
       withinUploadBudget: () => true,
@@ -1196,19 +1536,27 @@ export class TreeExchange {
     const previous = this.peer.pipeHandlers.get(CONTENT_TYPE);
     this.peer.pipeHandlers.set(CONTENT_TYPE, (from, payload) => {
       const tag = peekTag(payload);
-      if (tag >= NODE_WANT && tag <= TREE_END) {
+      if (tag >= NODE_WANT && tag <= CHALLENGE) {
         this.onFrame(from, payload);
         return;
       }
       if (tag === REJECT) {
-        let msg: Dict | null = null;
-        try {
-          msg = loads(payload) as Dict;
-        } catch {
-          msg = null;
+        const msg = readTreeMessage(payload);
+        if (msg !== null && msg["index"] === TREE_INDEX && msg["root"] === "") {
+          for (const session of this.sessions) {
+            if (session.onReject(from, Number(msg["reason"]))) {
+              break;
+            }
+          }
+          return;
         }
         if (msg !== null && msg["index"] === TREE_INDEX) {
           const root = String(msg["root"]);
+          const challenge = [...this.challenges.values()].find((c) => c.store === from && c.root === root);
+          if (challenge !== undefined) {
+            this.settleChallenge(challenge, `refused with REJECT reason ${String(msg["reason"])}`);
+            return;
+          }
           for (const f of this.fetches.values()) {
             if (f.onReject(from, msg) && (f.root === root || f.bare.includes(root))) {
               break;
@@ -1233,13 +1581,20 @@ export class TreeExchange {
 
   // ---- the advertisement (PD-X-01)
 
-  /** This peer's content-swarm capability advertisement: piece sizes, sealing, seed mode, and `trees = "1"`. */
+  /**
+   * This peer's content-swarm capability advertisement: piece sizes, sealing, seed mode, `trees = "1"`, and at level 2
+   * `pdt = "2"` (PDT 2 phase 7, P2-C-01, P2-F-05), since this client's decoders carry every level-2 schema of §6.10.4.
+   */
   advertisement(): Dict {
     const now = this.peer.now();
+    const parameters: Dict = { pieceSizes: "65536-4194304", sealing: this.keys === null ? SEALING_NONE : SEALING_GROUP_KEY,
+      seedMode: "always", [TREES_PARAMETER]: TREES_VERSION };
+    if (this.level() >= 2) {
+      parameters[PDT_PARAMETER] = String(this.level());
+    }
     return { id: `aspace://${this.peer.group}/cap/content-swarm/${this.selfId}`, issuer: this.selfId, group: this.peer.group,
       issued: instantIso(now - (now % 1000)), ttl: "PT15M", capabilityType: CONTENT_TYPE, version: "0.1", binding: "pipe",
-      parameters: canonicalMap({ pieceSizes: "65536-4194304", sealing: this.keys === null ? SEALING_NONE : SEALING_GROUP_KEY,
-        seedMode: "always", [TREES_PARAMETER]: TREES_VERSION }), costHints: {} };
+      parameters: canonicalMap(parameters), costHints: {} };
   }
 
   /** Publishes the advertisement on the `ads` stream; `tick` renews it at half its lease. */
@@ -1272,6 +1627,16 @@ export class TreeExchange {
     }
     const ad = this.advertisementOf(peer);
     return ad !== null && ((ad["parameters"] as Dict | null) ?? {})[TREES_PARAMETER] === TREES_VERSION;
+  }
+
+  /** The PDT feature level this member stands at (P2-F-05). */
+  level(): number {
+    return this.levelOption;
+  }
+
+  /** A member's PDT feature level, from its newest unexpired content-swarm advertisement (P2-F-05). */
+  pdtLevel(peer: string): number {
+    return featureLevel(this.advertisementOf(peer));
   }
 
   /** Whether any member's current advertisement says the group's content travels sealed. */
@@ -1341,7 +1706,13 @@ export class TreeExchange {
       open: (from, req, msg) => this.open(from, req, msg),
       strike: (_peer, _reason) => { this.nodesStruck += 1; },
       nowMillis: () => this.peer.now(),
+      readsDeltas: () => this.level() >= 2,
     };
+  }
+
+  /** The members that hold a root, by their holdings (a retry asks these before the issuer; swarm retries). */
+  holders(root: string): string[] {
+    return [...new Set(this.content.holdings(root).map((h) => String(h["holder"])))];
   }
 
   /** Starts (or continues) fetching every node under `root` absent under the `haves` roots held here. */
@@ -1381,6 +1752,18 @@ export class TreeExchange {
       f.tick();
       if (f.done) {
         this.fetches.delete(key);
+      }
+    }
+    const now = this.peer.now();
+    for (const session of [...this.sessions]) {
+      session.tick(now);
+      if (session.finished) {
+        this.sessions.delete(session);
+      }
+    }
+    for (const challenge of [...this.challenges.values()]) {
+      if (now >= challenge.deadline) {
+        this.settleChallenge(challenge, `no answer within ${challenge.deadline - challenge.sent} ms`);
       }
     }
     for (const root of [...this.holderState.keys()]) {
@@ -1454,6 +1837,142 @@ export class TreeExchange {
     }
   }
 
+  // ---- reconciliation (PDT 2 phase 7, P2-K-02, P2-K-03)
+
+  /**
+   * The roots this member holds complete: the tree roots it holds and the flat artifacts whose every piece it holds,
+   * the set a reconciliation compares (Java's Content.heldRoots).
+   */
+  heldRoots(): string[] {
+    const out: string[] = [];
+    for (const root of this.holderState.keys()) {
+      if (this.store.complete(root)) {
+        out.push(root);
+      }
+    }
+    for (const root of this.content.store.roots()) {
+      const m = this.content.store.manifest(root);
+      if (m !== null && this.content.store.have(root).size >= Number(m["pieces"])) {
+        out.push(root);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Reconciles this member's held roots with another member's (P2-K-03): negentropy when `expected` is 0, else RIBLT
+   * for about that many differences, falling back to negentropy. A sketch goes only to a member at level 2 (P2-F-05),
+   * so a peer at level 1 rejects the promise at once. The outcome lists the roots this member holds and the other
+   * lacks, and the roots the other holds and this member lacks; the caller fetches what it needs.
+   */
+  reconcileHeld(peer: string, expected = 0): Promise<Outcome> {
+    if (this.level() < 2 || this.pdtLevel(peer) < 2) {
+      return Promise.reject(new Error(`${peer.slice(0, 10)} stands at level ${this.pdtLevel(peer)}; a sketch goes only to a`
+        + " member at level 2"));
+    }
+    const session = new SketchSession(peer, SketchSet.of(this.heldRoots()), expected, {
+      nowMillis: () => this.peer.now(),
+      nextReq: () => this.nextReq(),
+      send: (to, req, sketch) => {
+        const message = sketchWant(req, sketch, MAX_SKETCH_BYTES);
+        this.send(to, message);
+        return dumps(message).length;
+      },
+    });
+    this.sessions.add(session);
+    session.start();
+    const counted = (o: Outcome): Outcome => {
+      this.sketchRetries += o.retries;
+      return o;
+    };
+    return session.outcome.then(counted);
+  }
+
+  /**
+   * Answers a sketch `TREE_WANT` (rule 12): a member at level 1 drops it, as a 0.5.0 holder does; an asker this member
+   * reads at level 1 gets the level-1 `REJECT` reason 3 (PDT 2 phase 5 adversary, A6); otherwise the holder's answer
+   * goes back as a `TREE_END` of reason 5, a refusal as a `REJECT` for the root `""`, and a drop is counted.
+   */
+  private answerSketch(from: string, want: Dict): void {
+    if (this.level() < 2) {
+      this.treeMessagesDropped += 1;
+      return;
+    }
+    if (this.pdtLevel(from) < 2) {
+      this.send(from, treeReject("", REASON_POLICY));
+      return;
+    }
+    const answer = this.sketches.answer(from, Number(want["req"]), want["sketch"] as Uint8Array, Number(want["budget"]));
+    if (answer.kind === "reply") {
+      this.send(from, sketchEnd(Number(want["req"]), answer.sketch));
+    } else if (answer.kind === "refusal") {
+      this.send(from, treeReject("", answer.reason));
+    } else {
+      this.treeMessagesDropped += 1;
+    }
+  }
+
+  // ---- possession challenges (PDT 2 phase 7, P2-C-01, P2-S-07)
+
+  /**
+   * Challenges a member's possession of a tree root this member holds (P2-S-07): up to {@link MAX_PICKS} random nodes
+   * of the root, answered within the deadline of §3.2.4, 2 s plus eight round trips of the path, else the challenge
+   * fails. The member must stand at level 2 (P2-F-05). Each node that comes back verifies against its CID.
+   */
+  challenge(root: string, store: string): Promise<ChallengeResult> {
+    if (this.level() < 2 || this.pdtLevel(store) < 2) {
+      return Promise.reject(new Error(`${store.slice(0, 10)} stands at level ${this.pdtLevel(store)}; a challenge goes only to a`
+        + " member at level 2"));
+    }
+    const candidates = [...this.store.reachable(root)].filter((cid) => this.store.has(cid));
+    if (candidates.length === 0) {
+      return Promise.reject(new Error(`this member holds nothing of ${root} to pick from`));
+    }
+    for (let i = candidates.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [candidates[i], candidates[j]] = [candidates[j]!, candidates[i]!];
+    }
+    const picks = candidates.slice(0, MAX_PICKS);
+    const req = this.nextReq();
+    const sent = this.peer.now();
+    const roundTrip = this.content.hopsTo(store) * CHALLENGE_HOP_MILLIS;
+    return new Promise((resolve) => {
+      const challenge: Challenge = { root, store, req, picks: new Set(picks), proven: new Set(), sent,
+        deadline: sent + CHALLENGE_DEADLINE_MILLIS + 8 * roundTrip, resolve };
+      this.challenges.set(`${store}|${req}`, challenge);
+      this.send(store, challengeMessage(req, root, picks.map((cid) => ({ cid }))));
+    });
+  }
+
+  private async onChallengeNodes(challenge: Challenge, msg: Dict): Promise<void> {
+    const nodes = await this.open(challenge.store, challenge.req, msg);
+    if (nodes === null) {
+      this.settleChallenge(challenge, "an answer this member could not open");
+      return;
+    }
+    for (const node of nodes) {
+      const cid = [...challenge.picks].find((pick) => cids.verifies(pick, node));
+      if (cid === undefined) {
+        this.settleChallenge(challenge, "a node that matches no pick");
+        return;
+      }
+      challenge.proven.add(cid);
+    }
+    const missing = (msg["missing"] as string[] | null) ?? [];
+    if (missing.length > 0) {
+      this.settleChallenge(challenge, `${missing.length} picks not held`);
+    } else if (challenge.proven.size === challenge.picks.size) {
+      this.settleChallenge(challenge, null);
+    }
+  }
+
+  private settleChallenge(challenge: Challenge, failure: string | null): void {
+    if (this.challenges.delete(`${challenge.store}|${challenge.req}`)) {
+      challenge.resolve({ passed: failure === null, proven: challenge.proven.size, picks: challenge.picks.size, failure,
+        millis: this.peer.now() - challenge.sent });
+    }
+  }
+
   // ---- frames
 
   private onFrame(from: string, payload: Uint8Array): void {
@@ -1461,14 +1980,8 @@ export class TreeExchange {
       this.treeMessagesDropped += 1;
       return;
     }
-    let msg: Dict;
-    try {
-      msg = loads(payload) as Dict;
-    } catch {
-      this.treeMessagesDropped += 1;
-      return;
-    }
-    if (typeof msg !== "object" || msg === null || treeViolation(msg) !== null) {
+    const msg = readTreeMessage(payload);
+    if (msg === null) {
       this.treeMessagesDropped += 1;
       return;
     }
@@ -1477,10 +1990,22 @@ export class TreeExchange {
         this.queue(from, () => this.server.serveNodeWant(from, msg));
         break;
       case TREE_WANT:
-        this.queue(from, () => this.server.serveTreeWant(from, msg));
+        this.queue(from, isSketchWant(msg) ? async () => this.answerSketch(from, msg) : () => this.server.serveTreeWant(from, msg));
+        break;
+      case CHALLENGE:
+        if (this.level() < 2) {
+          this.treeMessagesDropped += 1; // a level-1 member reads no tag 12
+          return;
+        }
+        this.queue(from, () => this.server.serveChallenge(from, msg));
         break;
       case NODES:
         this.queue(from, async () => {
+          const challenge = this.challenges.get(`${from}|${String(msg["req"])}`);
+          if (challenge !== undefined) {
+            await this.onChallengeNodes(challenge, msg);
+            return;
+          }
           for (const f of this.fetches.values()) {
             if (await f.onNodes(from, msg)) {
               break;
@@ -1489,6 +2014,16 @@ export class TreeExchange {
         });
         break;
       case TREE_END:
+        if (msg["reason"] === END_SKETCH) {
+          this.queue(from, async () => {
+            const taken = [...this.sessions].some((session) => session.onEnd(from, Number(msg["req"]), msg["sketch"] as Uint8Array,
+              payload.length));
+            if (!taken) {
+              this.treeMessagesDropped += 1;
+            }
+          });
+          return;
+        }
         this.queue(from, async () => {
           for (const f of this.fetches.values()) {
             if (f.onTreeEnd(from, msg)) {
@@ -1497,8 +2032,6 @@ export class TreeExchange {
           }
         });
         break;
-      default:
-        this.treeMessagesDropped += 1;
     }
   }
 
@@ -1523,7 +2056,8 @@ export class TreeExchange {
   stats(): Dict {
     return { fetchesActive: this.fetches.size, nodesServed: this.server.nodesServed, bytesServed: this.bytesServed,
       treeRequestsRejected: this.server.rejected, treeMessagesDropped: this.treeMessagesDropped + this.server.dropped,
-      nodesStruck: this.nodesStruck, nodesHeld: this.store.nodesHeld, bytesHeld: this.store.bytesHeld };
+      nodesStruck: this.nodesStruck, nodesHeld: this.store.nodesHeld, bytesHeld: this.store.bytesHeld,
+      sketchSessions: this.sessions.size, sketchRetries: this.sketchRetries, challengesPending: this.challenges.size };
   }
 }
 

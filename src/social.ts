@@ -27,7 +27,8 @@
 
 import { equals, fromBase64, toBase64, utf8 } from "./bytes.js";
 import { cryptoPort } from "./crypto.js";
-import { CborDouble, CborValue, dumps, loads } from "./cbor.js";
+import { CborValue, dumps } from "./cbor.js";
+import * as records from "./records.js";
 import { Identity, deriveId } from "./identity.js";
 
 type Dict = { [key: string]: CborValue };
@@ -357,52 +358,44 @@ export function credentialView(candidate: string, group: string): Uint8Array {
   return dumps({ candidate, group });
 }
 
-function isDict(value: CborValue): value is Dict {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    && !(value instanceof Uint8Array) && !(value instanceof CborDouble);
+/** A conformed JoinCredentials.Delegation as the client holds it. */
+function delegationOf(value: Dict): Delegation {
+  return { founderKey: value["founderKey"] as Uint8Array, inviteKey: value["inviteKey"] as Uint8Array,
+    group: value["group"] as string, notAfterMillis: Number(value["notAfterMillis"]),
+    label: (value["label"] as string | null) ?? "", signature: value["signature"] as Uint8Array };
 }
 
-function delegationOf(value: CborValue): Delegation | null {
-  if (!isDict(value)) {
-    return null;
-  }
-  const founderKey = value["founderKey"];
-  const inviteKey = value["inviteKey"];
-  const group = value["group"];
-  const notAfter = value["notAfterMillis"];
-  const label = value["label"];
-  const signature = value["signature"];
-  if (!(founderKey instanceof Uint8Array) || !(inviteKey instanceof Uint8Array)
-      || typeof group !== "string" || !(signature instanceof Uint8Array)
-      || (typeof notAfter !== "number" && typeof notAfter !== "bigint")) {
-    return null;
-  }
-  return { founderKey, inviteKey, group, notAfterMillis: Number(notAfter),
-    label: typeof label === "string" ? label : "", signature };
-}
-
-/** Decodes a delegation string (base64 CBOR), or returns null when it does not parse. */
+/**
+ * Decodes a delegation string (base64 CBOR), or returns null when it is no JoinCredentials.Delegation
+ * read strictly (HLC round six, 2026-11-08, F3) or names no group, signature or keys.
+ */
 export function parseDelegation(delegation: string): Delegation | null {
   try {
-    return delegationOf(loads(fromBase64(delegation.trim())));
+    const value = records.readRecord(fromBase64(delegation.trim()), records.DELEGATION);
+    return value === null || !complete(value) ? null : delegationOf(value);
   } catch {
     return null;
   }
 }
 
-/** Decodes a delegated credential string into its delegation and the invite key's signature. */
+/** Whether a delegation names its founder key, invite key, group and signature, each of which Java's record requires. */
+function complete(value: Dict): boolean {
+  return value["founderKey"] !== null && value["inviteKey"] !== null && value["group"] !== null && value["signature"] !== null;
+}
+
+/**
+ * Decodes a delegated credential string into its delegation and the invite key's signature, or null
+ * when it is no JoinCredentials.DelegatedCredential read strictly (HLC round six, 2026-11-08, F3).
+ */
 export function parseDelegatedCredential(credential: string): { delegation: Delegation; signature: Uint8Array } | null {
   try {
-    const value = loads(fromBase64(stripPrefix(credential.trim())));
-    if (!isDict(value)) {
+    const value = records.readRecord(fromBase64(stripPrefix(credential.trim())), records.DELEGATED_CREDENTIAL);
+    const delegation = value?.["delegation"] as Dict | null | undefined;
+    if (value === null || delegation === null || delegation === undefined || !complete(delegation)
+        || value["signature"] === null) {
       return null;
     }
-    const delegation = delegationOf(value["delegation"]);
-    const signature = value["signature"];
-    if (delegation === null || !(signature instanceof Uint8Array)) {
-      return null;
-    }
-    return { delegation, signature };
+    return { delegation: delegationOf(delegation), signature: value["signature"] as Uint8Array };
   } catch {
     return null;
   }

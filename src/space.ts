@@ -33,8 +33,9 @@
 
 import { Emitter, contextStore } from "./emitter.js";
 
-import { CborDouble, CborValue, loads } from "./cbor.js";
+import { CborDouble, CborValue, loads, readDocument } from "./cbor.js";
 import { AgentIdentity, spaceIdLocal } from "./identity.js";
+import { leaseExpiryOf, present } from "./peer.js";
 import type { Peer } from "./peer.js";
 import type { Dict } from "./wire.js";
 
@@ -373,7 +374,13 @@ export const TakeContext = {
 
 // ----------------------------------------------------------------- the space
 
-type Watcher = { template: Template<unknown>; delivered: Set<string>; emit: (event: SpaceEvent<unknown>) => void };
+/**
+ * One watch: its template, the events it has judged (by entry id, the kinds and claim epochs), and
+ * its delivery. HLC round five, 2026-11-08: the space never decodes a judged event again, matched or
+ * not, since a record's payload and tags never change, and it forgets an entry's marks when the
+ * replica collects the entry.
+ */
+type Watcher = { template: Template<unknown>; judged: Map<string, Set<string>>; emit: (event: SpaceEvent<unknown>) => void };
 
 /**
  * A watch handle: an emitter of `"event"`, closed with `close()`. A leased
@@ -462,6 +469,7 @@ export class Space {
   constructor(readonly peer: Peer, readonly name: string,
               readonly agent: AgentIdentity | null = null, readonly agentName = "typescript") {
     this.spaceId = spaceIdLocal(`${peer.group}/${name}`);
+    peer.joinSpace(name);
     install(peer).push(this);
   }
 
@@ -483,19 +491,19 @@ export class Space {
     const found: Entry<T>[] = [];
     for (const [entryId, dto] of this.peer.states) {
       const record = (dto["record"] as Dict | undefined) ?? {};
-      if (!template.accepts(record["type"]) || !this.mine(dto) || dto["completed"]) {
+      if (!template.accepts(record["type"]) || !this.mine(dto) || !present(dto)) {
         continue;
       }
-      const lease = (record["lease"] as Dict | undefined) ?? {};
-      const expires = Number(lease["expiresAtMillis"] ?? 0);
+      const expires = leaseExpiryOf(dto);
       if (expires <= now) {
         continue;
       }
       const raw = this.peer.payloadOf(dto);
-      if (raw === null) {
-        continue; // a block or artifact still on its way: its transfer has started
+      const read = raw === null ? null : readDocument(raw);
+      if (read === null) {
+        continue; // a block or artifact still on its way, or a value no read can decode (HLC round six, 2026-11-08)
       }
-      const payload = loads(raw) as Dict;
+      const payload = read.value as Dict;
       const tags = (record["tags"] as Dict | undefined) ?? {};
       if (!template.matches(payload, tags)) {
         continue;
@@ -558,7 +566,7 @@ export class Space {
     if (listener) {
       subscription.on("event", listener);
     }
-    this.watchers.set(key, { template: template as Template<unknown>, delivered: new Set(),
+    this.watchers.set(key, { template: template as Template<unknown>, judged: new Map(),
       emit: (e) => subscription.emit("event", e) });
     return subscription;
   }
@@ -586,59 +594,106 @@ export class Space {
 
   // ---------------------------------------------------------------- events
 
-  private deliver(dto: Dict, kind: EventKind, markSuffix: string = kind): void {
+  /**
+   * Delivers one event of an entry to every watcher that has not judged it yet. The marks come
+   * first: when every watcher has judged the event, the space neither reads nor decodes the payload
+   * (HLC round five, 2026-11-08: a live console page spent 95% of its main thread decoding lapsed
+   * entries it had already reported).
+   */
+  private deliver(dto: Dict, kind: EventKind, mark: string = kind): void {
     const record = (dto["record"] as Dict | undefined) ?? {};
     const entryId = String(record["entryId"]);
+    const judging: Watcher[] = [];
+    for (const watcher of this.watchers.values()) {
+      if (watcher.template.accepts(record["type"]) && !watcher.judged.get(entryId)?.has(mark)) {
+        judging.push(watcher);
+      }
+    }
+    if (judging.length === 0) {
+      return;
+    }
     const raw = this.peer.payloadOf(dto);
     if (raw === null) {
       return; // a referenced payload not here yet: the event waits for a later fold or read
     }
-    const payload = loads(raw) as Dict;
+    const read = readDocument(raw);
+    if (read === null) {
+      // HLC round six, 2026-11-08: a value no read can decode announces nothing, judged once.
+      for (const { judged } of judging) {
+        judged.set(entryId, (judged.get(entryId) ?? new Set<string>()).add(mark));
+      }
+      return;
+    }
+    const payload = read.value as Dict;
     const tags = (record["tags"] as Dict | undefined) ?? {};
-    for (const { template, delivered, emit } of [...this.watchers.values()]) {
-      if (!template.accepts(record["type"]) || !template.matches(payload, tags)) {
+    for (const { template, judged, emit } of judging) {
+      const marks = judged.get(entryId) ?? new Set<string>();
+      judged.set(entryId, marks.add(mark));
+      if (!template.matches(payload, tags)) {
         continue;
       }
-      const mark = `${entryId}:${markSuffix}`;
-      if (delivered.has(mark)) {
-        continue;
-      }
-      delivered.add(mark);
-      const lease = (record["lease"] as Dict | undefined) ?? {};
       emit({ kind, entry: { entryId, value: template.decode(payload), tags: { ...tags },
-        issuer: String(record["issuer"]), type: String(record["type"]), expiresAtMillis: Number(lease["expiresAtMillis"] ?? 0),
+        issuer: String(record["issuer"]), type: String(record["type"]), expiresAtMillis: leaseExpiryOf(dto),
         completed: kind === COMPLETED, taken: kind === TAKEN } });
     }
   }
 
-  onStateFolded(dto: Dict): void {
+  /**
+   * WRITTEN or COMPLETED for a state that folds present or completed. A withdrawn state announces nothing
+   * (HLC round five, 2026-11-08) unless it withdraws an entry this replica held present: a cancel then raises
+   * EXPIRED, the kind a lapse raises, as Java's ReplicatedSpace and LocalSpace raise it, once per watcher with
+   * the sweep's EXPIRED (core cancel events, 2026-11-09).
+   */
+  onStateFolded(dto: Dict, previous?: Dict): void {
     if (!this.mine(dto)) {
       return;
     }
-    this.deliver(dto, dto["completed"] ? COMPLETED : WRITTEN);
+    if (dto["completed"] || present(dto)) {
+      this.deliver(dto, dto["completed"] ? COMPLETED : WRITTEN);
+    } else if (previous !== undefined && present(previous)) {
+      this.deliver(dto, EXPIRED);
+    }
   }
 
+  /**
+   * TAKEN once per claim epoch while the claim is in force, as Java's ReplicatedSpace fires it (HLC
+   * round six, 2026-11-08, R9): a later take of an entry whose earlier take lapsed is heard again, and
+   * a claim already expired announces nothing.
+   */
   onClaimFolded(entryId: string): void {
     const dto = this.peer.states.get(entryId);
-    if (dto === undefined || !this.mine(dto) || dto["completed"]) {
+    const claim = this.peer.claims.get(entryId)?.["claim"] as Dict | undefined;
+    if (dto === undefined || claim === undefined || !this.mine(dto) || !present(dto)
+        || Number(claim["expiresAtMillis"]) <= this.peer.now()) {
       return;
     }
-    this.deliver(dto, TAKEN);
+    this.deliver(dto, TAKEN, `${TAKEN}:${String(claim["epoch"])}`);
   }
 
-  /** EXPIRED once per entry whose write lease lapsed while open; REAPPEARED once per lapsed claim epoch. */
+  /** Forgets what every watcher judged of entries the replica collected (SPEC §7.3, HLC round five, 2026-11-08). */
+  onCollected(entryIds: string[]): void {
+    for (const { judged } of this.watchers.values()) {
+      for (const entryId of entryIds) {
+        judged.delete(entryId);
+      }
+    }
+  }
+
+  /**
+   * EXPIRED once per present entry whose lease (renewed or not) lapsed; REAPPEARED once per lapsed
+   * claim epoch. A lapse every watcher already judged costs a lookup and no decode (HLC round five,
+   * 2026-11-08).
+   */
   sweep(): void {
     if (this.watchers.size === 0) {
       return;
     }
     const now = this.peer.now();
-    for (const [entryId, dto] of [...this.peer.states]) {
-      if (!this.mine(dto) || dto["completed"]) {
+    for (const [entryId, dto] of this.peer.states) {
+      if (!this.mine(dto) || !present(dto)) {
         continue;
       }
-      const record = (dto["record"] as Dict | undefined) ?? {};
-      const lease = (record["lease"] as Dict | undefined) ?? {};
-      if (Number(lease["expiresAtMillis"] ?? 0) <= now) {
+      if (leaseExpiryOf(dto) <= now) {
         this.deliver(dto, EXPIRED);
         continue;
       }
@@ -658,16 +713,23 @@ function install(peer: Peer): Space[] {
     holder.agentspacesSpaces = spaces;
     const previousState = peer.onState;
     const previousClaim = peer.onClaim;
-    peer.onState = (dto) => {
-      previousState?.(dto);
+    const previousCollected = peer.onCollected;
+    peer.onState = (dto, previous) => {
+      previousState?.(dto, previous);
       for (const s of [...spaces]) {
-        s.onStateFolded(dto);
+        s.onStateFolded(dto, previous);
       }
     };
     peer.onClaim = (entryId, signed) => {
       previousClaim?.(entryId, signed);
       for (const s of [...spaces]) {
         s.onClaimFolded(entryId);
+      }
+    };
+    peer.onCollected = (entryIds) => {
+      previousCollected?.(entryIds);
+      for (const s of [...spaces]) {
+        s.onCollected(entryIds);
       }
     };
     // EXPIRED and REAPPEARED are judged by the clock, not by a fold; the timer

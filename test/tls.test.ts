@@ -143,7 +143,9 @@ async function tlsSeed(): Promise<{ identity: Identity; port: number; frames: { 
         assert.deepEqual({ ...(loads(decoded.env["body"] as Uint8Array) as Dict) }, { acceptsBare: true, attestedRemote: identity.peerId });
         const env = wire.envelope(GROUP, "PING", identity.peerId, wire.hlcNow(identity.peerId, Date.now()),
           wire.pingBody(41), String(decoded.env["from"]));
-        channel.send(dumps({ envelope: env })); // bare: no key, no signature
+        // Bare: no key and no signature, each written as null since WireCodec.Signed always holds both
+        // (HLC round six, 2026-11-08, P1).
+        channel.send(dumps({ envelope: env, senderPublicKey: null, signature: null }));
       }
     });
   });

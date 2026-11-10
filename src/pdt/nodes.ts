@@ -26,9 +26,24 @@
  * Kinds and schemas: `m` {d, n, e, c, cnt}, `mc` {e}, `v` {c | e}, `vr` {n, s, r, t}, `b` {h, c, z},
  * `x` {v}. A decoder refuses a node over 1 MiB, more than 1,024 links, a key outside the kind's schema,
  * an unknown kind, an unknown link codec, keys out of order, and trailing bytes, naming the rule.
+ *
+ * Both directions also refuse an embedded item that is no document in the wire encoding (rules S1 to
+ * S12, the big-number tags 2, 3 and 4 included, no other tag), as Java's NodeCodec does (HLC round six,
+ * 2026-11-08, definition 2.4 and change JD-4). A bare link item in a value slot, a spilled value
+ * (PD-N-05), is the one exception; a key never spills.
+ *
+ * PDT 2 phase 0 (srad/agentspaces-pdt2.md §3, annex H as Java's NodeCodec carries it) adds the seven
+ * level-2 kinds, strict DAG-CBOR down to every item except a `db` root's schema and an `rr` tail, which
+ * keep the embedded rules above: `db` {v, s, me, mt, bf, i: {aevt, avet, eavt} of links, t: tail link or
+ * null} and `dn` {l, x, e: [datom...], c} (P2-D-01), `rr` {n, s, r, t} and `rv` {c, z} (P2-R-01), `t`
+ * {r: [run...], v} (P2-T-01), `vg` {r: CID text, b: [CID text...], i, t, p: [link...]} (P2-V-01), and `bo`
+ * {g, n, p: bytes, c} (P2-B-02). Their text is well-formed UTF-8 with no lone surrogate, every header is
+ * in its shortest form, and a datom float is a finite float64. Kinds `s`, `tm` and `ec` are reserved
+ * (PD-F-01, P2-F-04); the typed readers of `kinds.ts` check the rules that span fields.
  */
 
 import { compare, concat, fromUtf8, utf8 } from "../bytes.js";
+import { CborDouble, loads } from "../cbor.js";
 import * as cids from "./cids.js";
 
 export const MAX_NODE_BYTES = 1024 * 1024;
@@ -44,8 +59,21 @@ export const KIND_M = "m", KIND_MC = "mc", KIND_V = "v", KIND_VR = "vr", KIND_B 
  * port walks it (its links are in the clear) and does not open it.
  */
 export const KIND_SN = "sn";
-/** Kinds reserved by PD-F-01 for later layouts (`s` sorted map, `rr` RRB vector); a decoder refuses them by name. */
-export const RESERVED_KINDS = new Set(["s", "rr"]);
+/** PDT 2 phase 0 (P2-D-01): a DataScript database root and a sorted-set node (srad/agentspaces-pdt2.md §3.1.1). */
+export const KIND_DB = "db", KIND_DN = "dn";
+/** PDT 2 phase 0 (P2-R-01): an RRB vector root and interior node (§3.7). */
+export const KIND_RR = "rr", KIND_RV = "rv";
+/** PDT 2 phase 0 (P2-T-01): a text leaf of Fugue runs (§3.9). */
+export const KIND_T = "t";
+/** PDT 2 phase 0 (P2-V-01): a version graph node, named by the attribute `pdt.ancestry` (§3.10). */
+export const KIND_VG = "vg";
+/** PDT 2 phase 0 (P2-B-02): a node of a blob's Bao outboard, named by the attribute `pdt.bao` (§3.5). */
+export const KIND_BO = "bo";
+/**
+ * Kinds reserved for later layouts, which a decoder refuses by name: `s` sorted map (PD-F-01), `tm` text
+ * marks and `ec` erasure-coded stripe (PDT 2 phase 0, P2-F-04). PDT 2 gave `rr` its schema.
+ */
+export const RESERVED_KINDS = new Set(["s", "tm", "ec"]);
 /** An `sn` node may reach 1 MiB plus 48 KiB; every other kind keeps the 1 MiB bound. */
 export const MAX_SEALED_NODE_BYTES = 1024 * 1024 + 48 * 1024;
 
@@ -62,7 +90,213 @@ export class Embedded {
   constructor(readonly bytes: Uint8Array) {}
 }
 
-export type Field = "uint" | "link" | "linkOrNull" | "links" | "embedded" | "embeddeds" | "uints" | "bytes";
+/**
+ * A signed 64-bit integer of a datom (PDT 2 phase 0, P2-D-01): a number within the safe range, a bigint
+ * outside it, so one value has one form and two equal datoms compare equal.
+ */
+export type Int64 = number | bigint;
+
+const INT64_MIN = -(1n << 63n);
+const INT64_MAX = (1n << 63n) - 1n;
+
+/** `value` in its one form, or a RangeError naming `what` when it is no signed 64-bit integer. */
+function int64(value: Int64, what: string): Int64 {
+  if (typeof value === "number" && !Number.isSafeInteger(value)) {
+    if (Number.isInteger(value)) {
+      throw new RangeError(`${what} ${value} is not a signed 64-bit integer held exactly`);
+    }
+    throw new RangeError(`${what} must be an integer, found ${value}`);
+  }
+  const big = BigInt(value);
+  if (big < INT64_MIN || big > INT64_MAX) {
+    throw new RangeError(`${what} ${big} is not a signed 64-bit integer`);
+  }
+  return Number.isSafeInteger(Number(big)) && BigInt(Number(big)) === big ? Number(big) : big;
+}
+
+/**
+ * A tagged datom value, `[tag, inner]` on the wire (PDT 2 phase 0, P2-D-01; §3.1.1): `u` over the 16 bytes
+ * of a UUID, `i` over epoch milliseconds, `n` over the minimal big-endian two's complement bytes of a big
+ * integer (Java's `BigInteger.toByteArray`).
+ */
+export class DatomTag {
+  readonly inner: Uint8Array | Int64;
+
+  constructor(readonly tag: "u" | "i" | "n", inner: Uint8Array | Int64) {
+    switch (tag) {
+      case "u":
+        if (!(inner instanceof Uint8Array) || inner.length !== 16) {
+          throw new RangeError("a uuid value holds 16 bytes");
+        }
+        this.inner = inner;
+        break;
+      case "i":
+        if (inner instanceof Uint8Array) {
+          throw new RangeError("an instant value holds an integer of epoch milliseconds");
+        }
+        this.inner = int64(inner, "an instant");
+        break;
+      case "n":
+        if (!(inner instanceof Uint8Array) || !minimalTwosComplement(inner)) {
+          throw new RangeError("a bigint value holds its minimal two's complement bytes");
+        }
+        this.inner = inner;
+        break;
+      default:
+        throw new RangeError(`unknown value tag '${String(tag)}'`);
+    }
+  }
+
+  /** The tagged form of a UUID's 16 bytes, most significant first. */
+  static uuid(bytes: Uint8Array): DatomTag {
+    return new DatomTag("u", bytes);
+  }
+
+  /** The tagged form of an instant in epoch milliseconds. */
+  static instant(epochMillis: Int64): DatomTag {
+    return new DatomTag("i", epochMillis);
+  }
+
+  /** The tagged form of a big integer: the fewest two's complement bytes that hold it. */
+  static bigint(value: bigint): DatomTag {
+    const out: number[] = [];
+    let rest = value;
+    do {
+      out.unshift(Number(rest & 0xffn));
+      rest >>= 8n;
+    } while (!((rest === 0n && (out[0]! & 0x80) === 0) || (rest === -1n && (out[0]! & 0x80) !== 0)));
+    return new DatomTag("n", Uint8Array.from(out));
+  }
+}
+
+/** Whether bytes are what `BigInteger.toByteArray` writes: non-empty, with no redundant sign byte. */
+function minimalTwosComplement(b: Uint8Array): boolean {
+  if (b.length === 0) {
+    return false;
+  }
+  return b.length === 1 || !((b[0] === 0 && b[1]! < 0x80) || (b[0] === 0xff && b[1]! >= 0x80));
+}
+
+/**
+ * A datom value (PDT 2 phase 0, P2-D-01; §3.1.1): an integer (or a ref), text (or a keyword's print form),
+ * a boolean, bytes, a finite float64 held as a {@link CborDouble}, a {@link Link} (a value spilled out of
+ * line, PD-N-05), or a {@link DatomTag}.
+ */
+export type DatomValue = Int64 | string | boolean | Uint8Array | CborDouble | Link | DatomTag;
+
+/**
+ * One datom of a `dn` node (PDT 2 phase 0, P2-D-01; srad/agentspaces-pdt2.md §3.1.1): on the wire the
+ * definite array `[e, a, v, tx]`, the entity and the transaction as CBOR integers (a negative transaction
+ * marks a retraction), the attribute as the keyword's print form. The constructor refuses tx 0 and a value
+ * outside the grammar, as Java's Datom does.
+ */
+export class Datom {
+  readonly e: Int64;
+  readonly v: DatomValue;
+  readonly tx: Int64;
+
+  constructor(e: Int64, readonly a: string, v: DatomValue, tx: Int64) {
+    this.e = int64(e, "a datom's entity");
+    this.tx = int64(tx, "a datom's tx");
+    if (this.tx === 0) {
+      throw new RangeError("a datom's tx is non-zero: its sign marks a retraction");
+    }
+    if (typeof a !== "string") {
+      throw new RangeError("a datom's attribute is text");
+    }
+    if (typeof v === "number" || typeof v === "bigint") {
+      if (typeof v === "number" && !Number.isInteger(v)) {
+        throw new RangeError(`a datom float travels as a CborDouble, found the number ${v}`);
+      }
+      this.v = int64(v, "a datom's value");
+    } else if (v instanceof CborDouble) {
+      if (v.constructor !== CborDouble || !Number.isFinite(v.value)) {
+        throw new RangeError(`a datom float is a finite float64, found ${String(v.value)}`);
+      }
+      this.v = v;
+    } else if (typeof v === "string" || typeof v === "boolean" || v instanceof Uint8Array || v instanceof Link
+        || v instanceof DatomTag) {
+      this.v = v;
+    } else {
+      throw new RangeError(`a datom value is an integer, text, a boolean, bytes, a float64, a link, or a tagged pair; `
+        + `the grammar holds no ${describe(v)}`);
+    }
+  }
+}
+
+/** A character id of a text leaf: the replica and the counter (PDT 2 phase 0, P2-T-01). */
+export class CharId {
+  constructor(readonly replica: string, readonly counter: number) {
+    if (typeof replica !== "string" || replica.length === 0) {
+      throw new RangeError("a character id names a non-empty replica");
+    }
+    if (!Number.isSafeInteger(counter) || counter < 0) {
+      throw new RangeError(`a character counter is a non-negative integer, found ${counter}`);
+    }
+  }
+}
+
+/**
+ * One run of a text leaf, kind `t` (PDT 2 phase 0, P2-T-01; srad/agentspaces-pdt2.md §3.9): characters from
+ * one replica with consecutive counters, each after the first the right child of the one before it. On the
+ * wire the definite array `[replica, counter, parent, side, length, deleted, text]`, with the points Java's
+ * build pinned: the parent is the Fugue parent of the first character as `[replica, counter]` or null for
+ * the document root, `length` counts code points, and a deleted run keeps its ids and drops its text.
+ */
+export class TextRun {
+  constructor(readonly replica: string, readonly counter: number, readonly parent: CharId | null,
+      readonly side: "L" | "R", readonly length: number, readonly deleted: boolean, readonly text: string) {
+    if (typeof replica !== "string" || replica.length === 0) {
+      throw new RangeError("a run names a non-empty replica");
+    }
+    if (!Number.isSafeInteger(counter) || counter < 0) {
+      throw new RangeError(`a run counter is a non-negative integer, found ${counter}`);
+    }
+    if (side !== "L" && side !== "R") {
+      throw new RangeError(`a run side is L or R, found '${String(side)}'`);
+    }
+    if (parent === null && side === "L") {
+      // the document root is the leftmost neighbour of every insert, so Fugue gives it right children only
+      throw new RangeError("a child of the document root hangs on its right, found side L");
+    }
+    if (!Number.isSafeInteger(length) || length < 1) {
+      throw new RangeError(`a run length is at least 1, found ${length}`);
+    }
+    if (counter + length > Number.MAX_SAFE_INTEGER) {
+      throw new RangeError("a run's counters pass 2^53 - 1");
+    }
+    if (LONE_SURROGATE.test(text)) {
+      throw new RangeError("a run's text holds a lone surrogate");
+    }
+    if (deleted && text.length > 0) {
+      throw new RangeError("a deleted run carries no text");
+    }
+    const codePoints = [...text].length;
+    if (!deleted && codePoints !== length) {
+      throw new RangeError(`a live run of length ${length} holds ${codePoints} code points`);
+    }
+  }
+}
+
+/** A `db` root's index map (PDT 2 phase 0, P2-D-01): exactly `aevt`, `avet` and `eavt`, each a link. */
+export interface IndexLinks {
+  readonly aevt: Link;
+  readonly avet: Link;
+  readonly eavt: Link;
+}
+
+/** The keys of a `db` root's index map, in DAG-CBOR order. */
+const INDEX_KEYS = ["aevt", "avet", "eavt"] as const;
+
+/** A string holding a UTF-16 surrogate outside a pair, which UTF-8 cannot carry. */
+const LONE_SURROGATE = /\p{Cs}/u;
+
+/** UTF-8 that refuses a malformed sequence instead of replacing it (PDT 2 phase 0). */
+const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+export type Field = "uint" | "link" | "linkOrNull" | "links" | "embedded" | "embeddeds" | "uints" | "bytes"
+  // PDT 2 phase 0 (P2-D-01, P2-T-01, P2-V-01): the strict field types of the level-2 kinds
+  | "text" | "cid" | "cids" | "index" | "datoms" | "runs";
 
 const SCHEMAS: { [kind: string]: { [key: string]: Field } } = {
   m: { d: "uint", n: "uint", e: "embeddeds", c: "links", cnt: "uint" },
@@ -72,9 +306,18 @@ const SCHEMAS: { [kind: string]: { [key: string]: Field } } = {
   b: { h: "uint", c: "links", z: "uints" },
   x: { v: "embedded" },
   sn: { ct: "bytes", ep: "uint", ln: "links", nc: "bytes" },
+  // PDT 2 phase 0 (srad/agentspaces-pdt2.md §3.1.1, §3.5, §3.7, §3.9, §3.10)
+  db: { v: "uint", s: "embedded", me: "uint", mt: "uint", bf: "uint", i: "index", t: "linkOrNull" },
+  dn: { l: "uint", x: "text", e: "datoms", c: "links" },
+  rr: { n: "uint", s: "uint", r: "linkOrNull", t: "embeddeds" },
+  rv: { c: "links", z: "uints" },
+  t: { r: "runs", v: "uint" },
+  vg: { r: "cid", b: "cids", i: "text", t: "text", p: "links" },
+  bo: { g: "uint", n: "uint", p: "bytes", c: "links" },
 };
 
-export type NodeValue = number | Link | null | Link[] | Embedded | Embedded[] | number[] | string | Uint8Array;
+export type NodeValue = number | Link | null | Link[] | Embedded | Embedded[] | number[] | string | Uint8Array
+  | string[] | IndexLinks | Datom[] | TextRun[];
 export type Node = { [key: string]: NodeValue };
 
 /** A node the codec refuses, with the rule and (when known) the CID. */
@@ -157,6 +400,48 @@ function text(value: string): Uint8Array {
   return concat(header(3, bytes.length), bytes);
 }
 
+/** A header whose argument is a bigint up to 2^64 - 1, in its shortest form (PDT 2 phase 0, P2-D-01). */
+function bigHeader(major: number, value: bigint): Uint8Array {
+  if (value <= BigInt(Number.MAX_SAFE_INTEGER)) {
+    return header(major, Number(value));
+  }
+  const out = new Uint8Array(9);
+  out[0] = (major << 5) | 27;
+  new DataView(out.buffer).setBigUint64(1, value, false);
+  return out;
+}
+
+/** A signed integer: major type 0, or major type 1 over -1 - value (PDT 2 phase 0, P2-D-01). */
+function sint(value: Int64): Uint8Array {
+  const big = BigInt(value);
+  return big >= 0n ? bigHeader(0, big) : bigHeader(1, -1n - big);
+}
+
+/** Text that UTF-8 can carry: a lone surrogate is refused, never replaced (PDT 2 phase 0). */
+function strictText(key: string, value: unknown): Uint8Array {
+  if (typeof value !== "string") {
+    throw new NodeFormatError(`'${key}' must hold text, found ${describe(value)}`);
+  }
+  if (LONE_SURROGATE.test(value)) {
+    throw new NodeFormatError(`'${key}' text holds a lone surrogate`);
+  }
+  return text(value);
+}
+
+/** A CID held as text (PDT 2 phase 0, P2-V-01): a `vg` node names roots without linking them. */
+function cidText(key: string, value: unknown): Uint8Array {
+  if (!cids.isCid(value)) {
+    throw new NodeFormatError(`'${key}' must hold a CID as text, found ${typeof value === "string" ? `'${value}'` : describe(value)}`);
+  }
+  return text(value);
+}
+
+/** Whether a value is an index map's shape before its keys are checked. */
+function isIndexShaped(value: unknown): value is { [key: string]: unknown } {
+  return typeof value === "object" && value !== null && !Array.isArray(value) && !(value instanceof Uint8Array)
+    && !(value instanceof Link) && !(value instanceof Embedded);
+}
+
 function uintOf(key: string, value: NodeValue): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
     throw new NodeFormatError(`'${key}' must be an unsigned integer, found ${describe(value)}`);
@@ -200,7 +485,7 @@ export function encode(node: Node): Uint8Array {
     }
     parts.push(linkItem(value.cid));
   };
-  const embedded = (key: string, value: unknown): void => {
+  const embedded = (key: string, value: unknown, keySlot: boolean): void => {
     if (!(value instanceof Embedded)) {
       throw new NodeFormatError(`'${key}' must hold an embedded CBOR item, found ${describe(value)}`);
     }
@@ -208,6 +493,7 @@ export function encode(node: Node): Uint8Array {
     if (skip(bytes, 0) !== bytes.length) {
       throw new NodeFormatError(`'${key}' embedded item has trailing bytes`);
     }
+    checkEmbedded(key, bytes, keySlot, null);
     if (isLinkShaped(bytes) && ++links > MAX_LINKS) {
       throw new NodeFormatError(`node has more than ${MAX_LINKS} links`);
     }
@@ -243,14 +529,13 @@ export function encode(node: Node): Uint8Array {
         break;
       }
       case "embedded":
-        embedded(key, value);
+        embedded(key, value, false);
         break;
       case "embeddeds": {
         const list = listOf(key, value);
+        const keyed = isKeyed(kind, key);
         parts.push(header(4, list.length));
-        for (const item of list) {
-          embedded(key, item);
-        }
+        list.forEach((item, i) => embedded(key, item, keyed && i % 2 === 0));
         break;
       }
       case "uints": {
@@ -268,6 +553,80 @@ export function encode(node: Node): Uint8Array {
         parts.push(header(2, value.length), value);
         break;
       }
+      case "text":
+        parts.push(strictText(key, value));
+        break;
+      case "cid":
+        parts.push(cidText(key, value));
+        break;
+      case "cids": {
+        const list = listOf(key, value);
+        parts.push(header(4, list.length));
+        for (const item of list) {
+          parts.push(cidText(key, item));
+        }
+        break;
+      }
+      case "index": {
+        const keysOf = isIndexShaped(value) ? Object.keys(value).sort() : null;
+        if (keysOf === null || keysOf.join(",") !== INDEX_KEYS.join(",")) {
+          throw new NodeFormatError(`'${key}' must map exactly aevt, avet and eavt to links, found ${
+            keysOf === null ? describe(value) : `[${keysOf.join(", ")}]`}`);
+        }
+        parts.push(header(5, INDEX_KEYS.length));
+        for (const index of INDEX_KEYS) {
+          parts.push(text(index));
+          link(key, (value as unknown as { [key: string]: unknown })[index]);
+        }
+        break;
+      }
+      case "datoms": {
+        const list = listOf(key, value);
+        parts.push(header(4, list.length));
+        for (const item of list) {
+          if (!(item instanceof Datom)) {
+            throw new NodeFormatError(`'${key}' must hold datoms, found ${describe(item)}`);
+          }
+          parts.push(header(4, 4), sint(item.e), strictText(key, item.a));
+          const v = item.v;
+          if (v instanceof Link) {
+            link(key, v);
+          } else if (v instanceof DatomTag) {
+            parts.push(header(4, 2), text(v.tag),
+              v.inner instanceof Uint8Array ? concat(header(2, v.inner.length), v.inner) : sint(v.inner));
+          } else if (v instanceof CborDouble) {
+            const float = new Uint8Array(9);
+            float[0] = 0xfb;
+            new DataView(float.buffer).setFloat64(1, v.value, false);
+            parts.push(float);
+          } else if (v instanceof Uint8Array) {
+            parts.push(header(2, v.length), v);
+          } else if (typeof v === "boolean") {
+            parts.push(Uint8Array.of(v ? 0xf5 : 0xf4));
+          } else if (typeof v === "string") {
+            parts.push(strictText(key, v));
+          } else {
+            parts.push(sint(v));
+          }
+          parts.push(sint(item.tx));
+        }
+        break;
+      }
+      case "runs": {
+        const list = listOf(key, value);
+        parts.push(header(4, list.length));
+        for (const item of list) {
+          if (!(item instanceof TextRun)) {
+            throw new NodeFormatError(`'${key}' must hold text runs, found ${describe(item)}`);
+          }
+          parts.push(header(4, 7), strictText(key, item.replica), header(0, item.counter));
+          parts.push(item.parent === null ? Uint8Array.of(0xf6)
+            : concat(header(4, 2), strictText(key, item.parent.replica), header(0, item.parent.counter)));
+          parts.push(text(item.side), header(0, item.length), Uint8Array.of(item.deleted ? 0xf5 : 0xf4),
+            strictText(key, item.text));
+        }
+        break;
+      }
       default:
         throw new NodeFormatError(`unhandled field ${key}`);
     }
@@ -277,6 +636,30 @@ export function encode(node: Node): Uint8Array {
     throw new NodeFormatError(`node of ${out.length} bytes exceeds ${boundOf(kind)} bytes`);
   }
   return out;
+}
+
+/** Whether a field of a kind is an entry list whose even slots hold keys: `e` of a map node. */
+function isKeyed(kind: string, key: string): boolean {
+  return (kind === KIND_M || kind === KIND_MC) && key === "e";
+}
+
+/**
+ * Refuses an embedded item that is no document in the wire encoding (HLC round six, 2026-11-08,
+ * definition 2.4 and change JD-4, as Java's NodeCodec.checkEmbedded): every application key and value
+ * obeys rules S1 to S12, so tags 2, 3 and 4 stand in it and no other tag does. A link-shaped item in a
+ * value slot is a spilled value (PD-N-05) and passes; in a key slot it is tag 42 in an application
+ * document, and the codec refuses it.
+ */
+function checkEmbedded(key: string, bytes: Uint8Array, keySlot: boolean, cid: string | null): void {
+  if (!keySlot && isLinkShaped(bytes)) {
+    return;
+  }
+  try {
+    loads(bytes);
+  } catch (e) {
+    throw new NodeFormatError(`'${key}' ${keySlot ? "key item" : "embedded item"} breaks the wire encoding: `
+      + (e instanceof Error ? e.message : String(e)), cid);
+  }
 }
 
 // ------------------------------------------------------------------ reading
@@ -336,12 +719,201 @@ class In {
     throw new NodeFormatError(`reserved additional information ${info}`, this.cid);
   }
 
+  /**
+   * A definite header of the expected major type in its shortest form, as Java's NodeCodec reads every
+   * structural header (PDT 2 phase 0: the level-2 kinds are strict DAG-CBOR down to every item).
+   */
   headerOf(major: number, what: string): number {
     const initial = this.u8();
     if (initial >> 5 !== major) {
       throw new NodeFormatError(`'${what}' has major type ${initial >> 5} where ${major} was expected`, this.cid);
     }
-    return this.argument(initial & 0x1f);
+    const info = initial & 0x1f;
+    const value = this.argument(info);
+    if (!shortest(info, value)) {
+      throw new NodeFormatError(`'${what}' integer not in shortest form`, this.cid);
+    }
+    return value;
+  }
+
+  /** A signed integer under its shortest head, within the 64-bit range (PDT 2 phase 0, P2-D-01). */
+  sint(what: string): Int64 {
+    const initial = this.u8();
+    const major = initial >> 5;
+    if (major !== 0 && major !== 1) {
+      throw new NodeFormatError(`'${what}' must be an integer, found major type ${major}`, this.cid);
+    }
+    const info = initial & 0x1f;
+    let argument: bigint;
+    if (info === 27) {
+      argument = 0n;
+      for (let i = 0; i < 8; i++) {
+        argument = (argument << 8n) | BigInt(this.u8());
+      }
+      if (argument < 0x100000000n) {
+        throw new NodeFormatError(`'${what}' integer not in shortest form`, this.cid);
+      }
+      if (argument > INT64_MAX) {
+        throw new NodeFormatError(`'${what}' integer beyond the signed 64-bit range`, this.cid);
+      }
+    } else {
+      const value = this.argument(info);
+      if (!shortest(info, value)) {
+        throw new NodeFormatError(`'${what}' integer not in shortest form`, this.cid);
+      }
+      argument = BigInt(value);
+    }
+    return int64(major === 0 ? argument : -1n - argument, what);
+  }
+
+  /** Text that is well-formed UTF-8 (PDT 2 phase 0): a malformed sequence is refused, never replaced. */
+  strictText(what: string): string {
+    const n = this.headerOf(3, what);
+    this.advance(n);
+    try {
+      return STRICT_UTF8.decode(this.bytes.subarray(this.p - n, this.p));
+    } catch {
+      throw new NodeFormatError(`'${what}' text is not well-formed UTF-8`, this.cid);
+    }
+  }
+
+  cidText(what: string): string {
+    const value = this.strictText(what);
+    if (!cids.isCid(value)) {
+      throw new NodeFormatError(`'${what}' must hold a CID as text, found '${value}'`, this.cid);
+    }
+    return value;
+  }
+
+  bool(what: string): boolean {
+    const initial = this.u8();
+    if (initial !== 0xf5 && initial !== 0xf4) {
+      throw new NodeFormatError(`'${what}' must be a boolean, found initial byte 0x${initial.toString(16)}`, this.cid);
+    }
+    return initial === 0xf5;
+  }
+
+  byteString(what: string): Uint8Array {
+    const n = this.headerOf(2, what);
+    this.advance(n);
+    return this.bytes.slice(this.p - n, this.p);
+  }
+
+  /** The `db` root's index map: exactly aevt, avet, eavt, in that order, each a link (P2-D-01). */
+  index(what: string): IndexLinks {
+    if (this.headerOf(5, what) !== INDEX_KEYS.length) {
+      throw new NodeFormatError(`'${what}' must map exactly aevt, avet and eavt to links, in that order`, this.cid);
+    }
+    const out: { [key: string]: Link } = {};
+    for (const expected of INDEX_KEYS) {
+      if (this.strictText(what) !== expected) {
+        throw new NodeFormatError(`'${what}' must map exactly aevt, avet and eavt to links, in that order`, this.cid);
+      }
+      out[expected] = this.link(what);
+    }
+    return out as unknown as IndexLinks;
+  }
+
+  /** One datom `[e, a, v, tx]` under the value grammar of §3.1.1 (PDT 2 phase 0, P2-D-01). */
+  datom(what: string): Datom {
+    if (this.headerOf(4, what) !== 4) {
+      throw new NodeFormatError(`'${what}' datom must hold four items`, this.cid);
+    }
+    const e = this.sint(what);
+    const a = this.strictText(what);
+    const v = this.datomValue(what);
+    const tx = this.sint(what);
+    return this.built(what, "datom", () => new Datom(e, a, v, tx));
+  }
+
+  private datomValue(what: string): DatomValue {
+    const initial = this.peek();
+    switch (initial >> 5) {
+      case 0: case 1:
+        return this.sint(what);
+      case 2:
+        return this.byteString(what);
+      case 3:
+        return this.strictText(what);
+      case 6:
+        return this.link(what);
+      case 4: {
+        if (this.headerOf(4, what) !== 2) {
+          throw new NodeFormatError(`'${what}' tagged datom value must hold two items`, this.cid);
+        }
+        const tag = this.strictText(what);
+        let inner: Uint8Array | Int64;
+        if (tag === "i") {
+          if (this.peek() >> 5 > 1) {
+            throw new NodeFormatError(`'${what}' instant value must hold an integer`, this.cid);
+          }
+          inner = this.sint(what);
+        } else if (tag === "u" || tag === "n") {
+          inner = this.byteString(what);
+        } else {
+          throw new NodeFormatError(`'${what}' unknown value tag '${tag}'`, this.cid);
+        }
+        return this.built(what, "tagged value", () => new DatomTag(tag as "u" | "i" | "n", inner));
+      }
+      case 7:
+        switch (initial) {
+          case 0xf5: case 0xf4:
+            return this.bool(what);
+          case 0xfb: {
+            this.advance(9);
+            const value = new DataView(this.bytes.buffer, this.bytes.byteOffset + this.p - 8, 8).getFloat64(0, false);
+            if (!Number.isFinite(value)) {
+              throw new NodeFormatError(`'${what}' float value is not finite`, this.cid);
+            }
+            return new CborDouble(value);
+          }
+          case 0xfa:
+            throw new NodeFormatError(`'${what}' float value is float32; a datom float is float64`, this.cid);
+          case 0xf9:
+            throw new NodeFormatError(`'${what}' float value is a half float; a datom float is float64`, this.cid);
+          case 0xf6:
+            throw new NodeFormatError(`'${what}' datom value is null`, this.cid);
+          default:
+            throw new NodeFormatError(`'${what}' datom value is simple value 0x${initial.toString(16)}`, this.cid);
+        }
+      default:
+        throw new NodeFormatError(`'${what}' datom value of major type ${initial >> 5}; the grammar holds integers, `
+          + "bytes, text, links, tagged pairs, booleans and float64", this.cid);
+    }
+  }
+
+  /** One run `[replica, counter, parent, side, length, deleted, text]` (PDT 2 phase 0, P2-T-01). */
+  run(what: string): TextRun {
+    if (this.headerOf(4, what) !== 7) {
+      throw new NodeFormatError(`'${what}' run must hold seven items`, this.cid);
+    }
+    const replica = this.strictText(what);
+    const counter = this.uint(what);
+    let parent: CharId | null = null;
+    if (this.peek() === 0xf6) {
+      this.advance(1);
+    } else {
+      if (this.headerOf(4, what) !== 2) {
+        throw new NodeFormatError(`'${what}' run parent must be null or [replica, counter]`, this.cid);
+      }
+      const parentReplica = this.strictText(what);
+      const parentCounter = this.uint(what);
+      parent = this.built(what, "run parent", () => new CharId(parentReplica, parentCounter));
+    }
+    const side = this.strictText(what);
+    const length = this.uint(what);
+    const deleted = this.bool(what);
+    const runText = this.strictText(what);
+    return this.built(what, "run", () => new TextRun(replica, counter, parent, side as "L" | "R", length, deleted, runText));
+  }
+
+  /** A value the constructor builds, its refusal turned into a refusal of the node. */
+  private built<T>(what: string, name: string, constructor: () => T): T {
+    try {
+      return constructor();
+    } catch (e) {
+      throw new NodeFormatError(`'${what}' ${name} refused: ${e instanceof Error ? e.message : String(e)}`, this.cid);
+    }
   }
 
   uint(what: string): number {
@@ -371,10 +943,24 @@ class In {
     }
   }
 
-  embedded(): Embedded {
+  /** One embedded item, which must be in the wire encoding (see {@link checkEmbedded}). */
+  embedded(what: string, keySlot: boolean): Embedded {
     const start = this.p;
     skipItem(this, 0);
-    return new Embedded(this.bytes.subarray(start, this.p));
+    const bytes = this.bytes.subarray(start, this.p);
+    checkEmbedded(what, bytes, keySlot, this.cid);
+    return new Embedded(bytes);
+  }
+}
+
+/** Whether an argument sits in the shortest head that holds it. */
+function shortest(info: number, value: number): boolean {
+  switch (info) {
+    case 24: return value >= 24;
+    case 25: return value >= 0x100;
+    case 26: return value >= 0x10000;
+    case 27: return value >= 0x100000000;
+    default: return true;
   }
 }
 
@@ -427,6 +1013,12 @@ function skipItem(input: In, depth: number): void {
       default:
         throw new NodeFormatError(`indefinite length on major type ${major}`, input.cid);
     }
+  }
+  if ((major === 0 || major === 1) && info === 27) {
+    // an integer's argument is no length, so a skip passes any 64-bit one: a datom holds the whole signed
+    // range (PDT 2 phase 0, P2-D-01), and Java's skip reads every argument as a long
+    input.advance(8);
+    return;
   }
   const n = input.argument(info);
   switch (major) {
@@ -518,7 +1110,7 @@ function scan(bytes: Uint8Array, cid: string | null): Scan {
   return { kind, offsets };
 }
 
-function readField(input: In, key: string, field: Field): NodeValue {
+function readField(input: In, kind: string, key: string, field: Field): NodeValue {
   switch (field) {
     case "uint":
       return input.uint(key);
@@ -542,12 +1134,13 @@ function readField(input: In, key: string, field: Field): NodeValue {
       return list;
     }
     case "embedded":
-      return input.embedded();
+      return input.embedded(key, false);
     case "embeddeds": {
       const n = input.headerOf(4, key);
+      const keyed = isKeyed(kind, key);
       const list: Embedded[] = [];
       for (let i = 0; i < n; i++) {
-        list.push(input.embedded());
+        list.push(input.embedded(key, keyed && i % 2 === 0));
       }
       return list;
     }
@@ -559,11 +1152,37 @@ function readField(input: In, key: string, field: Field): NodeValue {
       }
       return list;
     }
-    case "bytes": {
-      const n = input.headerOf(2, key);
-      const start = input.p;
-      input.advance(n);
-      return input.bytes.slice(start, input.p);
+    case "bytes":
+      return input.byteString(key);
+    case "text":
+      return input.strictText(key);
+    case "cid":
+      return input.cidText(key);
+    case "cids": {
+      const n = input.headerOf(4, key);
+      const list: string[] = [];
+      for (let i = 0; i < n; i++) {
+        list.push(input.cidText(key));
+      }
+      return list;
+    }
+    case "index":
+      return input.index(key);
+    case "datoms": {
+      const n = input.headerOf(4, key);
+      const list: Datom[] = [];
+      for (let i = 0; i < n; i++) {
+        list.push(input.datom(key));
+      }
+      return list;
+    }
+    case "runs": {
+      const n = input.headerOf(4, key);
+      const list: TextRun[] = [];
+      for (let i = 0; i < n; i++) {
+        list.push(input.run(key));
+      }
+      return list;
     }
     default:
       throw new NodeFormatError(`unhandled field ${key}`, input.cid);
@@ -587,18 +1206,8 @@ export function decode(bytes: Uint8Array, cid: string | null = null): Node {
       throw new NodeFormatError(`key '${key}' outside the schema of kind '${scanned.kind}'`, cid);
     }
     input.p = offset;
-    const value = readField(input, key, field);
-    if (value instanceof Link) {
-      links += 1;
-    } else if (Array.isArray(value)) {
-      for (const item of value) {
-        if (item instanceof Link || (item instanceof Embedded && isLinkShaped(item.bytes))) {
-          links += 1;
-        }
-      }
-    } else if (value instanceof Embedded && isLinkShaped(value.bytes)) {
-      links += 1;
-    }
+    const value = readField(input, scanned.kind, key, field);
+    links += fieldLinks(scanned.kind, key, value).length;
     node[key] = value;
   }
   if (links > MAX_LINKS) {
@@ -613,8 +1222,42 @@ export function kindOf(bytes: Uint8Array, cid: string | null = null): string {
 }
 
 /**
+ * The links one field of a node carries, in order: a link, each link of a list, every embedded value item
+ * that is exactly a tag-42 link item (a spilled value, PD-N-05; a map node's key positions skipped), a
+ * `db` root's index links in aevt, avet, eavt order, and every datom value spilled to a link (PDT 2
+ * phase 0, P2-D-01).
+ */
+function fieldLinks(kind: string, key: string, value: NodeValue): string[] {
+  const out: string[] = [];
+  const keyed = isKeyed(kind, key);
+  const one = (item: unknown, keySlot: boolean): void => {
+    if (item instanceof Link) {
+      out.push(item.cid);
+    } else if (item instanceof Embedded && !keySlot) {
+      const spilled = spilledLink(item.bytes);
+      if (spilled !== null) {
+        out.push(spilled);
+      }
+    } else if (item instanceof Datom && item.v instanceof Link) {
+      out.push(item.v.cid);
+    }
+  };
+  if (Array.isArray(value)) {
+    value.forEach((item, i) => one(item, keyed && i % 2 === 0));
+  } else if (isIndexShaped(value)) {
+    for (const index of INDEX_KEYS) {
+      one(value[index], false);
+    }
+  } else {
+    one(value, false);
+  }
+  return out;
+}
+
+/**
  * The links of a node in field order: the link fields plus every embedded value item that is exactly a
- * tag-42 link item (a spilled value, PD-N-05); a map node's key positions are skipped. A raw chunk has
+ * tag-42 link item (a spilled value, PD-N-05; a map node's key positions are skipped), and for the level-2
+ * kinds the index links of a `db` root and the spilled values of datoms (PDT 2 phase 0). A raw chunk has
  * none.
  */
 export function links(bytes: Uint8Array, cid: string | null = null): string[] {
@@ -624,29 +1267,9 @@ export function links(bytes: Uint8Array, cid: string | null = null): string[] {
   const node = decode(bytes, cid);
   const kind = node[KIND_KEY] as string;
   const out: string[] = [];
-  const keyed = (kind === KIND_M || kind === KIND_MC);
   for (const [key, value] of Object.entries(node)) {
-    if (key === KIND_KEY) {
-      continue;
-    }
-    if (value instanceof Link) {
-      out.push(value.cid);
-    } else if (value instanceof Embedded) {
-      const spilled = spilledLink(value.bytes);
-      if (spilled !== null) {
-        out.push(spilled);
-      }
-    } else if (Array.isArray(value)) {
-      value.forEach((item, i) => {
-        if (item instanceof Link) {
-          out.push(item.cid);
-        } else if (item instanceof Embedded && !(keyed && key === "e" && i % 2 === 0)) {
-          const spilled = spilledLink(item.bytes);
-          if (spilled !== null) {
-            out.push(spilled);
-          }
-        }
-      });
+    if (key !== KIND_KEY) {
+      out.push(...fieldLinks(kind, key, value));
     }
   }
   return out;

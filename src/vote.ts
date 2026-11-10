@@ -27,47 +27,40 @@
  * rule accepted) is eligible, because a peer-asserted name is exactly what that
  * granularity exists to distrust.
  */
-import { loads } from "./cbor.js";
+import { readDocument } from "./cbor.js";
 import type { Dict } from "./wire.js";
-import type { Peer } from "./peer.js";
-import type { AgentIdentity } from "./identity.js";
+import { Peer, leaseExpiryOf, present } from "./peer.js";
+import { AgentIdentity, spaceIdLocal } from "./identity.js";
 
 export const BALLOT_TYPE = "ai.badmonkey.agentspaces.capabilities.vote.VoteCapability$Ballot#v1";
 export const PROPOSAL_TYPE = "ai.badmonkey.agentspaces.capabilities.vote.VoteCapability$Proposal#v1";
 export type Granularity = "PEER" | "AGENT";
 
-function dotKeys(dots: unknown): Set<string> {
-  const keys = new Set<string>();
-  for (const dot of Array.isArray(dots) ? dots as Dict[] : []) {
-    keys.add(`${String(dot["replica"])}:${String(dot["counter"])}`);
-  }
-  return keys;
-}
-
-/** The folded, present ballot records for one proposal, in stored order. */
-export function ballots(states: Map<string, Dict>, proposalId: string): Array<[Dict, Dict, Dict]> {
+/**
+ * The live entries of `type` in the vote space `space`, each as its record, its state and its decoded
+ * value: present, unlapsed, and of that space alone, as Java's VoteCapability reads its own vote space
+ * (HLC round six, 2026-11-08, R9). An entry whose value no read can decode is skipped.
+ */
+function liveValues(peer: Peer, space: string, type: string): Array<[Dict, Dict, Dict]> {
+  const spaceId = spaceIdLocal(`${peer.group}/${space}`);
+  const now = peer.now();
   const found: Array<[Dict, Dict, Dict]> = [];
-  for (const dto of states.values()) {
+  for (const dto of peer.states.values()) {
     const record = (dto["record"] as Dict) ?? {};
-    if (record["type"] !== BALLOT_TYPE || dto["completed"]) {
+    if (record["type"] !== type || record["spaceId"] !== spaceId || !present(dto) || leaseExpiryOf(dto) <= now) {
       continue;
     }
-    const removes = dotKeys(dto["removes"]);
-    if (![...dotKeys(dto["adds"])].some((k) => !removes.has(k))) {
-      continue; // withdrawn
-    }
-    let ballot: unknown;
-    try {
-      ballot = loads(record["payload"] as Uint8Array);
-    } catch {
-      continue;
-    }
-    if (typeof ballot === "object" && ballot !== null
-        && (ballot as Dict)["proposalId"] === proposalId) {
-      found.push([record, dto, ballot as Dict]);
+    const read = readDocument(record["payload"] as Uint8Array);
+    if (read !== null && typeof read.value === "object" && read.value !== null) {
+      found.push([record, dto, read.value as Dict]);
     }
   }
   return found;
+}
+
+/** The live ballot records for one proposal in the vote space `space`, in stored order. */
+export function ballots(peer: Peer, space: string, proposalId: string): Array<[Dict, Dict, Dict]> {
+  return liveValues(peer, space, BALLOT_TYPE).filter(([, , ballot]) => ballot["proposalId"] === proposalId);
 }
 
 /**
@@ -75,7 +68,7 @@ export function ballots(states: Map<string, Dict>, proposalId: string): Array<[D
  * answer (everyone, by default); `options` zero-fills and spoils ballots for
  * options the proposal does not offer, when known.
  */
-export function tally(states: Map<string, Dict>, proposalId: string,
+export function tally(peer: Peer, space: string, proposalId: string,
                       options: string[] | null = null, granularity: Granularity = "PEER",
                       permits: ((issuer: string) => boolean) | null = null): Map<string, number> {
   const result = new Map<string, number>();
@@ -83,7 +76,7 @@ export function tally(states: Map<string, Dict>, proposalId: string,
     result.set(option, 0);
   }
   const counted = new Set<string>();
-  for (const [record, dto, ballot] of ballots(states, proposalId)) {
+  for (const [record, dto, ballot] of ballots(peer, space, proposalId)) {
     const issuer = record["issuer"];
     if (typeof issuer !== "string" || ballot["voter"] !== issuer) {
       continue; // declared voter is not the authenticated writer: forged
@@ -113,22 +106,11 @@ export function tally(states: Map<string, Dict>, proposalId: string,
 /** A proposal as the fleet writes it (SPEC §8.4). */
 export type Proposal = { proposalId: string; question: string; options: string[]; quorum: number };
 
-/** The open proposals by id, from the folded Proposal records. */
-export function proposals(states: Map<string, Dict>): Map<string, Proposal> {
+/** The open proposals by id, from the live Proposal records of the vote space `space`. */
+export function proposals(peer: Peer, space: string): Map<string, Proposal> {
   const found = new Map<string, Proposal>();
-  for (const dto of states.values()) {
-    const record = (dto["record"] as Dict) ?? {};
-    if (record["type"] !== PROPOSAL_TYPE || dto["completed"]) {
-      continue;
-    }
-    let proposal: unknown;
-    try {
-      proposal = loads(record["payload"] as Uint8Array);
-    } catch {
-      continue;
-    }
-    const p = proposal as Dict;
-    if (typeof p === "object" && p !== null && typeof p["proposalId"] === "string" && !found.has(p["proposalId"])) {
+  for (const [, , p] of liveValues(peer, space, PROPOSAL_TYPE)) {
+    if (typeof p["proposalId"] === "string" && !found.has(p["proposalId"])) {
       found.set(p["proposalId"], { proposalId: p["proposalId"], question: String(p["question"] ?? ""),
         options: ((p["options"] as unknown[]) ?? []).map(String), quorum: Number(p["quorum"] ?? 0) });
     }
@@ -143,7 +125,7 @@ export function proposals(states: Map<string, Dict>): Map<string, Proposal> {
 export function propose(peer: Peer, space: string, proposalId: string, question: string,
                         options: string[], quorum: number, leaseMillis = 3_600_000,
                         agent: AgentIdentity | null = null, agentName = "typescript"): string | null {
-  if (proposals(peer.states).has(proposalId)) {
+  if (proposals(peer, space).has(proposalId)) {
     return null;
   }
   return peer.writeEntry(space, PROPOSAL_TYPE, { proposalId, question, options, quorum },
@@ -169,13 +151,13 @@ export type Decision = { proposalId: string; winner: string; tally: Map<string, 
  * voters reach the quorum, the option with the most votes wins, ties broken
  * to the lexicographically first option. Null while open or unknown.
  */
-export function decision(states: Map<string, Dict>, proposalId: string, granularity: Granularity = "PEER",
+export function decision(peer: Peer, space: string, proposalId: string, granularity: Granularity = "PEER",
                          permits: ((issuer: string) => boolean) | null = null): Decision | null {
-  const proposal = proposals(states).get(proposalId);
+  const proposal = proposals(peer, space).get(proposalId);
   if (proposal === undefined) {
     return null;
   }
-  const counts = tally(states, proposalId, proposal.options, granularity, permits);
+  const counts = tally(peer, space, proposalId, proposal.options, granularity, permits);
   let voters = 0;
   for (const n of counts.values()) {
     voters += n;

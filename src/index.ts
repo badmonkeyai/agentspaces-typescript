@@ -42,8 +42,11 @@ import * as revocation from "./revocation.js";
 export { revocation };
 import * as wire from "./wire.js";
 export { wire };
-export { BootstrapTimeoutError, Peer } from "./peer.js";
-export type { InviteJoined } from "./peer.js";
+import * as records from "./records.js";
+export { records };
+export { AD_CACHE_MAX_BYTES, AD_CACHE_MAX_ENTRIES, APPCARD_HINT, APPCARD_LEVEL, BootstrapTimeoutError, Peer,
+  SpillRefusedError, appCardLevelOf } from "./peer.js";
+export type { InviteJoined, SpillStore } from "./peer.js";
 import * as social from "./social.js";
 export { social };
 import * as beacon from "./beacon.js";
@@ -52,7 +55,6 @@ import * as vote from "./vote.js";
 export { vote };
 export * from "./space.js";
 export * from "./agents.js";
-export * from "./console.js";
 export { JOIN_TICKET_TYPE, JOIN_TAG, KEY_TAG, JoinBinding, JoinTicket, KeyTickets } from "./join.js";
 export type { JoinConfig, ResolvedPart } from "./join.js";
 export { GLOBAL_KEY, REDUCE_KEY_TAG, REDUCE_TAG, STEPS_TAG, ReduceBinding, current as currentAccumulator,

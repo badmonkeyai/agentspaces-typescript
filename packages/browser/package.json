@@ -1,6 +1,6 @@
 {
   "name": "@agentspaces/browser",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "The resident host of the AgentSpaces JavaScript client (srad/agentspaces-js.md JS-R-02): a SharedWorker or Worker holding one peer per identity per origin, pages attached over MessagePorts, keys and state in IndexedDB.",
   "license": "Apache-2.0",
   "type": "module",

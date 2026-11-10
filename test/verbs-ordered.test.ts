@@ -200,6 +200,26 @@ test("a claim installs only at epoch == committed + 1: a duplicate or a jump is 
   }
 });
 
+test("a take through the log skips a withdrawn entry and takes a renewed one past its first lease", async () => {
+  const f = await orderedFleet(1);
+  const [c1] = f.clients as [NetPeer];
+  try {
+    const orders = new Space(f.writer, "orders");
+    const withdrawn = orders.write(new Order("eu-7", "eu", 7), "10m");
+    f.writer.cancelEntry("orders", withdrawn);
+    const log1 = new OrderedLog(new Pipes(c1));
+    assert.equal(await log1.take("orders", "com.acme.Order#v1", "clerk", 30_000, 2000), null,
+      "the log takes no withdrawn entry (HLC round five, 2026-11-08)");
+    const renewed = orders.write(new Order("eu-8", "eu", 8), 1500);
+    f.writer.renewEntry("orders", renewed, 600_000);
+    await sleep(1600);
+    assert.equal(await log1.take("orders", "com.acme.Order#v1", "clerk", 30_000, 15_000), renewed,
+      "the renewed lease keeps the entry takeable");
+  } finally {
+    await f.close();
+  }
+});
+
 @agent("joiner")
 class OrderedJoiner {
   invocations = 0;

@@ -19,10 +19,12 @@
  * payload of a `PIPE_DATA` frame of capability {@link CAPABILITY}, a CBOR map in the canonical order
  * of wire version 3. Encoded through the core codec so the bytes match the Java `RtcSignal` record
  * exactly (indefinite map, component order `v, fp, mid, sdp, sid, cand, code, kind`, absent keys
- * omitted); receivers ignore unknown keys, so later fields need no migration.
+ * omitted). A receiver reads the body as Java's `fromWire` reads the record (HLC round seven,
+ * 2026-11-08; SPEC annex I): an unknown key, a field of the wrong type, a field out of order, or bytes
+ * other than the record's own encoding make the body undecodable, so a later field needs a new version.
  */
 
-import { cbor } from "@agentspaces/client";
+import { cbor, records } from "@agentspaces/client";
 import { normalize } from "./fingerprints.js";
 
 export const CAPABILITY = "aspace:cap/rtc-signal";
@@ -93,37 +95,31 @@ export function encode(signal: RtcSignal): Uint8Array {
   return cbor.dumps(body);
 }
 
-/** Decodes a signal body, ignoring unknown keys; returns null when it is not a map. */
+/**
+ * Decodes a signal body under the RtcSignal record (HLC round seven, 2026-11-08), or returns null when
+ * the body is undecodable: no RtcSignal in the wire encoding, or one whose `sid` or `kind` is null,
+ * which Java's malformed check refuses with the same count.
+ */
 export function decode(bytes: Uint8Array): RtcSignal | null {
-  let map: cbor.CborValue;
-  try {
-    map = cbor.loads(bytes);
-  } catch {
+  const m = records.readRecord(bytes, records.RTC_SIGNAL);
+  if (m === null || !(m["sid"] instanceof Uint8Array) || typeof m["kind"] !== "string") {
     return null;
   }
-  if (typeof map !== "object" || map === null || Array.isArray(map) || map instanceof Uint8Array) {
-    return null;
+  const signal: RtcSignal = { v: m["v"] as number, sid: m["sid"], kind: m["kind"] as SignalKind };
+  if (m["fp"] !== undefined) {
+    signal.fp = m["fp"] as string[];
   }
-  const m = map as { [key: string]: cbor.CborValue };
-  const signal: RtcSignal = {
-    v: typeof m["v"] === "number" ? m["v"] : -1,
-    sid: m["sid"] instanceof Uint8Array ? m["sid"] : new Uint8Array(),
-    kind: String(m["kind"]) as SignalKind,
-  };
-  if (Array.isArray(m["fp"])) {
-    signal.fp = m["fp"].map((x) => String(x));
+  if (m["mid"] !== undefined) {
+    signal.mid = m["mid"] as string;
   }
-  if (typeof m["mid"] === "string") {
-    signal.mid = m["mid"];
+  if (m["sdp"] !== undefined) {
+    signal.sdp = m["sdp"] as string;
   }
-  if (typeof m["sdp"] === "string") {
-    signal.sdp = m["sdp"];
+  if (m["cand"] !== undefined) {
+    signal.cand = m["cand"] as string;
   }
-  if (typeof m["cand"] === "string") {
-    signal.cand = m["cand"];
-  }
-  if (typeof m["code"] === "number") {
-    signal.code = m["code"];
+  if (m["code"] !== undefined) {
+    signal.code = m["code"] as number;
   }
   return signal;
 }

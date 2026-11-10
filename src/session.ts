@@ -25,7 +25,8 @@
  */
 
 import { concat, equals, utf8 } from "./bytes.js";
-import { CborValue, dumps, loads } from "./cbor.js";
+import { dumps } from "./cbor.js";
+import * as records from "./records.js";
 import { cryptoPort } from "./crypto.js";
 import * as wire from "./wire.js";
 import type { Dict } from "./wire.js";
@@ -46,28 +47,20 @@ export function sessionHelloBody(ephemeralKey: Uint8Array, nonce: Uint8Array, re
   return dumps({ ephemeralKey, nonce, remote, echo });
 }
 
-/** The hello a body decodes to, or null when it is not one. */
+/** The hello a body decodes to, or null when it is no Bodies.SessionHello read strictly (HLC round six, 2026-11-08, F3). */
 export function parseSessionHello(body: Uint8Array): { ephemeralKey: Uint8Array; nonce: Uint8Array;
     remote: string; echo: Uint8Array | null } | null {
-  let value: CborValue;
-  try {
-    value = loads(body);
-  } catch {
+  const hello = records.readRecord(body, records.SESSION_HELLO);
+  if (hello === null) {
     return null;
   }
-  if (typeof value !== "object" || value === null || Array.isArray(value) || value instanceof Uint8Array) {
+  const key = hello["ephemeralKey"] as Uint8Array | null;
+  const nonce = hello["nonce"] as Uint8Array | null;
+  const remote = hello["remote"] as string | null;
+  if (key === null || key.length !== 32 || nonce === null || nonce.length < 16 || nonce.length > 64 || remote === null) {
     return null;
   }
-  const hello = value as Dict;
-  const key = hello["ephemeralKey"];
-  const nonce = hello["nonce"];
-  const echo = hello["echo"];
-  if (!(key instanceof Uint8Array) || key.length !== 32 || !(nonce instanceof Uint8Array)
-      || nonce.length < 16 || nonce.length > 64 || typeof hello["remote"] !== "string"
-      || (echo !== null && echo !== undefined && !(echo instanceof Uint8Array))) {
-    return null;
-  }
-  return { ephemeralKey: key, nonce, remote: hello["remote"], echo: echo instanceof Uint8Array ? echo : null };
+  return { ephemeralKey: key, nonce, remote, echo: hello["echo"] as Uint8Array | null };
 }
 
 /**

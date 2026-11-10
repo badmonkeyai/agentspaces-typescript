@@ -47,7 +47,7 @@ test("one card per asset with the SPEC §6.1a fields alone and the appendix F ac
     assert.equal(card["issuer"], "zIssuer");
     assert.equal(card["group"], "zGroup");
     assert.equal(card["freshness"], "PT30S");
-    assert.equal(card["ttl"], "PT60S", "the TTL is twice the freshness");
+    assert.equal(card["ttl"], "PT1M", "the TTL is twice the freshness, as Java's Duration prints it");
     const access = card["access"] as StringMap;
     assert.equal(access["runtime"], "celld");
     assert.equal(access["connector"], "cell");
@@ -99,7 +99,7 @@ test("card ids are stable across renderings, restarts, and moves (JS-C-08)", () 
   assert.deepEqual(a, b, "the id depends on the application and the asset alone, never the issuer or the instant");
   assert.equal(cardId("inventory", "do/Inventory"), "inventory:do/Inventory");
   assert.equal(cardTtl({ application: "x" }), "PT2M");
-  assert.equal(cardTtl({ application: "x", freshness: "PT45S" }), "PT90S");
+  assert.equal(cardTtl({ application: "x", freshness: "PT45S" }), "PT1M30S");
   assert.equal(cardTtl({ application: "x", freshness: "PT45S", ttl: "PT5M" }), "PT5M");
 });
 

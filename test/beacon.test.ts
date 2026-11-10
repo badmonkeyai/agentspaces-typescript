@@ -221,8 +221,11 @@ test("canonical bytes follow Jackson: declared order, sorted maps, nulls omitted
   const parsed = beacon.parseBeaconDocument(json);
   assert.deepEqual(beacon.canonicalDocumentBytes(parsed), beacon.canonicalDocumentBytes(document));
   assert.equal(beacon.documentSigner(parsed), issuer.peerId);
-  // Unknown fields are ignored; a forbidden parameter is refused; v < 1 is refused.
-  assert.equal(beacon.parseBeaconDocument(json.slice(0, -1) + ",\"future\":true}").groups.length, 2);
+  // HLC round seven, 2026-11-08: a signed document arrives canonical, so an unknown field refuses it;
+  // an unsigned one ignores it. A forbidden parameter is refused; v < 1 is refused.
+  assert.throws(() => beacon.parseBeaconDocument(json.slice(0, -1) + ",\"future\":true}"), /canonical JSON/);
+  const unsigned = beacon.documentJson({ ...document, signature: null });
+  assert.equal(beacon.parseBeaconDocument(unsigned.slice(0, -1) + ",\"future\":true}").groups.length, 2);
   assert.throws(() => beacon.parseBeaconDocument(JSON.stringify({ v: 1, ttl: 1,
     groups: [{ name: "x", parameters: { "Content-Key": "no" } }] })), /never carries/);
   assert.throws(() => beacon.parseBeaconDocument(JSON.stringify({ v: 0, ttl: 1, groups: [] })), /v=0/);

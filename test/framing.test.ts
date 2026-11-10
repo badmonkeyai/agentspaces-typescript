@@ -163,18 +163,17 @@ test("the exchange batch codec judges every bound before copying, on both sides"
   assert.throws(() => decodeBatch(many), /frames in one body/);
 });
 
-test("tagged items decode: bignums, decimal fractions, dates, and unknown tags unwrap (RFC 8949 §3.4)", () => {
+test("a tag decodes only as a big number in the wire encoding's form; every other tagged item is refused (HLC round six, 2026-11-08, S9)", () => {
   const hex = (h: string): Uint8Array => Uint8Array.from(Buffer.from(h, "hex"));
-  assert.equal(loads(hex("c249010000000000000000")), 18446744073709551616n); // tag 2, 2^64: beyond a safe integer, exact
-  assert.equal(loads(hex("c2420100")), 256);                                 // tag 2, within range
-  assert.equal(loads(hex("c3420100")), -257);                                // tag 3
-  assert.equal(loads(hex("c4822003")), 0.3);                                 // tag 4: [-1, 3] is 3 * 10^-1
-  assert.equal(loads(hex("c482211a000f4240")), 10000);                       // tag 4: [-2, 1000000], a Java BigDecimal
-  assert.ok(Math.abs((loads(hex("c48228c2481874f583e9f63f15")) as number) - 1762303301.123456789) < 1e-6); // tag 4 over a bignum mantissa: an Instant's seconds.nanos
-  assert.equal(loads(hex("c5822003")), 1.5);                                 // tag 5: [-1, 3] is 3 * 2^-1
-  assert.equal(loads(hex("c074323031332d30332d32315432303a30343a30305a")), "2013-03-21T20:04:00Z"); // tag 0
-  assert.equal(loads(hex("c11a514b67b0")), 1363896240);                      // tag 1
-  assert.deepEqual({ ...(loads(hex("d9d9f7a16161c3420100")) as object) }, { a: -257 }); // the self-described tag (55799) unwraps
-  assert.throws(() => loads(hex("c4a0")), /needs/);                          // a fraction that is not [exponent, mantissa]
-  assert.throws(() => loads(hex("c2a0")), /needs/);                          // a bignum that is not a byte string
+  // A bignum past a Java long, a normalized decimal, a decimal with a bignum mantissa past a long.
+  for (const item of ["c249010000000000000000", "c3490100000000000000ff", "c4822003", "c482201a80000000",
+    "c48228c249008000000000000001", "8201c249010000000000000000"]) {
+    assert.doesNotThrow(() => loads(hex(item)), item);
+  }
+  // A bignum a long holds, a decimal with a trailing zero, a bignum mantissa a long holds, an
+  // indefinite array, a tag other than 2, 3 and 4, and a big-number tag over any other item.
+  for (const item of ["c2420100", "c3420100", "c482211a000f4240", "c48228c2481874f583e9f63f15", "9f01ff",
+    "c5822003", "c074323031332d30332d32315432303a30343a30305a", "c11a514b67b0", "d9d9f7a16161c3420100", "c4a0", "c2a0"]) {
+    assert.throws(() => loads(hex(item)), RangeError, item);
+  }
 });

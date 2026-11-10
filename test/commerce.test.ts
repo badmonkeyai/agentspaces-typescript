@@ -1,15 +1,3 @@
-// The Bad Monkey console records as data (enterprise platform, spiral 3 S3-H-06): the entry types the console
-// and its agents write into a group's `constraints`, `policy`, `decisions`, and `findings` spaces, named by the
-// console namespace `https://badmonkey.ai/console#<Record>` so a TypeScript peer reads them with the same
-// `Template` it uses for its own entries. A field the wire carries that a class here does not declare still
-// arrives on the instance; the declared ones document the shape.
-//
-//     import { Constraint, rules } from "@agentspaces/client";
-//     for (const c of new Space(peer, "constraints").readAll(new Template(Constraint))) console.log(c.template, c.a, c.b);
-//     const counts = Object.fromEntries(Object.entries(rules(peer)).map(([k, v]) => [k, v.length]));
-
-
-
 /** The commerce twins (SPEC §6.5a): the builders emit the Java field order and the golden vectors of agentspaces-commerce round-trip byte for byte. */
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";

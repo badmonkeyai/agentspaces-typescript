@@ -24,7 +24,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { Binder, agent, ballot, bidFunction, onDecision, spaceNotify, spaceTake } from "../src/agents.js";
+import { Binder, CATALOG_SPACE, agent, ballot, bidFunction, dataUse, onDecision, spaceNotify, spaceTake } from "../src/agents.js";
 import type { Decision, Proposal } from "../src/agents.js";
 import { dumps, loads } from "../src/cbor.js";
 import { Identity } from "../src/identity.js";
@@ -299,13 +299,13 @@ test("a ballot casts once per proposal and a decision fires once at quorum", asy
     peer.foldAllFrom(other);
     vote.propose(other, "votes", "ops:2", "ship?", ["yes", "no"], 1);
     peer.foldAllFrom(other);
-    assert.ok(await until(5_000, () => vote.tally(peer.states, "rel:1").get("yes") === 1));
-    assert.deepEqual(vote.ballots(peer.states, "ops:2"), []);
-    assert.equal(vote.decision(peer.states, "rel:1"), null);
+    assert.ok(await until(5_000, () => vote.tally(peer, "votes", "rel:1").get("yes") === 1));
+    assert.deepEqual(vote.ballots(peer, "votes", "ops:2"), []);
+    assert.equal(vote.decision(peer, "votes", "rel:1"), null);
     vote.cast(other, "votes", "rel:1", "no");
     peer.foldAllFrom(other);
     assert.ok(await until(5_000, () => panelist.decided.length === 1));
-    const decided = vote.decision(peer.states, "rel:1")!;
+    const decided = vote.decision(peer, "votes", "rel:1")!;
     assert.equal(decided.winner, "no");
     assert.deepEqual([...decided.tally.entries()].sort(), [["no", 1], ["yes", 1]]);
     assert.ok(await until(5_000, () => new Space(peer, "ledger").readAll(new Template(Verdict)).length === 1));
@@ -318,8 +318,36 @@ test("a ballot casts once per proposal and a decision fires once at quorum", asy
     vote.propose(other, "votes", "rel:2", "hold?", ["yes", "no"], 1);
     peer.foldAllFrom(other);
     await sleep(100);
-    assert.deepEqual(vote.ballots(peer.states, "rel:2"), []);
+    assert.deepEqual(vote.ballots(peer, "votes", "rel:2"), []);
   } finally {
     await bound.close();
+  }
+});
+
+// The data-use hook names no product's record (neutral vectors, 2026-11-09): the binder writes, into the group's
+// catalog space, the record type its caller names, one leased entry per declaration.
+const DATA_USE = "https://example.org/ns/demo/v1/DataUse";
+
+@dataUse({ type: DATA_USE, reads: ["orders"], source: "jdbc:postgresql://db/orders", sensitivity: "internal" })
+@agent("auditor")
+class Auditor {
+  @spaceNotify(Task, "tasks")
+  seen(_task: Task): void {
+    // observes only
+  }
+}
+
+test("the data-use hook writes the record type its caller names into the catalog space", async () => {
+  const peer = new StubPeer();
+  const bound = new Binder(peer, { publishCard: false, agentName: "auditor" }).bind(new Auditor());
+  try {
+    assert.equal(bound.dataUse.length, 1);
+    const written = new Space(peer, CATALOG_SPACE).entries(new Template(ANY_TYPE));
+    assert.deepEqual(written.map((e) => e.type), [DATA_USE]);
+    assert.deepEqual(new Space(peer, CATALOG_SPACE).readAll(new Template<Dict>(ANY_TYPE)).map((v) => [v["agent"], v["reads"],
+      v["source"], v["sensitivity"]]), [["auditor", ["orders"], "jdbc:postgresql://db/orders", "internal"]]);
+  } finally {
+    await bound.close();
+    peer.close();
   }
 });

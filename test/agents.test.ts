@@ -77,11 +77,14 @@ test("a renewing agent stays verifiable after its first certificate lapses", () 
   const host = Identity.generate();
   const agent = host.renewingSubordinate("planner", "PT1H", Identity.generate(), clock.now);
   const first = agent.certificate;
+  // Six-hour leases outlive the receipt four hours on: the receiver refuses at the door a state whose
+  // lease lapsed past its grace (SPEC §7.3, HLC round five, 2026-11-08).
+  const lease = 6 * 60 * 60 * 1000;
   const early = deltaState(wire.entryDelta("tasks", GROUP, "T#v1", new Uint8Array([1]), host, "x",
-    600_000, agent, clock.millis).body);
+    lease, agent, clock.millis).body);
   clock.advance(31 * 60 * 1000);
   const later = deltaState(wire.entryDelta("tasks", GROUP, "T#v1", new Uint8Array([2]), host, "x",
-    600_000, agent, clock.millis).body);
+    lease, agent, clock.millis).body);
   assert.notEqual(agent.certificate, first);
   assert.equal(agent.certificateCovering(T0), first);
   clock.advance(4 * 60 * 60 * 1000);
@@ -292,7 +295,7 @@ test("a revoked holder's completion is refused though its claim came first", () 
   assert.equal(receiver.states.get(String(record["entryId"]))!["completed"], false);
 });
 
-test("a state whose signedAt is not a stamp is judged without throwing", () => {
+test("a state whose signedAt is not a stamp is refused without throwing", () => {
   const clock = new Clock(T0);
   const host = Identity.generate();
   const state = deltaState(wire.entryDelta("tasks", GROUP, "T#v1", new Uint8Array([1]), host, "x",
@@ -304,8 +307,9 @@ test("a state whose signedAt is not a stamp is judged without throwing", () => {
     state["leaseValue"] as Dict, false, null, "not-a-stamp");
   const odd = { ...state, signedAt: "not-a-stamp", stateSig: host.sign(dumps(view)) };
   const receiver = new Peer(Identity.generate(), GROUP, clock.now);
+  // HLC round four, 2026-11-08 (D1): a signedAt is a stamp like any other, so the state is refused.
   assert.doesNotThrow(() => internals(receiver).fold(odd));
-  assert.equal(receiver.states.size, 1);
+  assert.equal(receiver.states.size, 0);
 });
 
 test("the peer clock judges skew and stamps the introduction", () => {
@@ -334,7 +338,8 @@ test("the peer clock judges skew and stamps the introduction", () => {
 test("a PING with a Java-sized 64-bit nonce is answered with that exact nonce", () => {
   const peer = new Peer(Identity.generate(), GROUP, new Clock(T0).now);
   const sent = capture(peer);
-  for (const nonce of [-4578347444961987476n, 8646844919576911264n - 2n ** 64n, 7n]) {
+  // Every Java long, its extremes included; a value past a long is no nonce (HLC round six, 2026-11-08, F1).
+  for (const nonce of [-4578347444961987476n, 8646844919576911264n, -(2n ** 63n), 2n ** 63n - 1n, 7n]) {
     internals(peer).handle({ kind: "PING", body: wire.pingBody(nonce),
       stamp: `${T0}:0:${Identity.generate().peerId}` });
     const [kind, body] = sent.at(-1)!;

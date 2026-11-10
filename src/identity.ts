@@ -26,7 +26,8 @@
  */
 
 import { concat, equals, fromHex, toHex, utf8 } from "./bytes.js";
-import { CborDouble, CborValue, dumps, loads } from "./cbor.js";
+import { CborValue, dumps } from "./cbor.js";
+import * as records from "./records.js";
 import { cryptoPort } from "./crypto.js";
 
 type Dict = { [key: string]: CborValue };
@@ -150,28 +151,19 @@ export function foundGroup(identity: Identity, name: string, membershipPolicy: s
  * Accepts the decoded SignedGroupAdvertisement or its raw CBOR bytes.
  */
 export function verifySignedGroupAd(signed: CborValue | Uint8Array): string | null {
-  let value: CborValue = signed;
-  if (signed instanceof Uint8Array) {
-    try {
-      value = loads(signed);
-    } catch {
-      return null;
-    }
-  }
-  if (typeof value !== "object" || value === null || Array.isArray(value)
-      || value instanceof CborDouble) {
+  // HLC round six, 2026-11-08 (F1, F3): the bytes read strictly, or the decoded value conformed, as a
+  // SignedGroupAdvertisement, so the founding fields hold exactly the kinds and text Java signs.
+  const wrapper = signed instanceof Uint8Array ? records.readRecord(signed, records.SIGNED_GROUP_ADVERTISEMENT)
+    : records.conformed(signed, records.SIGNED_GROUP_ADVERTISEMENT);
+  if (wrapper === null) {
     return null;
   }
-  const wrapper = value as Dict;
-  const ad = wrapper["advertisement"];
-  const key = wrapper["founderPublicKey"];
-  const signature = wrapper["signature"];
-  if (typeof ad !== "object" || ad === null || Array.isArray(ad)
-      || !(key instanceof Uint8Array) || key.length !== 32
-      || !(signature instanceof Uint8Array)) {
+  const advertisement = wrapper["advertisement"] as Dict;
+  const key = wrapper["founderPublicKey"] as Uint8Array;
+  const signature = wrapper["signature"] as Uint8Array;
+  if (key.length !== 32) {
     return null;
   }
-  const advertisement = ad as Dict;
   const group = advertisement["group"];
   if (typeof group !== "string" || deriveId(key) !== advertisement["issuer"]) {
     return null;
@@ -279,18 +271,32 @@ export function certificateCovers(certificate: Dict, signingMillis: number): boo
 
 /**
  * AgentCertificates.verifyAt (SPEC §4.2, v0.1.13): judged at the signing time
- * of what it certifies (a record's issue stamp, a claim's stamp, a state's
- * signedAt), not at receipt. The window covers the signing time, which may
- * lead the receiver's clock by at most the HLC drift ceiling, and every check
- * of `verifyAgentCertificate` holds at that time.
+ * of what it certifies. The window covers the signing time,
+ * which may lead the receiver's clock by at most the HLC drift ceiling, and
+ * every check of `verifyAgentCertificate` holds at that time. A replica judges
+ * no stamp so since HLC round six, 2026-11-08 (F4): a record's, a claim's and a
+ * state's signing time meet D4's far-future rule after
+ * {@link verifyAgentCertificateCovering} instead.
  */
 export function verifyAgentCertificateAt(certificate: unknown, peerPublicRaw: Uint8Array,
                                          expectedAgent: string, signingMillis: number,
                                          receiverNowMillis: number): boolean {
+  return signingMillis <= receiverNowMillis + MAX_DRIFT_MILLIS
+    && verifyAgentCertificateCovering(certificate, peerPublicRaw, expectedAgent, signingMillis);
+}
+
+/**
+ * Every check of {@link verifyAgentCertificateAt} but the drift ceiling: the certificate's window
+ * covers the signing time and every check of `verifyAgentCertificate` holds at that time. A record's
+ * issue stamp, a claim's stamp (HLC round five, 2026-11-08, E4) and a state's signedAt (HLC round
+ * six, 2026-11-08, F4) are judged so, and D4 then defers or refuses a stamp that leads the receiver's
+ * wall exactly as for a peer-signed record or claim.
+ */
+export function verifyAgentCertificateCovering(certificate: unknown, peerPublicRaw: Uint8Array,
+                                               expectedAgent: string, signingMillis: number): boolean {
   try {
     if (typeof certificate !== "object" || certificate === null || Array.isArray(certificate)
-        || !certificateCovers(certificate as Dict, signingMillis)
-        || signingMillis > receiverNowMillis + MAX_DRIFT_MILLIS) {
+        || !certificateCovers(certificate as Dict, signingMillis)) {
       return false;
     }
   } catch {
@@ -303,6 +309,32 @@ export function verifyAgentCertificateAt(certificate: unknown, peerPublicRaw: Ui
 export function instantIso(millis: number): string {
   const text = new Date(millis).toISOString(); // always .sssZ
   return millis % 1000 === 0 ? text.replace(/\.000Z$/, "Z") : text;
+}
+
+/**
+ * Milliseconds as java.time.Duration.toString prints a non-negative duration: `PT0S`, else hours,
+ * minutes and seconds each when not zero, the seconds with the fraction's trailing zeros dropped
+ * (`PT1M` for a minute). A receiver refuses any other spelling (HLC round six, 2026-11-08, P2).
+ */
+export function durationIso(millis: number): string {
+  if (!Number.isSafeInteger(millis) || millis < 0) {
+    throw new RangeError(`a duration is a non-negative whole number of milliseconds: ${millis}`);
+  }
+  const hours = Math.floor(millis / 3_600_000);
+  const minutes = Math.floor((millis % 3_600_000) / 60_000);
+  const seconds = Math.floor((millis % 60_000) / 1000);
+  const fraction = millis % 1000;
+  let text = "PT";
+  if (hours > 0) {
+    text += `${hours}H`;
+  }
+  if (minutes > 0) {
+    text += `${minutes}M`;
+  }
+  if (seconds > 0 || fraction > 0 || text === "PT") {
+    text += fraction === 0 ? `${seconds}S` : `${seconds}.${String(fraction).padStart(3, "0").replace(/0+$/, "")}S`;
+  }
+  return text;
 }
 
 /** AgentCertificates.sign: the peer signs the body. Only the agent's own peer may certify it. */
@@ -478,8 +510,15 @@ export class Identity {
     return cryptoPort().ed25519Sign(this.seed, message);
   }
 
-  /** The AgentID string form: '<peerId>/<localName>'. */
+  /**
+   * The AgentID string form: '<peerId>/<localName>'. Throws for a local name that is empty or holds a
+   * "/" or a ":", which Java's AgentId grammar refuses and no receiver decodes (HLC round six,
+   * 2026-11-08, R5).
+   */
   agent(localName: string): string {
+    if (localName.length === 0 || localName.includes("/") || localName.includes(":")) {
+      throw new Error(`an agent's local name is non-empty and holds no "/" and no ":": ${JSON.stringify(localName)}`);
+    }
     return `${this.peerId}/${localName}`;
   }
 

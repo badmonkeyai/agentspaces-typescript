@@ -25,8 +25,9 @@
  *     const value = await aggregate.awaitSettled("load", Settle.after(3, 0.01), 20_000);
  */
 
-import { CborDouble, CborValue, canonicalMap, dumps, loads } from "../cbor.js";
+import { CborDouble, canonicalMap, dumps } from "../cbor.js";
 import { instantIso } from "../identity.js";
+import { AGGREGATE_FRAME, readRecord } from "../records.js";
 import * as wire from "../wire.js";
 import type { Dict } from "../wire.js";
 import type { Pipes } from "./pipes.js";
@@ -61,19 +62,6 @@ export type Estimate = { epochId: string; mode: Mode; value: number; ticks: numb
 
 type Watch = { epochs: (id: string) => boolean; settle: Settle; listener: (e: Estimate) => void;
   tracks: Map<string, { last: number | null; stable: number; fired: boolean; seen: number }> };
-
-function num(value: CborValue | undefined): number {
-  if (value instanceof CborDouble) {
-    return value.value;
-  }
-  if (typeof value === "number") {
-    return value;
-  }
-  if (typeof value === "bigint") {
-    return Number(value);
-  }
-  return Number.NaN;
-}
 
 /** One node's share of every epoch it joined or heard about. */
 export class Aggregate {
@@ -312,13 +300,10 @@ export class Aggregate {
   }
 
   private onFrame(_from: string, payload: Uint8Array): void {
-    let frame: Dict;
-    try {
-      frame = loads(payload) as Dict;
-    } catch {
-      return;
-    }
-    if (typeof frame !== "object" || frame === null) {
+    // HLC round seven, 2026-11-08: a frame decodes as Java's fromWire reads it, under its annex I
+    // schema and the canonical-bytes rule, or it is dropped unheard
+    const frame = readRecord(payload, AGGREGATE_FRAME);
+    if (frame === null) {
       return;
     }
     this.exchanged = true;
@@ -332,19 +317,19 @@ export class Aggregate {
       this.received.set(id, (this.received.get(id) ?? 0) + 1);
     }
     if (share && typeof share["epochId"] === "string") {
-      const value = num(share["value"]);
-      const weight = num(share["weight"]);
+      const value = (share["value"] as CborDouble).value;
+      const weight = (share["weight"] as CborDouble).value;
       if (Number.isFinite(value) && Number.isFinite(weight) && weight >= 0) {
         const e = this.epoch(share["epochId"]);
         e.value += value;
         e.weight += weight;
       }
     } else if (extremum && typeof extremum["epochId"] === "string") {
-      this.mergeExtremum(extremum["epochId"], Boolean(extremum["max"]), num(extremum["value"]));
-    } else if (roster && typeof roster["epochId"] === "string") {
+      this.mergeExtremum(extremum["epochId"], extremum["max"] as boolean, (extremum["value"] as CborDouble).value);
+    } else if (roster && typeof roster["epochId"] === "string" && roster["members"] !== null) {
       const members = this.roster(roster["epochId"]);
-      for (const m of (roster["members"] as CborValue[]) ?? []) {
-        members.add(BigInt(m as number | bigint));
+      for (const m of roster["members"] as Array<number | bigint>) {
+        members.add(BigInt(m));
       }
     }
   }

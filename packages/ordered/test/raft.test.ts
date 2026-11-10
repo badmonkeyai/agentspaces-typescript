@@ -207,3 +207,24 @@ test("the Raft frames encode as the Java records do (golden raft_*)", () => {
     GOLDEN["raft_append_reply_cbor"]);
   assert.equal(hex(frame("clientSubmit", { command: new TextEncoder().encode("cmd") })), GOLDEN["raft_client_submit_cbor"]);
 });
+
+test("a voter reads a frame as Java's fromWire reads RaftMessages.Frame (HLC round seven, 2026-11-08)", async () => {
+  const bus = new Bus();
+  const { logs } = await cluster(bus, ["zA"], new Map([["zA", new MemoryLogStore()]]));
+  const voter = logs.get("zA")!;
+  const deliver = async (payload: Uint8Array) => {
+    bus.handlers.get("zA")!("zClient", payload);
+    await settle();
+  };
+  const command = new TextEncoder().encode("cmd");
+  await deliver(frame("clientSubmit", { command }));
+  assert.equal(voter.clientSubmits, 1);
+  // each relabel is undecodable: dropped before any judgement, neither counted as a submit nor refused
+  await deliver(dumps({ clientSubmit: { command } }));
+  await deliver(dumps({ requestVote: null, voteReply: null, appendEntries: null, appendReply: null,
+    clientSubmit: { command }, later: 1 }));
+  await deliver(frame("clientSubmit", { command: "cmd" }));
+  await deliver(frame("clientSubmit", { command, x: 1 }));
+  assert.equal(voter.clientSubmits, 1);
+  assert.equal(voter.clientSubmitsRefused, 0);
+});
