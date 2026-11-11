@@ -914,20 +914,44 @@ export class Peer {
    * peer. Answers that fail verification are ignored, so a hostile seed can
    * delay the join but never substitute a policy. Rejects with a timeout
    * error when no verified document arrives in time.
+   *
+   * `groupId` is the bare id or the join URI `aspace://<id>[/<space>]`, read
+   * as Java's `GroupId.ofUri` reads it. `scheme` names the seed's transport
+   * (`tcp` by default, `tls`, `ws`, or any scheme a registered dialer serves).
+   * The want goes out again while the join waits, in slices of 1 s, 2 s, 4 s,
+   * then 5 s, as Java's join does (ISSUE-BootstrapRobustness FR-4), so a seed
+   * that missed the first want or had not yet founded the group still answers.
    */
   async joinByGroupId(host: string, port: number, groupId: string,
-                      timeoutMillis = 10_000): Promise<Dict> {
-    this.group = groupId;
-    await this.dialAny([{ host, port }]);
-    const founding = this.awaitFounding(groupId, timeoutMillis);
+                      timeoutMillis = 10_000, scheme = "tcp"): Promise<Dict> {
+    const id = beacon.bareGroupId(groupId);
+    if (id === null) {
+      throw new Error(`no GroupId in '${groupId}'`);
+    }
+    this.group = id;
+    await this.dialAny([scheme.toLowerCase() === "tcp" ? { host, port } : { host, port, scheme }]);
+    const founding = this.awaitFounding(id, timeoutMillis);
     // Unaddressed: the seed's PeerID is unknown until it answers (§9).
-    this.sendEnvelope(wire.groupAdWantEnvelope(groupId, this.identity.peerId,
+    const want = (): void => this.sendEnvelope(wire.groupAdWantEnvelope(id, this.identity.peerId,
       wire.hlcNow(this.identity.peerId, this.now())));
+    want();
+    let resend: unknown = null;
+    let slice = 1_000;
+    const again = (): void => {
+      resend = this.timers.setTimeout(() => {
+        want();
+        slice = Math.min(slice * 2, 5_000);
+        again();
+      }, slice);
+    };
+    again();
     try {
       this.founding = await founding;
     } catch (e) {
       this.close();
       throw e;
+    } finally {
+      this.timers.clearTimeout(resend);
     }
     this.introduce();
     this.pullRevocations();
@@ -1676,6 +1700,16 @@ export class Peer {
     return this.foldOrTimeout(maxMillis);
   }
 
+  /**
+   * Resolves after exactly `millis` on this peer's timers, whatever folds meanwhile: the take's settle
+   * window, which a fold must never shorten.
+   */
+  private settle(millis: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      this.timers.setTimeout(resolve, Math.max(0, millis));
+    });
+  }
+
   /** Resolves on the next fold or after `maxMillis`, whichever comes first. */
   private foldOrTimeout(maxMillis: number): Promise<void> {
     return new Promise<void>((resolve) => {
@@ -1954,7 +1988,11 @@ export class Peer {
         this.claims.set(entryId, wire.mergeClaims(this.claims.get(entryId), signed));
         this.send("RUMOR", wire.rumorBody(`space:${space}`,
           `c:${entryId}:${claim["stamp"]}`, 6, wire.claimDelta(entryId, signed)));
-        await this.foldOrTimeout(settleMillis); // the settle window: a competing claim folds within it
+        // The settle window is waited in full, as the Python and Java takes wait it: a competing
+        // claim folds within it. Waking at the first fold of any entry ended the window early in a
+        // busy space, so this peer judged the race before the rival claim arrived, kept a claim it
+        // had lost, and two takers ran one task (2026-11-11, exactly-once over TLS).
+        await this.settle(settleMillis);
         this.pullSpacePaced(space, settleMillis);
         await this.foldOrTimeout(Math.min(settleMillis, 300));
         const winner = this.claims.get(entryId)?.["claim"] as Dict | undefined;
