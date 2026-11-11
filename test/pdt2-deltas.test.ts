@@ -64,7 +64,7 @@ test("PDT 2 phase 7: the dcz reader refuses by name what decision 4 refuses, bef
   const big = new Uint8Array(300 * 1024);
   const magicBase = concat(Uint8Array.of(0x37, 0xa4, 0x30, 0xec), BASE.subarray(4));
   const cases: [string, () => Uint8Array, RegExp][] = [
-    ["a VCDIFF frame", () => withByte(FIELD, 0, 0x76), /VCDIFF/],
+    ["a VCDIFF frame", () => withByte(FIELD, 0, 0x76), /VCDIFF.*send a zstd frame/],
     ["an unknown format byte", () => withByte(FIELD, 0, 0x78), /unknown format byte 0x78/],
     ["no RFC 9842 header", () => withByte(FIELD, 1, 0x00), /no RFC 9842 dcz header/],
     ["another base", () => withByte(FIELD, 20, FIELD[20]! ^ 1), /names another base/],

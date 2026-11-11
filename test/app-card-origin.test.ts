@@ -91,10 +91,16 @@ test("each refusal vector is refused at decode for its own rule", () => {
 
 test("the origin builder rebuilds the vector's origin and stores no empty attrs", () => {
   const card = records.decodeRecord(hex("app_card_origin_formats_cbor"), records.APP_CARD) as Dict;
-  const origin = wire.appCardOrigin("realm", "example-realm/example-app", "", {
-    "realm.namespace": "urn:realm:example-realm#", "realm.format": "1", "realm.reads": "Item,Order" });
+  // the realm values of SPEC v0.1.33 (REALM.md §5 revision 4): the realm's semver, the form and the specification
+  // commit, the realm's commit, the import document's digest, and the app link as url
+  const origin = wire.appCardOrigin("realm", "example-realm/example-app", "1.0.0", {
+    "realm.namespace": "urn:realm:example-realm#", "realm.format": "yaml@89faba629f66e715421ba0f1b535142e4d2ef3aa",
+    "realm.digest": "sha256:ae7219d1e1e24b382d3ffc38aeb92052628db2d0f55d5dc75b3a72fd19965637",
+    "realm.commit": "0123456789abcdef0123456789abcdef01234567", "realm.reads": "Item,Order" });
   assert.deepEqual(dumps(origin), dumps(card["origin"]!));
-  assert.deepEqual(Object.keys(origin["attrs"] as Dict), ["realm.reads", "realm.format", "realm.namespace"]);
+  assert.deepEqual(Object.keys(origin["attrs"] as Dict),
+    ["realm.reads", "realm.commit", "realm.digest", "realm.format", "realm.namespace"]);
+  assert.equal(card["url"], "app://example-realm/example-app");
   assert.deepEqual(wire.appCardOrigin("console", "example-console/example-board", "", {}),
     { system: "console", ref: "example-console/example-board", version: "" });
   assert.deepEqual(wire.appCardOrigin("com.example.apps", "a/b"), { system: "com.example.apps", ref: "a/b", version: "" });
@@ -153,7 +159,7 @@ test("a host is idp by default and refuses tenant", () => {
 
 test("the semantic text adds the origin's system and ref and every format after the url", () => {
   const card = records.decodeRecord(hex("app_card_origin_formats_cbor"), records.APP_CARD) as Dict;
-  assert.equal(textOf("AppCard", card), "example-app fed static example-realm https://apps.example.org/example-app.html"
+  assert.equal(textOf("AppCard", card), "example-app fed static example-realm app://example-realm/example-app"
     + " realm example-realm/example-app text/html application/geo+json urn:realm:example-realm#");
   const hosted = records.decodeRecord(hex("app_card_host_cbor"), records.APP_CARD) as Dict;
   assert.equal(textOf("AppCard", hosted), "Support chat fed a2ui support ");

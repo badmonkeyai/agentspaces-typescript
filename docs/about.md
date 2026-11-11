@@ -9,8 +9,8 @@ AgentSpaces is a P2P framework to quickly discover and join P2P networks, where 
 ## About @agentspaces/client
 
 The TypeScript wire-compatible client: the same protocol the Java and Python
-peers speak. From 0.4.0 the client is a **portable core**
-(`srad/agentspaces-js.md` §3.1): the main entry imports no Node module, so it
+peers speak. From 0.4.0 the client is a **portable core**:
+the main entry imports no Node module, so it
 loads in browsers, Web Workers, Cloudflare Workers and workerd, Deno, and Bun
 as it does on Node 22 or later. Crypto runs on the audited noble libraries
 (`@noble/curves`, `@noble/hashes`) everywhere; the CBOR codec is in

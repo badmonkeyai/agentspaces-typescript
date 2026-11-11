@@ -1,7 +1,6 @@
 # @agentspaces/workers
 
-The cell host of the AgentSpaces JavaScript client (srad/agentspaces-js.md §3.6, §3.8, §4.5, §4.7,
-§4.8, appendix F): Durable Object cells on celld, workerd, and Cloudflare Workers. A cell is one
+The cell host of the AgentSpaces JavaScript client: Durable Object cells on celld, workerd, and Cloudflare Workers. A cell is one
 Durable Object carrying one core `Peer`: its identity and state snapshot in the object's own SQLite
 storage, its durable tick on the alarm, one outbound `wss` connection to the fleet's seeds (`ws`
 under the `dev-local` profile), and `js.residency=cell` in its advertisement. The **connector cell**
@@ -14,7 +13,7 @@ Worker space handles over the cell's stub. No `node:` module is imported under `
 public Workers APIs are used, so one bundle runs on all three runtimes.
 
 **Architecture position.** Hosts and gateways. SPEC §5.2 (hints), §6.1a (AssetCards), §6.3;
-TECH-SPEC §6; srad/celld-assetcard-analysis.md §1, §6, §7.
+annex F (asset operations and the Workers convention); TECH-SPEC §6.
 
 ## Use
 
@@ -62,7 +61,7 @@ in Java, `invoke` in `@agentspaces/connect`).
 | `src/config.ts` | `cellConfig(env)`: the `vars`, the profile rule for seeds, every cadence as an option. |
 | `src/fleet.ts` | `fleet(env, binding, name)`: `Fleet`, `FleetSpace` (`write`, `entries`, `readAll`, `take`), `FleetTaken` (`complete`, `renew`) over the stub's RPC. |
 | `src/workers-types.ts` | The slice of the Workers platform the package touches, as structural types, so Node tests fake it and the build needs no global Workers typings. |
-| `example/` | The JS-C-12 demonstration Worker: `Inventory` (stock per warehouse, `once` on both operations, a durable run counter), `Fleet` (the connector), `Adjuster` (an agent cell with `DamageEstimator`), `wrangler.json`. |
+| `example/` | The demonstration Worker: `Inventory` (stock per warehouse, `once` on both operations, a durable run counter), `Fleet` (the connector), `Adjuster` (an agent cell with `DamageEstimator`), `wrangler.json`. |
 | `test/workers/workerd-run.ts` | The harness: esbuild bundle of the example, a workerd config with SQLite-backed namespaces on local disk and the `vars` as text bindings, `workerd serve`. |
 | `test/workers/workerd-runner.ts` | The runner the Java `WorkerdCellConnectorTest` spawns: the example under workerd dialing a Java `ws` seed, JSON events (`up`, `runs`, `done`) on stdout. |
 
@@ -74,26 +73,25 @@ example's type check), the root's `workerd` and `esbuild`.
 
 ## Requirements and the tests that prove them
 
-| Row | What it asks | Proof |
-| --- | --- | --- |
-| JS-R-05 | The cell host: identity and state in SQLite, the tick on the alarm, outbound `wss` or `ws` by profile, reconnection on socket close and on each alarm while down, one bundle on the three runtimes | `test/workerd.test.ts` (the cell dials the hub, resumes under the same PeerID after `/pause` and after a workerd restart, refreshes its card under the same id); `test/once.test.ts` "the SQLite key store ..." (the identity resumes on every load); `test/config.test.ts` (seeds by profile) |
-| JS-R-03 | Nothing outlives its lease across a pause; the same identity resumes | `test/workerd.test.ts` (`/pause`: the hub sees the link close; `/wake`: the same PeerID; the restart: the same PeerID, the connector's memory gone, the target's `once` table not) |
-| JS-R-07 | `js.residency=cell` in the hints | `test/workerd.test.ts` (the hub's copy of both cells' advertisements) |
-| JS-P-08 | The SQLite key store | `test/once.test.ts` "the SQLite key store round-trips bytes ..." |
-| JS-C-04 | `once(invocationId, fn)` in SQLite, the stored result on a repeat, a configurable retention (24 h) | `test/once.test.ts` (one run per id; concurrent calls share one run; a failed run records nothing; the retention and its default); `test/workerd.test.ts` (`reserveStock` once under a retry and across the restart: `/runs` stays at one) |
-| JS-C-05 | The connector cell: the runtime on the host, the manifest, a non-agent member, `connector` by default | `test/workerd.test.ts` (cards from the cell, no AgentCard from it, `servedBy: connector`) |
-| JS-C-06 | The providers: DO classes and instances, KV `get`/`list` under prefixes, D1 named queries, R2 `head`/`list`/`get`, Queues `send`, Workflows `create`/`status`, routes GET-as-read and POST-as-invoke | `test/providers.test.ts` (one test per kind over fake bindings); `test/workerd.test.ts` (a real Durable Object) |
-| JS-C-07 | Nothing unlisted runs; parameters validated against declared names; refusals name the rule | `test/providers.test.ts` "requests outside the allowlist are refused ..." (thirteen refusals, no binding touched), "D1 runs only the named query"; `test/manifest.test.ts` "a manifest that could not be served honestly ..."; `test/workerd.test.ts` (`dropTable`: `invoke-ops`; an undeclared `sql` parameter: `params`; a class card without `object`: `object-param`) |
-| JS-C-08 | SPEC §6.1a fields alone, `workers://<application>/<kind>/<name>`, appendix F access keys, ids stable across restarts and moves | `test/manifest.test.ts` (every kind's card; the id across renderings); `test/workerd.test.ts` (`inventory:do/Inventory` before and after the restart, one card per id) |
-| JS-C-12 | The §7 demonstration on workerd: a stateful Durable Object discovered through its card, queried by a Java agent, updated exactly once under a forced retry | Java `agentspaces-connect-core` `WorkerdCellConnectorTest` (a Java peer with a `ws` listener as the seed; `DataQueryClient.fetch`, `AssetInvocations.invoke` and `retry` under one id; the runner's `done` line reports one run); `test/workerd.test.ts` (the same with the TypeScript client, plus the restart) |
-| JS-C-13 | The trust boundaries in this README | below |
-| JS-S-05 | `AgentSpacesCell`: decorated agents as a member with its own identity | `test/workerd.test.ts` (the `Adjuster` cell's own PeerID, its AgentCard, a `DamageReport` taken and a `DamageEstimate` written) |
-| JS-S-06 | `fleet(env, binding)`: space handles over the stub | `test/config.test.ts` "fleet() drives the cell's RPC verbs ..."; `test/workerd.test.ts` (`/entries` reads the data space through `fleet(env)` in the Worker) |
-| JS-S-07 | One `wrangler.json` with the binding, one migration, the `vars` block, deployed unchanged | `example/wrangler.json`; the workerd run uses its `vars` as text bindings and its classes as SQLite namespaces; celld and Cloudflare: see the limits below |
-| JS-S-08 | Each runtime's limits in this README | below |
-| JS-K-03 | This README and its map | this file |
+| What it asks | Proof |
+| --- | --- |
+| The cell host: identity and state in SQLite, the tick on the alarm, outbound `wss` or `ws` by profile, reconnection on socket close and on each alarm while down, one bundle on the three runtimes | `test/workerd.test.ts` (the cell dials the hub, resumes under the same PeerID after `/pause` and after a workerd restart, refreshes its card under the same id); `test/once.test.ts` "the SQLite key store ..." (the identity resumes on every load); `test/config.test.ts` (seeds by profile) |
+| Nothing outlives its lease across a pause; the same identity resumes | `test/workerd.test.ts` (`/pause`: the hub sees the link close; `/wake`: the same PeerID; the restart: the same PeerID, the connector's memory gone, the target's `once` table not) |
+| `js.residency=cell` in the hints | `test/workerd.test.ts` (the hub's copy of both cells' advertisements) |
+| The SQLite key store | `test/once.test.ts` "the SQLite key store round-trips bytes ..." |
+| `once(invocationId, fn)` in SQLite, the stored result on a repeat, a configurable retention (24 h) | `test/once.test.ts` (one run per id; concurrent calls share one run; a failed run records nothing; the retention and its default); `test/workerd.test.ts` (`reserveStock` once under a retry and across the restart: `/runs` stays at one) |
+| The connector cell: the runtime on the host, the manifest, a non-agent member, `connector` by default | `test/workerd.test.ts` (cards from the cell, no AgentCard from it, `servedBy: connector`) |
+| The providers: DO classes and instances, KV `get`/`list` under prefixes, D1 named queries, R2 `head`/`list`/`get`, Queues `send`, Workflows `create`/`status`, routes GET-as-read and POST-as-invoke | `test/providers.test.ts` (one test per kind over fake bindings); `test/workerd.test.ts` (a real Durable Object) |
+| Nothing unlisted runs; parameters validated against declared names; refusals name the rule | `test/providers.test.ts` "requests outside the allowlist are refused ..." (thirteen refusals, no binding touched), "D1 runs only the named query"; `test/manifest.test.ts` "a manifest that could not be served honestly ..."; `test/workerd.test.ts` (`dropTable`: `invoke-ops`; an undeclared `sql` parameter: `params`; a class card without `object`: `object-param`) |
+| SPEC §6.1a fields alone, `workers://<application>/<kind>/<name>`, SPEC annex F access keys, ids stable across restarts and moves | `test/manifest.test.ts` (every kind's card; the id across renderings); `test/workerd.test.ts` (`inventory:do/Inventory` before and after the restart, one card per id) |
+| The demonstration on workerd: a stateful Durable Object discovered through its card, queried by a Java agent, updated exactly once under a forced retry | Java `agentspaces-connect-core` `WorkerdCellConnectorTest` (a Java peer with a `ws` listener as the seed; `DataQueryClient.fetch`, `AssetInvocations.invoke` and `retry` under one id; the runner's `done` line reports one run); `test/workerd.test.ts` (the same with the TypeScript client, plus the restart) |
+| The trust boundaries in this README | below |
+| `AgentSpacesCell`: decorated agents as a member with its own identity | `test/workerd.test.ts` (the `Adjuster` cell's own PeerID, its AgentCard, a `DamageReport` taken and a `DamageEstimate` written) |
+| `fleet(env, binding)`: space handles over the stub | `test/config.test.ts` "fleet() drives the cell's RPC verbs ..."; `test/workerd.test.ts` (`/entries` reads the data space through `fleet(env)` in the Worker) |
+| One `wrangler.json` with the binding, one migration, the `vars` block, deployed unchanged | `example/wrangler.json`; the workerd run uses its `vars` as text bindings and its classes as SQLite namespaces; celld and Cloudflare: see the limits below |
+| Each runtime's limits in this README | below |
 
-## Trust boundaries (JS-C-13)
+## Trust boundaries
 
 - **The bucket or account administers every cell.** On celld the bucket (and whoever can write to
   it) owns the cells' SQLite files, the identity keys inside them, and the code they run; on
@@ -103,7 +101,7 @@ example's type check), the root's `workerd` and `esbuild`.
   every result is signed by the connector cell's key; a fleet trusting the asset trusts that peer.
   The manifest is the allowlist: nothing a request names outside it runs, and the connector holds no
   credential beyond the deployment's own bindings.
-- **The fleet's authorizer grants the JS-C-02 scopes.** With an `authorizer` in `connectorOptions`,
+- **The fleet's authorizer grants the connector scopes.** With an `authorizer` in `connectorOptions`,
   a card is published only under `aspace:connector-serve:<asset>` and an operation runs only for a
   requester holding `aspace:connector-invoke:<asset>:<operation>`; without one, every admitted
   member may query and invoke what the manifest lists.
@@ -113,7 +111,7 @@ example's type check), the root's `workerd` and `esbuild`.
 - `dev-local` is the only profile that dials plaintext `ws`; an `attested` cell refuses a plaintext
   seed at configuration time, naming the rule.
 
-## Runtime limits (JS-S-08)
+## Runtime limits
 
 - **celld.** An outbound Durable Object WebSocket closes when a cell moves between nodes; the cell
   then resumes on its next alarm (the one immediate redial, then every `reconnectMillis`), and every
@@ -233,7 +231,7 @@ It skips without `npm run build` here unless `-Dtsclient.required=true`.
   the limit, unless the provider is given `artifacts: { content, store }` with an `R2PieceStore`
   over the same bucket: the object is then hashed piece by piece through ranged gets, published as
   an artifact of the content swarm (`publishR2Object`), and the row carries its `root` and `pieces`;
-  members fetch the pieces from the cell, which serves each by a ranged `get` (LB-C-05, SPEC
+  members fetch the pieces from the cell, which serves each by a ranged `get` (SPEC
   v0.1.23 §8). The cell's own peer needs a `Content` over its `Pipes` and a `content` space.
 - Every bound is an option: `tickMillis`, `idleMillis`, `reconnectMillis`, `snapshotMillis`,
   `introduceMillis`, `busyWindowMillis`, `listLimit`, `maxInlineResultBytes`, the `once` retention,

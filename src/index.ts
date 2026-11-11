@@ -23,6 +23,9 @@ import * as cbor from "./cbor.js";
 export { cbor };
 import * as bytes from "./bytes.js";
 export { bytes };
+// spiral 6 (ISSUE-A2uiAppComponents FR-11, FR-12): the open A2UI records and component builders
+import * as a2ui from "./a2ui.js";
+export { a2ui };
 export { CryptoPort, cryptoPort, installCrypto, nobleCrypto } from "./crypto.js";
 export * from "./platform.js";
 export * from "./transport.js";

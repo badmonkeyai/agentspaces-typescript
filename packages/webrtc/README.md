@@ -8,8 +8,7 @@ each side signs. It runs over the global `RTCPeerConnection` in a browser and ov
 neither exists, installation fails naming the package.
 
 **Architecture position.** A binding over the portable core (`@agentspaces/client`), the TypeScript
-twin of the Java `agentspaces-transport-webrtc`. SPEC §5.5, §5.6. Design of record:
-`srad/agentspaces-js.md` §3.4, §3.5, §4.3, appendix B.
+twin of the Java `agentspaces-transport-webrtc`. SPEC §5.5, §5.6, and annex B (the WebRTC formats).
 
 ## Using it
 
@@ -53,14 +52,14 @@ The same model as the Java binding, byte-compatible on the wire:
   event, failing a send after 30 s paused. None caps members, sessions, or connections.
 - **Privacy** candidates and SDP travel only inside signals to their target and are never logged
   above DEBUG.
-- **The relay offload (JS-W-11)** the core counts, per member, the frames a relay carried between
+- **The relay offload** the core counts, per member, the frames a relay carried between
   the peer and it in a sliding minute (`peer.onRelayed`, `peer.relayedWithInLastMinute`; it only
   counts and tells, with no WebRTC code in the core). The binding subscribes on `install`: past
   `offloadFramesPerMinute` (30) for a member that advertises a `webrtc` endpoint, is not reachable,
   has no signalling in progress, and no failed dial inside `offloadRetryMillis` (5 minutes), it
   dials the member and hands the open channel to `peer.acceptChannel` as a link, so the next
-  frames go direct and the relay carries none (JS-Q-PRF-03). A dial that cannot complete fails
-  at the dial bound, leaves the relay path as it was, and starts the backoff (JS-Q-REL-08). Both
+  frames go direct and the relay carries none. A dial that cannot complete fails
+  at the dial bound, leaves the relay path as it was, and starts the backoff. Both
   are options of `install`, settings rather than caps; `counters.offloadAttempts`, `offloadOpened`,
   and `offloadFailed` count what it did.
 
@@ -74,19 +73,19 @@ The same model as the Java binding, byte-compatible on the wire:
 | `src/signal.ts` | The signalling bodies, their canonical encoding, the bounds, and unknown-key tolerance. |
 | `src/counters.ts` | `WebRtcCounters`: sessions, failures by reason, signals dropped, chunks and bytes, selected candidate type. |
 
-## Requirement to test map (SRAD `srad/agentspaces-js.md`)
+## What the tests cover
 
-| Requirements | Tests |
+| Behaviour | Tests |
 | --- | --- |
-| JS-W-05, JS-F-01 | `test/chunk.test.ts` (capacity; the `ceil(n/C)` split and its input validation; reassembly, its bounds, the FINAL-then-MORE reset, the overflow refusal; a randomized round trip) |
-| JS-W-03, JS-F-02 | `test/signal.test.ts` (the canonical bodies, pinned byte-for-byte against the Java `RtcSignalTest`; unknown-key tolerance; the bounds) |
-| JS-W-04 | `test/signal.test.ts` (fingerprints match exactly the signed list) |
-| JS-W-02, JS-W-04, JS-W-05, JS-W-14 | `test/node-to-node.test.ts` (two bindings over `node-datachannel` open a channel, attest, and exchange a small and a 200 KB chunked frame; counters) |
-| JS-W-11, JS-Q-PRF-03, JS-Q-REL-08 | `test/offload.test.ts` (past the threshold the binding dials over `node-datachannel`, adopts the channel, and counts; a member without a `webrtc` endpoint is left alone; a dial that cannot complete fails at the bound and is not retried before the backoff), `../../test/host-links.test.ts` (the core's count per pair, both directions, the sliding minute, the bounded memory) |
-| JS-W-12 | `agentspaces-transport-webrtc/src/test/.../TwoBrowserWebRtcTest.java` (opt-in: two headless Chromium pages over a Java RELAY seed open a `webrtc` connection and exchange frames) |
+| Chunking | `test/chunk.test.ts` (capacity; the `ceil(n/C)` split and its input validation; reassembly, its bounds, the FINAL-then-MORE reset, the overflow refusal; a randomized round trip) |
+| The signal bodies | `test/signal.test.ts` (the canonical bodies, pinned byte-for-byte against the Java `RtcSignalTest`; unknown-key tolerance; the bounds) |
+| Fingerprints | `test/signal.test.ts` (fingerprints match exactly the signed list) |
+| Two Node bindings end to end | `test/node-to-node.test.ts` (two bindings over `node-datachannel` open a channel, attest, and exchange a small and a 200 KB chunked frame; counters) |
+| The relay offload | `test/offload.test.ts` (past the threshold the binding dials over `node-datachannel`, adopts the channel, and counts; a member without a `webrtc` endpoint is left alone; a dial that cannot complete fails at the bound and is not retried before the backoff), `../../test/host-links.test.ts` (the core's count per pair, both directions, the sliding minute, the bounded memory) |
+| Two browsers over a Java seed | `agentspaces-transport-webrtc/src/test/.../TwoBrowserWebRtcTest.java` (opt-in: two headless Chromium pages over a Java RELAY seed open a `webrtc` connection and exchange frames) |
 
 ## Not here
 
 The Java engine's natives, DTLS policy, and the enterprise-CA path live in
-`agentspaces-transport-webrtc`; WebRTC Direct (no signalling) and WebTransport are FUTURE rows
-(JS-F-10, JS-F-11).
+`agentspaces-transport-webrtc`; WebRTC Direct (no signalling) and WebTransport are planned for
+later.

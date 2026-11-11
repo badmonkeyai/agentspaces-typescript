@@ -1,7 +1,7 @@
 # @agentspaces/automerge
 
-The automerge-repo `NetworkAdapter` over an AgentSpaces fleet
-(`srad/agentspaces-js.md` JS-S-01, JS-S-03). A `Repo` that syncs over a
+The automerge-repo `NetworkAdapter` over an AgentSpaces fleet.
+A `Repo` that syncs over a
 WebSocket server today syncs over the fleet by changing one constructor
 argument: the members a peer's capability pipes reach become the Repo's
 peers, under their AgentSpaces PeerID, and the Repo's messages travel as
@@ -69,15 +69,15 @@ have hidden. There is no cap on peers, documents, or rate.
 
 All in `test/adapter.test.ts`.
 
-| Row | Requirement | Test |
-|---|---|---|
-| JS-S-01 | members become `peer-candidate` under their PeerID; sync messages travel as `aspace:cap/automerge` frames; one constructor argument changes | "two Repos over two peers are each other's peer-candidate under their PeerIDs and converge" |
-| JS-S-01 | a late joiner catches up | "a third peer joining late catches up on the document" |
-| JS-S-01 | departures are `peer-disconnected` | "a departure fires peer-disconnected: by the goodbye, and by a lost link alone" |
-| JS-S-03 | the payload is the library's own encoding, byte for byte; the signer is the sender | "the payload is the library's own encoding of its message, byte for byte, and the signer is the sender" |
-| JS-S-03 | the only bound is a per-message size, an option under the frame cap, refused by name | "an oversize message is refused by name, not chunked, and the bound is an option under the frame cap" |
-| JS-S-03 | `visitor` residency, no ordered log, pipes alone | "the adapter runs at the visitor residency over pipes alone: no ordered log, no host duty" |
-| JS-S-03, JS-P-01 | the entry imports no Node module and names no Node global | "the package entry imports no Node module and names no Node global" |
+| Requirement | Test |
+|---|---|
+| members become `peer-candidate` under their PeerID; sync messages travel as `aspace:cap/automerge` frames; one constructor argument changes | "two Repos over two peers are each other's peer-candidate under their PeerIDs and converge" |
+| a late joiner catches up | "a third peer joining late catches up on the document" |
+| departures are `peer-disconnected` | "a departure fires peer-disconnected: by the goodbye, and by a lost link alone" |
+| the payload is the library's own encoding, byte for byte; the signer is the sender | "the payload is the library's own encoding of its message, byte for byte, and the signer is the sender" |
+| the only bound is a per-message size, an option under the frame cap, refused by name | "an oversize message is refused by name, not chunked, and the bound is an option under the frame cap" |
+| `visitor` residency, no ordered log, pipes alone | "the adapter runs at the visitor residency over pipes alone: no ordered log, no host duty" |
+| the entry imports no Node module and names no Node global | "the package entry imports no Node module and names no Node global" |
 
 Versions proven: `@automerge/automerge-repo` 2.6.0-alpha.3, `@automerge/automerge` 3.5.0.
 

@@ -3,8 +3,7 @@
 Written for: TypeScript and JavaScript developers who build with @agentspaces/client.
 
 The client refuses every carrier that is not in the wire encoding, and stays
-cautious in what it sends (ROBUSTNESS.md; HLC round six, 2026-11-08, owner
-rulings F1 to F4). SPEC section 9.1 defines the wire encoding, its annex I
+cautious in what it sends (ROBUSTNESS.md). SPEC section 9.1 defines the wire encoding, its annex I
 tabulates the vectors, and `test/wire-encoding-vectors.json` holds their bytes.
 
 - **Items.** `cbor.loads` accepts a document only in the one form its value
@@ -16,8 +15,7 @@ tabulates the vectors, and `test/wire-encoding-vectors.json` holds their bytes.
   re-encodes in that order, and `cbor.canonicalMap` marks a map the encoder
   writes in the RFC 8949 key order, integer-like keys included. `cbor.dumps`
   writes a plain object or a JavaScript `Map` with text keys: a plain object
-  lists its integer-like keys first, and a `Map` keeps its insertion order
-  (HLC round seven, 2026-11-08).
+  lists its integer-like keys first, and a `Map` keeps its insertion order.
 - **Records.** `src/records.ts` holds every protocol record this client reads,
   with Java's fields in declared order. `records.decodeRecord` conforms a
   carrier to its record and refuses it unless the conformed value re-encodes
@@ -35,11 +33,9 @@ tabulates the vectors, and `test/wire-encoding-vectors.json` holds their bytes.
   Every advertisement this client signs is conformed to its record first.
   The aggregate and semantic capabilities, `@agentspaces/ordered`, and
   `@agentspaces/webrtc`'s `signal.decode` read their pipe payloads the same
-  way, so an unknown key or a wrong type refuses a payload (HLC round seven,
-  2026-11-08).
+  way, so an unknown key or a wrong type refuses a payload.
 - **Stamps.** A stamp holds at most 3996 UTF-16 units, so it always travels
-  as one definite text, and `hlcNow` refuses a node past 3965 units (HLC
-  round seven, 2026-11-08).
+  as one definite text, and `hlcNow` refuses a node past 3965 units.
 - **Values.** A record's payload is an application document signed as bytes.
   The entry replicates whatever the payload holds, and every read skips a
   value that is no document in the wire encoding (`cbor.readDocument`).

@@ -53,8 +53,7 @@ agent certificate) published on the `ads` stream on bind. `vote.propose`,
 Java's. Numbers: a fractional field is encoded as a float64, an integral one
 as an integer, and decoded doubles are unwrapped before matching.
 
-The return conventions are the Java binder's (ISSUE-WorkflowVerbs,
-ISSUE-Motion): `null` writes nothing; `new Tagged(value, { region: "eu" })`
+The return conventions are the Java binder's: `null` writes nothing; `new Tagged(value, { region: "eu" })`
 is written with its tags; an array is the fork, each element written on its
 own after the take completes; a `new Motion(proposalId, question, options,
 quorum, space?)` opens a vote once per proposal id in its space or the
@@ -214,7 +213,7 @@ golden vectors and run the spill in process.
 ## Values that change: persistent data structures
 
 `pdt` is the TypeScript port of the persistent data structures
-(srad/agentspaces-pdt.md, PD-C-05): maps, sets, vectors, and blobs stored as
+(SPEC annex H): maps, sets, vectors, and blobs stored as
 content-addressed trees whose unchanged parts every version shares, so a
 small update ships only its delta. A `PMap` is a CHAMP trie (sha2-256 key
 hashing, 32-way nodes, canonical layout whatever the order of operations), a
@@ -224,12 +223,12 @@ FastCDC chunks (16/64/256 KiB). Every node is DAG-CBOR named by a CIDv1
 Python, and TypeScript ports produce the same bytes for the same values; the
 `pdt_*` and `content_*` tree vectors of `test/golden.json` pin that. Two
 rules keep a root equal to Java's: a value that is itself an object is
-embedded in the order you built it while the Java codec sorts a map's keys
-(ISSUE-CanonicalMaps), so put a nested object in canonical order
+embedded in the order you built it while the Java codec sorts a map's keys,
+so put a nested object in canonical order
 (`canonicalMap`) when its root must match; and a number is encoded as an
 integer when it is a safe integer, as a float64 otherwise (`-0`, `1.5`,
 `1e300`), with `CborDouble` for an integral value that must stay a float.
-An escalated space payload (a `payloadRef` whose CID is dag-cbor, PD-E-01)
+An escalated space payload (a `payloadRef` whose CID is dag-cbor)
 goes to the facade's `payload(root)`, which reassembles the bytes once the
 tree is here and starts one tree fetch otherwise; `writePayload` and
 `readPayload` in `pdt/values` are the Java `PayloadTree` byte for byte
@@ -260,7 +259,7 @@ head with the later HLC and reports a `PConflict` through `onConflict`), the
 later head whole for vectors and blobs unless `values.mergeFor(name, fn)` names
 a merge. The facade opens and pulls its ref space (`refs` unless named) when
 it is built, and the space of a ref when `ref()` first names it, as Java's
-facade holds its ref space from the start (HLC round six, 2026-11-08, R11).
+facade holds its ref space from the start.
 A ref in `linear` mode (`modes: { counter: "linear" }`) takes its head with
 `Space.take` before computing, the `@SpaceReduce` pattern. A
 version whose delta is above the inline cap travels by request over the
@@ -279,7 +278,7 @@ The node store is `NodeStore` over a backend: memory anywhere,
 origin private file system with an index rebuilt from the pack, for the
 resident worker, where synchronous access handles exist; a page thread falls
 back to memory). `test/pdt-vectors.test.ts` recomputes every golden vector
-and records the PD-N-03 check against `@ipld/dag-cbor` (it accepts
+and records the check against `@ipld/dag-cbor` (it accepts
 `pdt_node_dagcbor` and refuses `pdt_node_embedded`); `test/pdt-values.test.ts`
 proves the values, spills, blobs, store, and inline deltas;
 `test/pdt-swarm.test.ts` runs two in-process peers through inline deltas,

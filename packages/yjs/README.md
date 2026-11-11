@@ -1,7 +1,6 @@
 # @agentspaces/yjs
 
-The Yjs provider over an AgentSpaces fleet (`srad/agentspaces-js.md`
-JS-S-02, JS-S-03). A document that syncs through y-websocket today syncs
+The Yjs provider over an AgentSpaces fleet. A document that syncs through y-websocket today syncs
 over the fleet by changing one constructor argument: per document, the
 y-protocols sync messages (step 1, step 2, update) and awareness updates
 travel as signed `PIPE_DATA` frames of capability `aspace:cap/yjs`, with the
@@ -80,15 +79,15 @@ rather than have it hidden. There is no cap on members, rooms, or rate.
 
 All in `test/provider.test.ts`.
 
-| Row | Requirement | Test |
-|---|---|---|
-| JS-S-02 | sync and awareness per document travel as `aspace:cap/yjs` frames; two docs converge; awareness propagates; one constructor argument changes | "two Y.Docs over two peers converge in both directions and awareness states propagate" |
-| JS-S-02 | a late joiner syncs; a departure retires its awareness | "a late joiner syncs the document through the hub and sees the others' awareness" |
-| JS-S-02 | the document name is the room; rooms stay apart | "two rooms on one peer stay apart, and a frame for a room nobody serves is dropped" |
-| JS-S-03 | the y-protocols bytes are passed through byte for byte; a plain `Y.Doc` applies them | "the y-protocols bytes travel as y-websocket writes them, byte for byte, and a plain Y.Doc applies them" |
-| JS-S-03 | the only bound is a per-message size, an option under the frame cap, refused by name | "an oversize message is refused by name, not chunked, and the bound is an option under the frame cap" |
-| JS-S-03 | `visitor` residency, no ordered log, pipes alone | "the provider runs at the visitor residency over pipes alone: no ordered log, no host duty" |
-| JS-S-03, JS-P-01 | the entry imports no Node module and names no Node global | "the package entry imports no Node module and names no Node global" |
+| Requirement | Test |
+|---|---|
+| sync and awareness per document travel as `aspace:cap/yjs` frames; two docs converge; awareness propagates; one constructor argument changes | "two Y.Docs over two peers converge in both directions and awareness states propagate" |
+| a late joiner syncs; a departure retires its awareness | "a late joiner syncs the document through the hub and sees the others' awareness" |
+| the document name is the room; rooms stay apart | "two rooms on one peer stay apart, and a frame for a room nobody serves is dropped" |
+| the y-protocols bytes are passed through byte for byte; a plain `Y.Doc` applies them | "the y-protocols bytes travel as y-websocket writes them, byte for byte, and a plain Y.Doc applies them" |
+| the only bound is a per-message size, an option under the frame cap, refused by name | "an oversize message is refused by name, not chunked, and the bound is an option under the frame cap" |
+| `visitor` residency, no ordered log, pipes alone | "the provider runs at the visitor residency over pipes alone: no ordered log, no host duty" |
+| the entry imports no Node module and names no Node global | "the package entry imports no Node module and names no Node global" |
 
 Versions proven: `yjs` 13.6.33, `y-protocols` 1.0.7, `lib0` 0.2.119. The
 provider uses only the y-protocols entry points, which serve Yjs 14 too;

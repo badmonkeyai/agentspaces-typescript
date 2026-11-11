@@ -2,13 +2,13 @@
 
 Written for: TypeScript and JavaScript developers who build with @agentspaces/client.
 
-Discovery SRAD §3.5 and §3.8 (DB-X-02, DB-X-03, DB-X-07). A beacon serves a
+A beacon serves a
 signed JSON document (`/.well-known/agentspaces/beacon.json`) listing, per
 group, its self-certifying founding advertisement and its seeds; `bootstrap`
 fetches it, verifies the issuer's Ed25519 signature over the canonical bytes
 (the pinned `beaconPeer` when given), refuses a signed document unless it
 arrives as exactly its canonical JSON with its signature and key in padded
-standard base64 (HLC round seven, 2026-11-08), verifies the founding with the same
+standard base64, verifies the founding with the same
 four checks `joinByGroupId` applies, and dials the document's `tcp` seeds in
 priority order. `https://` only unless `allowPlain`; at most 64 KiB.
 

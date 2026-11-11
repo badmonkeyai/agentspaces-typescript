@@ -15,7 +15,7 @@ point of `dumps(loads(x))`.
 
 JavaScript has one number type and Java has several, and signatures cover the
 bytes, so `src/cbor.ts` keeps the distinction explicit in both directions. Each
-value has exactly one encoding (HLC round six, 2026-11-08), so every decoded
+value has exactly one encoding, so every decoded
 value re-encodes to the bytes it arrived in:
 
 - **Doubles.** A plain `number` encodes as a CBOR integer; wrap it in

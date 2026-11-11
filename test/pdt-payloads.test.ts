@@ -120,6 +120,8 @@ test("payload trees match the Java roots and round trip", () => {
 
 test("a text above the node bound is refused as in Java", () => {
   assert.throws(() => writePayload(text("x".repeat(2 * 1024 * 1024)), pdt.NodeStore.inMemory()), /1048569/);
+  assert.throws(() => writePayload(text("x".repeat(2 * 1024 * 1024)), pdt.NodeStore.inMemory()),
+    /node bound; store a value this large as a byte string, which becomes a blob/);
   assert.throws(() => writePayload(new Uint8Array(0), pdt.NodeStore.inMemory()), /empty payload/);
 });
 

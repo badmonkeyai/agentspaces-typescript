@@ -474,7 +474,10 @@ export function kindNamed(name: string, options: RefOptions = {}): RefKind<unkno
       return {
         name: KIND_DB, byKey: false,
         empty: () => null, load: (store, root) => new DbReader(root, store),
-        root: () => { throw new Error("a db ref is read-only in this client: DataScript writes it (P2-D-03)"); },
+        root: () => {
+          throw new Error("a db ref is read-only in this client;"
+            + " write db refs with DataScript through agentspaces-datascript");
+        },
         size: () => 0, version: () => VERSION_2,
       };
     default:
@@ -706,7 +709,7 @@ export class Refs {
         throw new Error(`a ref name is 1 to ${MAX_NAME_BYTES} bytes`);
       }
       if (kind === KIND_DB && this.config.level < 2) {
-        throw new Error("a db ref needs the PDT feature level 2 (P2-F-06)");
+        throw new Error("a db ref needs the PDT feature level 2; set level: 2 in the PDT options");
       }
       state = new State(name, kindNamed(kind, options), space, this.config.modes[name] ?? MODE_MULTI);
       this.states.set(key, state);
@@ -1382,14 +1385,20 @@ export class Refs {
   }
 
   /**
-   * The heads' base walks, fetching the chain nodes they reach and the store lacks from the heads' issuers and the
-   * writers of the chain nodes read (P2-V-02), one bare batch per round within the load timeout; the first batch that
-   * fails ends the fetching, so a walk with no reachable holder costs one timeout at most. Each node that batch asked
-   * for then waits out a backoff before any walk asks for it again (PDT 2 phase 7 gate; swarm retries, ROBUSTNESS.md
-   * §10.2), so the reads of a forked ref whose chain node nobody serves pay no timeout each.
+   * The heads' base walks, fetching the chain nodes they reach and the store lacks from the heads' issuers first, then
+   * the writer of every version this engine knows and of every chain node read (P2-V-02), one bare batch per round
+   * within the load timeout. A head's writer links its base's chain node without holding it, so the base's own writer
+   * may alone hold it; a walk that asked the heads' issuers alone merged with no base (chain walk sources, Java's
+   * Refs.chainSources, srad/agentspaces-pdt2.md §10.20). The first batch that fails ends the fetching, so a walk with
+   * no reachable holder costs one timeout at most. Each node that batch asked for then waits out a backoff before any
+   * walk asks for it again (PDT 2 phase 7 gate; swarm retries, ROBUSTNESS.md §10.2), so the reads of a forked ref whose
+   * chain node nobody serves pay no timeout each.
    */
   private async chainWalks(state: State, heads: Head[]): Promise<{ roots: Set<string>; complete: boolean }[]> {
     const sources = new Set(heads.map((h) => issuerPeer(h.issuer)));
+    for (const version of state.known.values()) {
+      sources.add(issuerPeer(version.issuer));
+    }
     let fetching = this.exchange !== null;
     for (;;) {
       const wanted = fetching ? new Set<string>() : null;

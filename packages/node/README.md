@@ -86,13 +86,12 @@ A host with no agent code is one command, `npx agentspaces-node run fleet.yaml`,
 The service host of the AgentSpaces JavaScript client: a Node 22 process that accepts
 connections on `tcp` and `ws`, dials its seeds, serves anti-entropy and relays rumors for the
 members behind it, hosts Raft voters and keepers, ticks at a fixed cadence and reports its true
-cadence to its duties, and drains on `SIGTERM`. It is the residency `service` of
-`srad/agentspaces-js.md` §3.6: everything a Java member does except the Java-only transports.
+cadence to its duties, and drains on `SIGTERM`. It is the residency `service`:
+everything a Java member does except the Java-only transports.
 
 **Architecture position.** A host over the portable core (`@agentspaces/client`) and the voter
 (`@agentspaces/ordered`). SPEC §5.3 (anti-entropy), §5.5 (`tcp`, `ws`), §5.6 (session attestation
-on unattested links). TECH-SPEC §10.1, §10.3. Design of record: `srad/agentspaces-js.md` §4.5
-(JS-R-04, JS-R-06, JS-R-07), §4.2 (JS-H-11).
+on unattested links). TECH-SPEC §10.1, §10.3.
 
 ## Using it
 
@@ -141,13 +140,13 @@ forwarding across links, one session per link — is in the core `Peer` (`src/se
 
 ## Requirements to tests
 
-| Row | Test |
+| Requirement | Test |
 | --- | --- |
-| JS-R-04 service host: tick, true cadence, drain, CLI over the fleet YAML | `test/host.test.ts` ("a tcp hub relays...", "a hub with no seeds... stop drains within its bound"), `test/fleet.test.ts` (YAML parse, `startFleet`, the CLI) |
-| JS-R-06 drift to visitor duties and recovery | `test/host.test.ts` "a host whose tick drifts three times drops to visitor duties and recovers after 60 s" |
-| JS-R-07 `js.residency` hint | `test/host.test.ts` (the hub's advertisement carries `js.residency=service`) |
-| JS-H-11 `ws` listener, endpoints advertised | `test/ws-listener.test.ts` |
-| JS-V-06 file log store, vote intact across a restart | `test/file-log-store.test.ts` |
+| Service host: tick, true cadence, drain, CLI over the fleet YAML | `test/host.test.ts` ("a tcp hub relays...", "a hub with no seeds... stop drains within its bound"), `test/fleet.test.ts` (YAML parse, `startFleet`, the CLI) |
+| Drift to visitor duties and recovery | `test/host.test.ts` "a host whose tick drifts three times drops to visitor duties and recovers after 60 s" |
+| The `js.residency` hint | `test/host.test.ts` (the hub's advertisement carries `js.residency=service`) |
+| The `ws` listener, endpoints advertised | `test/ws-listener.test.ts` |
+| The file log store, vote intact across a restart | `test/file-log-store.test.ts` |
 | Serving half (core): digests, deltas, relay, sessions per link, lapsed members, anti-entropy rounds | root `test/host-links.test.ts`, `test/serving.test.ts` (golden `space_state_hash`, `space_claim_hash`, `java_double_strings`) |
 | Cross-language: a Node voter beside Java voters, leader killed | `agentspaces-capabilities` `NodeVoterDeskTest` (worker `test/workers/voter-worker.ts`) |
 

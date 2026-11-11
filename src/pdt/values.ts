@@ -112,7 +112,7 @@ export class Ctx {
 export function checkKey(key: Uint8Array): void {
   if (isLinkShaped(key)) {
     throw new Error("a key must not be a bare link item (CBOR tag 42 over a CID): a link item in a map node names a"
-      + " spilled node (PD-N-05); hold a CID as text");
+      + " spilled node; hold a CID as text");
   }
 }
 
@@ -185,7 +185,7 @@ function headerLength(info: number): number {
 export function spill(cbor: Uint8Array, ctx: Ctx): Ref {
   if (isLinkShaped(cbor)) {
     throw new Error("a value must not be a bare link item (CBOR tag 42 over a CID): a link item in a value slot names a"
-      + " spilled node (PD-N-05); hold a CID as text");
+      + " spilled node; hold a CID as text");
   }
   if (cbor.length <= VALUE_LIMIT) {
     return cbor;
@@ -208,7 +208,8 @@ export function spill(cbor: Uint8Array, ctx: Ctx): Ref {
   }
   if (cbor.length > MAX_X_VALUE) {
     throw new Error(`a value of ${cbor.length} CBOR bytes exceeds the ${MAX_X_VALUE} bytes an x node can hold under the`
-      + " 1 MiB node bound (PD-N-04)");
+      + " 1 MiB node bound; store a value this large as a byte string, which becomes a blob, or split it into a map or"
+      + " a vector");
   }
   return new XNode(cbor);
 }

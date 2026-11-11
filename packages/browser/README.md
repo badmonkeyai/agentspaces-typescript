@@ -129,8 +129,7 @@ The sections below add the rest: the worker and page files in detail, the reside
 
 ## About @agentspaces/browser
 
-The resident host of the AgentSpaces JavaScript client (`srad/agentspaces-js.md`
-§3.6, JS-R-02): one `Peer` of `@agentspaces/client` running in a SharedWorker
+The resident host of the AgentSpaces JavaScript client: one `Peer` of `@agentspaces/client` running in a SharedWorker
 (a dedicated Worker where the browser has none, or when asked), holding the
 Web Lock `agentspaces:<group>:<peerId>` so one peer per identity per origin
 runs, its keys and state in IndexedDB, and every page of the origin attached
@@ -142,10 +141,10 @@ the worker; the fleet sees one member whatever the number of tabs.
 | File | What it is |
 | --- | --- |
 | `src/page.ts` | The page side: `connect(options)` starts or joins the worker, says hello, asks `navigator.storage.persist()`, and returns a `BrowserHost` (`peerId`, `shared`, `instance`, `state`, `"state"` events) whose `space(name)` carries `write`, `entries`, `readAll`, `read`, `take`, `watch`, `events`, `notify`, and `renew` over the port; `RemoteTaken` (`complete`, `renew`) and `RemoteSubscription` (`"event"`, `"close"`, the async iterator, `renew`, `close`). Templates stay the core's `Template`, function matchers included: the host filters by schema, the page judges fields and tags, and a take claims the exact entry the page chose. |
-| `demo/swarm.ts`, `demo/swarm-page.ts` | The swarm demo (LB-C-06): a hub and two server peers hold one artifact; the page fetches it through its worker from all three, the hub directly and the servers through the hub as a relay, and draws the bytes from each. `npm run demo:swarm` prints the URL; `node build/demo/swarm.js --check` runs the page in headless Chromium and prints the outcome. |
+| `demo/swarm.ts`, `demo/swarm-page.ts` | The swarm demo: a hub and two server peers hold one artifact; the page fetches it through its worker from all three, the hub directly and the servers through the hub as a relay, and draws the bytes from each. `npm run demo:swarm` prints the URL; `node build/demo/swarm.js --check` runs the page in headless Chromium and prints the outcome. |
 | `src/opfs.ts` | `OpfsStore`, the content swarm's piece store over the origin private file system (SPEC v0.1.23 §8): one directory per root with the pieces at their offsets, the verified bitfield, and the manifest, so a fetch resumes after a reload and a browser that holds an artifact serves it; reads answer later (the API is asynchronous on a page) and writes queue behind a memory copy that serves meanwhile; `OpfsStore.open(name)` reads every root back and throws where the API is absent, so a caller falls back to the core's `MemoryStore`. Build the swarm as `new Content(new Pipes(peer), new Space(peer, "content"), await OpfsStore.open())`. |
 | `src/worker.ts` | The worker entry (`@agentspaces/browser/worker`): detects its scope, builds one `ResidentHost`, serves each `onconnect` port of a SharedWorker or the own scope of a dedicated Worker, and closes a dedicated Worker once its page detaches. A custom worker script imports `ResidentHost` instead and calls `startResidentHost`, then `host.bind(agent)` for agents whose code lives in the worker. |
-| `src/host.ts` | `ResidentHost`: identity and agent key bootstrap under the identity lock, the Web Lock election, the peer with `js.residency=resident` in its hints, the snapshot restore, the port protocol, the pause rule, the drift rule (`observeCadence`, JS-R-06), and the tick (the cadence, lapsed members, anti-entropy, the advertisement, the EXPIRED and REAPPEARED sweep, keep-alive renewal of held claims at half-lease, the silent-page sweep, the periodic snapshot). |
+| `src/host.ts` | `ResidentHost`: identity and agent key bootstrap under the identity lock, the Web Lock election, the peer with `js.residency=resident` in its hints, the snapshot restore, the port protocol, the pause rule, the drift rule (`observeCadence`), and the tick (the cadence, lapsed members, anti-entropy, the advertisement, the EXPIRED and REAPPEARED sweep, keep-alive renewal of held claims at half-lease, the silent-page sweep, the periodic snapshot). |
 | `src/lock.ts` | `LockElection`: `acquire(name, waitMillis)` holds a lock for the host's life and refuses after the wait naming the lock; `withLock` is the bootstrap's critical section. The browser releases a lock when its holder's global dies, so the next tab's host takes over without a message. |
 | `src/idb.ts` | `IndexedDbKeyStore`, the core's `KeyStore` port over one object store of the group's database (`keys` for `peer.key`, `peer.pub`, and `agents/<name>/agent.key`; `state` for the CBOR snapshot); `openDatabase`, `closeDatabase`, `deleteDatabase`. Typed structurally, so the package compiles without the DOM library. |
 | `src/protocol.ts` | The port protocol: requests by tag with an id, answers with a value or an error, pushes (`event`, `closed`, `state`); `WireEntry` carries the record's own payload and tag bytes so a float stays a float across the port; the lock, database, and key names. |
@@ -162,13 +161,13 @@ the worker; the fleet sees one member whatever the number of tabs.
 | `service` | `@agentspaces/node` | a process under an operator | everything, plus listeners, Raft voter, ORDERED join coordinator, relay role, connector runtime |
 | `cell` | `@agentspaces/workers` | activated by requests and alarms; durable storage | everything a resident hosts, plus the connector runtime and agent cells |
 
-The host declares `resident`; the core judges it (`requireResidency`, JS-R-01). What pages reach over the port is the space verbs and `notify`; the binder verbs run only for code loaded in the worker (`host.bind`), because a page cannot send a class across a port.
+The host declares `resident`; the core judges it (`requireResidency`). What pages reach over the port is the space verbs and `notify`; the binder verbs run only for code loaded in the worker (`host.bind`), because a page cannot send a class across a port.
 
-## The drift rule (JS-R-06)
+## The drift rule
 
 `observeCadence(now)` is a pure function of the observed tick times, the service host's rule (`DRIFT_TICKS` 3, `DRIFT_FACTOR` 2, `RECOVERY_MILLIS` 60 s): a tick later than twice the period, three times running, drops the host to visitor duties. It logs the drift, sets `js.residency=visitor` in its hints and introduces itself at once when connected, closes every worker-side binding (the `Binder` judges LEASED and ORDERED joins and reduces by residency, so a visitor may not carry them) keeping the instances, and renews no held claim, so each lapses on its own lease. Sixty seconds of cadence restore `resident`: the hint, the bindings bound again from the kept instances, and renewals. The first observation after a start or resume only sets the cadence, so a pause is never a drift. Pages see the change as a `state` event (`residency`, `drifts`).
 
-## The pause rule (JS-R-03)
+## The pause rule
 
 The host runs while at least one attached page is active. A page reports `pagehide` and `freeze` as inactive and `pageshow` and `resume` as active, beats every 5 s while attached, and detaches on a `pagehide` that is not a back-forward cache entry. When the last active page goes, the host snapshots its state to IndexedDB, stops its tick (the only renewer of held claims), closes every worker-side binding, and closes its channel with a clean WebSocket close, so the hub sees the member leave. While paused, `write`, `take`, `complete`, and both renewals are refused naming the pause; reads of the local replica still answer. A page returning resumes the same identity: the host dials again, introduces itself, pulls its spaces, and forgets every hold whose lease lapsed while it was away. Nothing is renewed by anything but the tick, so no claim outlives its lease across a pause; a `notify` lease runs on the timer port and lapses on time, paused or not. Worker termination (the last tab closing, the browser discarding the worker) drops the socket and releases the lock; the next page's `connect` restarts the host from IndexedDB with the same PeerID. A hidden-but-alive tab does not pause the host: only `pagehide` and `freeze` do.
 
@@ -200,18 +199,17 @@ Options: `shared: false` forces a dedicated Worker (one page, its own host); `lo
 
 ## Requirements to tests
 
-| Row | Requirement | Test |
-| --- | --- | --- |
-| JS-R-02 | A SharedWorker when available, else a dedicated Worker | `resident.test.ts` "two tabs share one PeerID and one ws connection" (`shared` equals the browser's `SharedWorker` presence) and "a dedicated Worker is the fallback, forced here" in each engine |
-| JS-R-02 | The Web Lock `agentspaces:<group>:<peerId>`, one peer per identity per origin | `resident.test.ts` "the Web Lock refuses a second host for the same identity in the origin"; `host.test.ts` "mints its identity once … refuses a second host"; `portable.test.ts` lock names |
-| JS-R-02 | Pages talk to the host over MessagePorts with the space verbs | `resident.test.ts` "a write from one tab is read in the other", "a watch in one tab sees a write from the other"; `host.test.ts` "subscriptions" |
-| JS-R-02 | Keys and state in IndexedDB; `navigator.storage.persist()` called | `resident.test.ts` "keys persist across a reload, and the worker's death closes the channel" (the PeerID read back from IndexedDB; the restarted host restores its snapshot); the persist answer is reported per engine; `host.test.ts` "the snapshot round trip" |
-| JS-R-03 | Stops renewing leases and closes its channels on `pagehide`/`freeze` of the last page, worker termination, port close; resumes with the same identity; nothing outlives its lease across a pause | `resident.test.ts` "the pause rule" (a 1 s claim renewed while running, refused and lapsed while paused, taken by the hub, the same PeerID on resume, completion refused) and "keys persist … the worker's death closes the channel"; `host.test.ts` "the pause rule" and the silent-page sweep in "subscriptions" |
-| JS-R-06 | A tick later than twice the period three times running drops the host to visitor duties (bindings closed, held claims left to lapse, the drift logged, the hint updated); 60 s of cadence restores them | `host.test.ts` "a host whose tick drifts three times drops to visitor duties … and recovers after 60 s of cadence" (a fake cadence drives `observeCadence`; the hub takes the un-renewed job; the hub hears `visitor` then `resident`; the re-bound agent reacts again); `resident.test.ts` reports `residency` and `drifts` in every status |
-| JS-R-07 | `js.residency=resident` in the self-advertisement hints, `visitor` while drifting | `resident.test.ts` (the hub's member record for the host), `host.test.ts` "mints its identity once" and the drift test |
-| JS-P-08 | Identity persistence through the `KeyStore` port, IndexedDB here | `host.test.ts` "mints its identity once" (`peer.key`, `peer.pub`, the agent key); `resident.test.ts` "keys persist across a reload" |
-| JS-P-01 | Neither entry imports a Node module | `portable.test.ts` |
-| JS-K-03 | This README | — |
+| Requirement | Test |
+| --- | --- |
+| A SharedWorker when available, else a dedicated Worker | `resident.test.ts` "two tabs share one PeerID and one ws connection" (`shared` equals the browser's `SharedWorker` presence) and "a dedicated Worker is the fallback, forced here" in each engine |
+| The Web Lock `agentspaces:<group>:<peerId>`, one peer per identity per origin | `resident.test.ts` "the Web Lock refuses a second host for the same identity in the origin"; `host.test.ts` "mints its identity once … refuses a second host"; `portable.test.ts` lock names |
+| Pages talk to the host over MessagePorts with the space verbs | `resident.test.ts` "a write from one tab is read in the other", "a watch in one tab sees a write from the other"; `host.test.ts` "subscriptions" |
+| Keys and state in IndexedDB; `navigator.storage.persist()` called | `resident.test.ts` "keys persist across a reload, and the worker's death closes the channel" (the PeerID read back from IndexedDB; the restarted host restores its snapshot); the persist answer is reported per engine; `host.test.ts` "the snapshot round trip" |
+| Stops renewing leases and closes its channels on `pagehide`/`freeze` of the last page, worker termination, port close; resumes with the same identity; nothing outlives its lease across a pause | `resident.test.ts` "the pause rule" (a 1 s claim renewed while running, refused and lapsed while paused, taken by the hub, the same PeerID on resume, completion refused) and "keys persist … the worker's death closes the channel"; `host.test.ts` "the pause rule" and the silent-page sweep in "subscriptions" |
+| A tick later than twice the period three times running drops the host to visitor duties (bindings closed, held claims left to lapse, the drift logged, the hint updated); 60 s of cadence restores them | `host.test.ts` "a host whose tick drifts three times drops to visitor duties … and recovers after 60 s of cadence" (a fake cadence drives `observeCadence`; the hub takes the un-renewed job; the hub hears `visitor` then `resident`; the re-bound agent reacts again); `resident.test.ts` reports `residency` and `drifts` in every status |
+| `js.residency=resident` in the self-advertisement hints, `visitor` while drifting | `resident.test.ts` (the hub's member record for the host), `host.test.ts` "mints its identity once" and the drift test |
+| Identity persistence through the `KeyStore` port, IndexedDB here | `host.test.ts` "mints its identity once" (`peer.key`, `peer.pub`, the agent key); `resident.test.ts` "keys persist across a reload" |
+| Neither entry imports a Node module | `portable.test.ts` |
 
 ## The content swarm in the worker
 

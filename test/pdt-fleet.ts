@@ -38,6 +38,8 @@ export class Network {
   readonly peers = new Map<string, NetPeer>();
   /** While true, frames queue instead of arriving; `flush` delivers them (two writers that have not seen each other). */
   holding = false;
+  /** The links `from>to` that drop every frame, one member out of another's reach while the rest still hear both. */
+  readonly cut = new Set<string>();
   private readonly held: (() => void)[] = [];
 
   deliver(fn: () => void): void {
@@ -68,7 +70,7 @@ export class NetPeer extends Peer {
         const targets = to !== null ? [network.peers.get(to)!]
           : [...network.peers.values()].filter((p) => p.identity.peerId !== this.identity.peerId);
         for (const target of targets) {
-          if (target !== undefined && target.accepts(env)) {
+          if (target !== undefined && !network.cut.has(`${this.identity.peerId}>${target.identity.peerId}`) && target.accepts(env)) {
             (target as unknown as Internals).handle(env);
           }
         }

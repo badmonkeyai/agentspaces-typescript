@@ -70,7 +70,8 @@ export function decode(base: Uint8Array, field: Uint8Array): Uint8Array {
     throw refused(`a field of ${field.length} bytes holds no format byte, RFC 9842 header, and zstd frame`);
   }
   if (field[0] === VCDIFF) {
-    throw refused("a VCDIFF frame (format byte 'v', P2-Z-05), which this release does not read");
+    throw refused("a VCDIFF frame (format byte 'v'), which this release does not read;"
+      + " send a zstd frame (format byte 'd') or the whole node");
   }
   if (field[0] !== ZSTD) {
     throw refused(`unknown format byte 0x${field[0]!.toString(16).padStart(2, "0")}; this release reads 'd' (zstd)`);

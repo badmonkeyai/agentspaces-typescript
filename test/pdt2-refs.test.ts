@@ -132,7 +132,7 @@ test("PDT 2 phase 7: a db ref reads a db head a Java writer wrote: its v 2 recor
     assert.equal(db.root, rootCid);
     assert.deepEqual(db.entity(2), { ":person/age": 46, ":person/name": "Grace" }, "the tail applied over the index");
     assert.deepEqual([...db.datoms("avet", ":person/name", "Grace")].map((d) => d.e), [2]);
-    await assert.rejects(rb.swap((v) => v), /read-only/);
+    await assert.rejects(rb.swap((v) => v), /read-only in this client; write db refs with DataScript through agentspaces-datascript/);
   } finally {
     closeAll(nodes);
   }
@@ -280,6 +280,55 @@ test("PDT 2 phase 7 gate: a chain node nobody serves costs a merge one load time
     const second = await rb.deref();
     assert.equal(batches, 1, "the next merge waits out the node's backoff and asks for nothing");
     assert.equal(second.root(), first.root());
+  } finally {
+    network.flush();
+    closeAll(nodes);
+  }
+});
+
+test("concurrent heads: a walk reads a chain node the heads' writers lack from the writer of a version the reader knows (P2-V-02)", async () => {
+  // Chain walk sources (srad/agentspaces-pdt2.md §10.20): a reader meets a head before the entry of the head's base,
+  // and the head's writer links the base's chain node without holding it, so the base's own writer alone holds the
+  // node. The walk asks the heads' writers first and then the writer of every version the reader knows, as Java's
+  // Refs.chainSources does. It asked the heads' writers and the writers of the chain nodes it read alone, who lacked
+  // the node, so the reader merged with no base where the base's writer merged against it.
+  const nodes = fleet(4, { loadTimeoutMillis: 200 });
+  const [a, b, c, r] = nodes as [Node, Node, Node, Node];
+  const network = a.peer.network;
+  const link = (from: Node, to: Node): string => `${from.peer.identity.peerId}>${to.peer.identity.peerId}`;
+  try {
+    const ra = a.pdt.ref<pdt.PMap<string, V>>("refs", "facts", "map");
+    const rb = b.pdt.ref<pdt.PMap<string, V>>("refs", "facts", "map");
+    const rc = c.pdt.ref<pdt.PMap<string, V>>("refs", "facts", "map");
+    const rr = r.pdt.ref<pdt.PMap<string, V>>("refs", "facts", "map");
+    // b writes the base, and every member reads its entry: b wrote a version r knows
+    const base = await rb.swap((m) => m.assoc("k", "base"));
+    await run(nodes, 2);
+    for (const ref of [ra, rc, rr]) {
+      assert.deepEqual(ref.heads().map((h) => h.root), [base.root()]);
+    }
+    // b moves on to p, whose entry a and r never read; c writes h over p, and a writes k over the base unseen by c
+    network.cut.add(link(b, a)).add(link(b, r)).add(link(a, c));
+    const p = await rb.swap((m) => m.assoc("p", "b"));
+    await run(nodes, 2);
+    const k = await ra.swap((m) => m.assoc("k2", "a"));
+    await run(nodes, 2);
+    assert.deepEqual(rc.heads().map((h) => h.root), [p.root()]);
+    const h = await rc.swap((m) => m.assoc("h", "c"));
+    await run(nodes, 2);
+    assert.deepEqual(new Set(rr.heads().map((x) => x.root)), new Set([h.root(), k.root()]));
+    type Facts = { known: Map<string, unknown>; ancestry: Map<string, string> };
+    const facts = (n: Node): Facts => (n.pdt.refs as unknown as { states: Map<string, Facts> }).states.get("refs/facts")!;
+    assert.ok(!facts(r).known.has(p.root()), "r never read an entry of p");
+    assert.ok(!c.pdt.store.has(facts(b).ancestry.get(p.root())!), "the head's writer lacks the chain node it linked");
+    network.cut.delete(link(b, r)); // b serves r again, and r has yet to hear of p
+
+    const merged = { k: "base", p: "b", h: "c", k2: "a" };
+    const conflicts: pdt.PConflict[] = [];
+    rr.onConflict((e) => conflicts.push(e));
+    assert.deepEqual(Object.fromEntries((await rb.deref()).toMap()), merged, "the base's writer merges against the base");
+    assert.deepEqual(Object.fromEntries((await rr.deref()).toMap()), merged, "and so does the reader");
+    assert.ok(!conflicts.some((e) => e.reason === "NO_COMMON_BASE"));
   } finally {
     network.flush();
     closeAll(nodes);
