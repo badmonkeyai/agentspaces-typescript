@@ -27,7 +27,7 @@
  */
 
 import * as beacon from "./beacon.js";
-import { equals, fromBase64, toHex, utf8 } from "./bytes.js";
+import { compare as compareBytes, equals, fromBase64, toHex, utf8 } from "./bytes.js";
 import { cryptoPort } from "./crypto.js";
 import { CborDouble, CborValue, canonicalMap, dumps, loads, readDocument } from "./cbor.js";
 import type { Pdt } from "./pdt/index.js";
@@ -44,6 +44,13 @@ import { DIALER_PACKAGES, Dialer, FrameChannel, defaultDialers } from "./transpo
 import "./transport/defaults.js";
 import { Seed, schemeOf, seedUrl } from "./seed.js";
 import { Repeating, TimerPort, systemTimers } from "./platform.js";
+import { AuditedSets, TrackedMap } from "./audited.js";
+import type { Holding } from "./audited.js";
+import { BUDGET_CEILING, LATE_COPY_MILLIS, TrieAudit } from "./audit.js";
+import type { AuditSignals, TreeNode } from "./audit.js";
+import * as horizon from "./horizon.js";
+import { entryIdOf, hasControl } from "./trie.js";
+import type { HashTrie } from "./trie.js";
 
 const wireSpaceId = (group: string, space: string): string => spaceIdLocal(`${group}/${space}`);
 
@@ -136,6 +143,51 @@ export const RECORDLESS_HINT = "wire.recordless";
 
 /** The most recordless states kept pending for records that have not arrived (PD-L-02). */
 export const MAX_PENDING_RECORDLESS = 1024;
+
+/**
+ * The hint of the hashed anti-entropy round (SPEC v0.1.17 §5.3): a round toward a member that carries it opens with a
+ * hash per stream and sends the full text only for the streams that differ.
+ */
+export const HASHES_HINT = "wire.hashes";
+/**
+ * The hint of replication by entry (SPEC annex I.6, v0.1.35; srad/replication-by-entry.md RE-T-02): `wire.ae=2`, a value
+ * in the hints map. Between two members that carry it a round audits each space by its fingerprinted trie and fetches
+ * the entries that differ by id, under a budget.
+ */
+export const AE_HINT = "wire.ae";
+/** The value of {@link AE_HINT} this build implements; a later form would be a new value. */
+export const AE_LEVEL = "2";
+/**
+ * The hint of the per-entry horizon (SPEC §7.3, v0.1.35; RE-H-04): `wire.horizon=1` promises that every writer behind
+ * this member renews by §7.2 (issuer only, present and unexpired, never shorter) and from one node per identity.
+ */
+export const HORIZON_HINT = "wire.horizon";
+/** The value of {@link HORIZON_HINT} this build implements. */
+export const HORIZON_LEVEL = "1";
+/** Streams a probe carries per-stream hashes for at most; above it the probe carries their root (SPEC §5.2, RE-T-07). */
+export const PROBE_HASH_STREAMS = 32;
+/** Rounds this peer's own anti-entropy must have been quiet before a probe's differing hashes open one (SPEC §5.2). */
+export const PROBE_QUIET_ROUNDS = 4;
+/** Budgeted text pulls continued at once per partner per round, at most: the session bound of annex I.6. */
+export const PULL_CONTINUATIONS_MAX = 64;
+/** How long the acknowledgement of a re-offered collected tombstone is held after its last refusal (RE-H-03). */
+export const COLLECTED_ACK_HOLD_MILLIS = horizon.LAPSED_GRACE_MILLIS;
+/** The anti-entropy form a round toward a member takes, read from its current card. */
+export type Form = "ae" | "hashes" | "text";
+/**
+ * The replication settings a host reads from its options (srad/replication-by-entry.md §7.2): `audit` advertises
+ * `wire.ae=2` and uses the audit toward members that carry it (on by default), `auditBudget` is the bytes this member
+ * asks an answer to stay within (1 MiB by default, 4 KiB to 4 MiB), and `horizon` is `per-entry` (the default) or
+ * `legacy`. Each is refused when it is out of bounds or misspelt.
+ */
+/**
+ * A host's replication settings (srad/replication-by-entry.md §7.2), each absent for the default: `audit` (true,
+ * Java's `agentspaces.gossip.audit`), `auditBudget` in bytes (1 MiB, `audit-budget`), `auditSessions` per asker (4,
+ * `audit-sessions`) and `horizon` (`per-entry`, `agentspaces.space.horizon`).
+ */
+export type ReplicationOptions = {
+  audit?: boolean; auditBudget?: number; auditSessions?: number; horizon?: "per-entry" | "legacy";
+};
 
 /**
  * The hint a peer advertises once every decoder it runs reads the v0.1.32 schemas of the AppCard and the AgentCard
@@ -236,6 +288,26 @@ export const MAX_TRACKED_LEASE_MILLIS = 24 * 60 * 60_000;
 /** How often a replica collects its tombstones (SPEC §7.3). */
 const COLLECT_PERIOD_MILLIS = 1000;
 
+/**
+ * After its settle window a take pulls the space once more and waits up to this long for the answer to fold,
+ * so a rival claim that push gossip dropped still reaches the judgement. Java has no such wait.
+ */
+const TAKE_FOLLOW_UP_MAX_MILLIS = 300;
+
+/** The take's follow-up wait after a settle window of `settleMillis`. */
+function takeFollowUpMillis(settleMillis: number): number {
+  return Math.min(Math.max(0, settleMillis), TAKE_FOLLOW_UP_MAX_MILLIS);
+}
+
+/**
+ * How long after its claim goes out a take may be judged in a quiet space: the whole settle window, then
+ * the follow-up wait, which ends early only when something folds. A take lease must be longer than this,
+ * since only a live claim wins. For the default window of 600 ms the bound is 900 ms.
+ */
+export function takeJudgedWithinMillis(settleMillis: number): number {
+  return Math.max(0, settleMillis) + takeFollowUpMillis(settleMillis);
+}
+
 /** Whether a `b` reference names a persistent tree (dag-cbor) rather than a piece artifact. */
 function isTreeRoot(ref: string): boolean {
   try {
@@ -246,8 +318,23 @@ function isTreeRoot(ref: string): boolean {
 }
 
 export class Peer {
-  readonly states = new Map<string, Dict>();
-  readonly claims = new Map<string, Dict>();
+  /**
+   * Moves on every change to the states, the claims and the acknowledged lines, which are all a space's text digest
+   * reads, so the digest is built once per change rather than once per probe (adversarial review of 2026-11-15).
+   */
+  private replicaVersion = 0;
+  // Every change to these maps names its entry to the audited sets (annex I.6), wherever it is made.
+  readonly states: Map<string, Dict> = new TrackedMap<string, Dict>().track((id, before, after) => {
+    this.replicaVersion += 1;
+    this.audited.touched(id);
+    if (after === undefined || !this.joinedStates.has(after)) {
+      this.signedStates.delete(id); // a state stored as signed is its own signed copy
+    }
+  });
+  readonly claims: Map<string, Dict> = new TrackedMap<string, Dict>().track((id) => {
+    this.replicaVersion += 1;
+    this.audited.touched(id);
+  });
   /** Recordless states for entries whose record has not arrived yet, by entry id (PD-L-02). */
   readonly pendingStates = new Map<string, Dict>();
   /** The founding advertisement this peer joined with, when it joined by GroupID. */
@@ -326,7 +413,11 @@ export class Peer {
    * them as `a:<line>`, as Java's acknowledges them, so partners stop re-offering them (HLC round
    * four, 2026-11-08, D5).
    */
-  private readonly refusedAck = new Map<string, string>();
+  private readonly refusedAck: Map<string, string> = new TrackedMap<string, string>()
+    .track((line, before, after) => {
+      this.replicaVersion += 1;
+      this.ackChanged(line, before, after);
+    });
   /** The dialers this peer dials with, by scheme; the registered defaults at construction. */
   readonly dialers = new Map<string, Dialer>();
   private pendingFounding: PendingFounding | null = null;
@@ -1051,6 +1142,14 @@ export class Peer {
     if (this.level > 1) {
       hints[APPCARD_HINT] = String(this.level); // AppCard origin and formats, 2026-11-09
     }
+    if (this.auditOn) {
+      // Replication by entry (annex I.6): the hashed round of v0.1.17 and the audit; off, this peer is a 0.6.0 member.
+      hints[HASHES_HINT] = "1";
+      hints[AE_HINT] = AE_LEVEL;
+    }
+    if (this.horizonOn) {
+      hints[HORIZON_HINT] = HORIZON_LEVEL; // every renewal here keeps §7.2's rule (RE-H-02, RE-H-04)
+    }
     const ad = wire.peerAdvertisement(this.group, this.identity, instantIso(now - (now % 1000)),
       "PT10M", hints);
     ad["endpoints"] = this.endpoints.map((e) => ({ ...e }));
@@ -1146,7 +1245,8 @@ export class Peer {
   }
 
   /** Layer 4 (SPEC §6, §8): the members heard from (peer id to its advertisement, `{}` when only heard). */
-  readonly members = new Map<string, Dict>();
+  readonly members: Map<string, Dict> = new TrackedMap<string, Dict>()
+    .track(() => { this.hinted.at = Number.NaN; }); // a member that comes or goes is judged afresh by the horizon
   /** The signed `peers` payloads held per member, served on the `view` stream (SPEC §5.2, v0.1.17). */
   private readonly heldPeerAds = new Map<string, Uint8Array>();
   /**
@@ -1678,6 +1778,7 @@ export class Peer {
         } else {
           this.sessionPeers.delete(String(ad["issuer"]));
         }
+        this.noteReplicationHints(issuer, hints);
       }
     } catch {
       // not a peer advertisement
@@ -1787,9 +1888,11 @@ export class Peer {
         this.claims.delete(entryId);
       }
     }
+    this.forgetAcknowledgements(now);
+    this.judgeHorizons(now);
     const collected: string[] = [];
     for (const [entryId, dto] of this.states) {
-      if (collectable(dto, now, this.longestLeaseOf(dto))) {
+      if (this.collectableHere(dto, now)) {
         collected.push(entryId);
       }
     }
@@ -1869,8 +1972,17 @@ export class Peer {
     this.pulledSpaces.add(space);
     // HLC round four, 2026-11-08 (D5): the digest names no entry, so the partner answers with every
     // state but those this replica refused and acknowledges.
-    this.send("DIGEST", wire.digestBody({ [`space:${space}`]: utf8(this.acknowledgedLines(space)),
-      ...revocationDigests() }), null, "dial");
+    const digests = { [`space:${space}`]: utf8(this.acknowledgedLines(space)), ...revocationDigests() };
+    // Toward a seed on wire.ae=2 the whole-space answer comes under this peer's budget, newest first, and the
+    // remainder continues as an audit, so a late joiner's pull never needs one frame of the whole space (RE-I-04).
+    const seed = this.seedPeer;
+    if (seed !== null && this.audits(seed)) {
+      this.expectPull(seed);
+      this.awaitBudgetedPull(seed);
+      this.send("DIGEST", wire.digestRecord({ digests, budget: this.trieAudit.budget }), null, "dial");
+      return;
+    }
+    this.send("DIGEST", wire.digestBody(digests), null, "dial");
   }
 
   /**
@@ -1937,6 +2049,14 @@ export class Peer {
   /**
    * Takes one entry under LEASE_RACE (spec §7.4): publish a signed claim,
    * wait one settle window, and win when the lattice still says so.
+   *
+   * The claim must still be live when the take is judged, which in a quiet
+   * space is after the whole settle window and a follow-up wait of up to
+   * min(settleMillis, 300) ms, so `leaseMillis` must exceed
+   * `takeJudgedWithinMillis(settleMillis)` (900 ms for the default 600 ms
+   * window). A take whose lease cannot outlast that throws a RangeError
+   * rather than racing for nothing until its timeout. Leave a margin above
+   * the bound: a busy event loop fires the timers late.
    */
   async takeEntry(space: string, typeName: string, agentName = "ts-worker",
                   leaseMillis = 60_000, settleMillis = 600,
@@ -1944,6 +2064,18 @@ export class Peer {
                   exactEntryId: string | null = null,
                   matches: ((payload: Dict, tags: Dict) => boolean) | null = null,
                   bid: number | ((payload: Dict) => number) = 0.0): Promise<string | null> {
+    // Only a live claim wins, as in Java's tryTakeOnce, and in a quiet space the claim is judged after the
+    // settle window and the follow-up wait. A lease no longer than both has always lapsed by then, so such
+    // a take could only publish doomed claims, each blocking other takers for its lease, and return null
+    // after its timeout as if it had lost a race (2026-11-15: the browser host took a 600 ms lease with a
+    // 600 ms window and never won; leases up to 900 ms failed the same way). Java judges right after its
+    // window, so its bound is the window alone.
+    const judgedWithin = takeJudgedWithinMillis(settleMillis);
+    if (!(leaseMillis > judgedWithin)) {
+      throw new RangeError(`a take lease of ${leaseMillis} ms cannot outlast its settle window of `
+        + `${settleMillis} ms and follow-up wait of ${takeFollowUpMillis(settleMillis)} ms: the claim `
+        + `would lapse before the take is judged (the lease must exceed ${judgedWithin} ms)`);
+    }
     const holder = agent !== null ? agent.agentId : this.identity.agent(agentName);
     if (this.revocations.refuses(holder, agent?.publicRaw ?? null, null)) {
       return null; // a revoked agent takes nothing, even locally
@@ -1994,7 +2126,7 @@ export class Peer {
         // had lost, and two takers ran one task (2026-11-11, exactly-once over TLS).
         await this.settle(settleMillis);
         this.pullSpacePaced(space, settleMillis);
-        await this.foldOrTimeout(Math.min(settleMillis, 300));
+        await this.foldOrTimeout(takeFollowUpMillis(settleMillis));
         const winner = this.claims.get(entryId)?.["claim"] as Dict | undefined;
         if (winner && winner["holder"] === holder
             && Number(winner["epoch"]) === epoch
@@ -2049,23 +2181,40 @@ export class Peer {
     }
   }
 
-  /** Extend a held claim using the existing claim lattice, with a fresh epoch. */
-  renewClaim(space: string, entryId: string, leaseMillis: number, agent: AgentIdentity): void {
+  /**
+   * Extends a held claim to at least `leaseMillis` from now, never shorter (SPEC §7.2 renewal, v0.1.35).
+   * The renewal is the same take, so it keeps the claim's epoch, stamp and bid and moves only the expiry,
+   * as Java's TakenEntry.renew does; the lattice prefers the later expiry of two otherwise equal claims.
+   */
+  renewClaim(space: string, entryId: string, leaseMillis: number, agent: AgentIdentity | null = null): void {
     if (!Number.isFinite(leaseMillis) || leaseMillis <= 0) throw new Error("Positive lease required");
     this.requireHeld(space, entryId, agent);
     const previous = this.claims.get(entryId)!["claim"] as Dict;
-    const claim = wire.takeClaim(entryId, String(previous["spaceId"]), Number(previous["epoch"]) + 1,
-      wire.hlcNow(agent.agentId, this.now()), agent.agentId, 0.0, this.now() + leaseMillis);
+    // A take made without an agent is held by one of this peer's agent names and signed by the peer, so its renewal is.
+    const holder = agent?.agentId ?? String(previous["holder"]);
+    const now = this.now();
+    const current = Number(previous["expiresAtMillis"]);
+    const expiry = Math.max(current, now + leaseMillis);
+    if (expiry === current) {
+      return; // the hold already runs that long, so nothing changes and nothing goes out (as Java, RE-H-02)
+    }
+    // A fresh epoch here made the renewal a new take: it outranked the held claim whatever its expiry, so
+    // a shorter renewal shortened the hold, and every replica, Java's included, announced TAKEN again for
+    // the new epoch. A fresh stamp broke SPEC §6.1, under which a renewal keeps the original stamp.
+    const claim = wire.takeClaim(entryId, String(previous["spaceId"]), wire.claimNumber(previous["epoch"]),
+      String(previous["stamp"]), holder, wire.claimNumber(previous["bid"]), expiry);
     const signed = wire.signedClaim(claim, this.identity, agent);
     this.observeClaimLease(signed);
     this.claims.set(entryId, wire.mergeClaims(this.claims.get(entryId), signed));
-    this.send("RUMOR", wire.rumorBody(`space:${space}`, `c:${entryId}:${claim["stamp"]}`, 6,
+    // The stamp no longer names the renewal, so its rumor id says renew and when, as Java's does; the
+    // original claim's id would be taken for the claim already heard.
+    this.send("RUMOR", wire.rumorBody(`space:${space}`, `c:${entryId}:renew:${now}`, 6,
       wire.claimDelta(entryId, signed)));
   }
 
   /** Snapshot contains signed public material only. Restore re-verifies every entry. */
   exportSnapshot(): Dict {
-    return { group: this.group, states: [...this.states.values()], claims: Object.fromEntries(this.claims), revocations: this.revocations.exportSigned() };
+    return { group: this.group, states: [...this.states].map(([id, dto]) => this.signedStateOf(id, dto)), claims: Object.fromEntries(this.claims), revocations: this.revocations.exportSigned() };
   }
   restoreSnapshot(snapshot: Dict): void {
     if (snapshot["group"] !== this.group) throw new Error("Snapshot group mismatch");
@@ -2090,12 +2239,6 @@ export class Peer {
     }
   }
 
-  /**
-   * Renews this peer's write of an entry (SPEC §7.3): a later lease stamp and
-   * expiry, re-signed by the issuer, as the agent when it wrote as one. Only
-   * the issuer renews: `agent` must be the record's issuer, and without one
-   * the issuer must be one of this peer's agent names.
-   */
   /**
    * Cancels an entry this peer (or `agent`) wrote, as `EntryHandle.cancel` does in Java: a state whose
    * `removes` cover its `adds`, signed by the issuer, so every replica drops the entry. Reads, finds,
@@ -2130,9 +2273,21 @@ export class Peer {
       dumps({ state: dto, claimEntry: null, claim: null })));
   }
 
+  /**
+   * Renews this peer's write of an entry (SPEC §7.2, v0.1.35, normative): the write lease runs to at least
+   * `leaseMillis` from now and never shortens, `expiry = max(current, now + leaseMillis)`, so the issuer's last lease
+   * is the largest any copy carries, which the collection horizons of §7.3 rely on. Three conditions guard it, each
+   * refused here with nothing sent: only the issuer renews (`agent` must be the record's issuer, and without one the
+   * issuer must be one of this peer's agent names), the entry is held present (neither completed nor withdrawn), and
+   * its write lease has not lapsed here. A renewal the rule leaves unchanged sends nothing. A caller that wants an entry
+   * gone sooner cancels it; one that wants a shorter lease cancels and writes again.
+   */
   renewEntry(space: string, entryId: string, leaseMillis = 600_000,
              agent: AgentIdentity | null = null): void {
-    const previous = this.states.get(entryId)!;
+    const previous = this.states.get(entryId);
+    if (previous === undefined) {
+      throw new Error(`${entryId} is not held here`);
+    }
     const record = previous["record"] as Dict;
     const issuer = String(record["issuer"]);
     if (agent !== null && agent.agentId !== issuer) {
@@ -2141,9 +2296,26 @@ export class Peer {
     if (agent === null && !issuer.startsWith(this.identity.peerId + "/")) {
       throw new Error(`${entryId} was written by ${issuer}, not by this peer`);
     }
+    if (!Number.isFinite(leaseMillis) || leaseMillis < 0) {
+      throw new RangeError(`a renewal extends by a non-negative lease, not ${leaseMillis}`);
+    }
     const now = this.now();
+    if (!present(previous)) {
+      throw new Error(`${entryId} is no longer present here (completed or withdrawn), so it cannot be renewed`);
+    }
+    const current = leaseExpiryOf(previous);
+    if (current <= now) {
+      throw new Error(`the write lease of ${entryId} lapsed, so it cannot be renewed`);
+    }
+    if (now + leaseMillis < current) {
+      this.renewShortenings += 1; // RE-H-01: a call that would have shortened the lease before v0.1.35
+    }
+    const expiry = Math.max(current, now + leaseMillis);
+    if (expiry === current) {
+      return; // the lease already runs that long: nothing changes and nothing goes out
+    }
     const dto = wire.signState({ ...previous, leaseStamp: wire.hlcNow(issuer, now),
-      leaseValue: { holder: issuer, expiresAtMillis: now + leaseMillis, kind: "WRITE" } },
+      leaseValue: { holder: issuer, expiresAtMillis: expiry, kind: "WRITE" } },
     this.identity, agent, now);
     this.observeLease(dto);
     this.states.set(entryId, dto);
@@ -2400,7 +2572,11 @@ export class Peer {
       // Java's probe nonces are random 64-bit longs: echo the decoded integer
       // as is (a bigint beyond 2^53), since a Number would lose it and the
       // encoder would refuse it, leaving the probe unanswered and this peer evicted.
-      this.send("ACK", wire.ackBody(decoded["nonce"] as number | bigint));
+      if (this.auditOn && typeof sender === "string" && (decoded["hashes"] !== undefined || decoded["root"] !== undefined)) {
+        this.onProbeHashes(sender, decoded); // SPEC §5.2: hashes are answered with hashes, of the kind the pinger reads
+      } else {
+        this.send("ACK", wire.ackBody(decoded["nonce"] as number | bigint));
+      }
     } else if (kind === "GROUP_AD") {
       this.offerGroupAd(env); // only a join in progress cares (§10.1)
     } else if (kind === "RUMOR") {
@@ -2444,6 +2620,11 @@ export class Peer {
       }
     } else if (kind === "PULL_RESP") {
       const deltas = decoded["deltas"] as { [stream: string]: Uint8Array };
+      // A fetch's answer is booked against the body it answers, and a budgeted pull's remainder continues (annex I.6).
+      const fetchStream = this.pullRespArrived(String(sender), decoded);
+      // A fetch's answer leaves a budgeted text pull to the same member waiting for its own answer.
+      const awaited = fetchStream === null && this.budgetedPullAnswered(String(sender));
+      const received = new Set<string>();
       for (const [stream, deltaBytes] of Object.entries(deltas)) {
         if (revocation.STREAMS.includes(stream) && deltaBytes.length > 0) {
           for (const signed of (records.readList(deltaBytes, records.SIGNED_REVOCATION) ?? [])) {
@@ -2480,7 +2661,19 @@ export class Peer {
         for (const dto of (sync["states"] as CborValue[]) ?? []) {
           this.fold(dto as Dict);
         }
+        if (stream === fetchStream) {
+          for (const entryId of Object.keys(claims)) {
+            received.add(entryId);
+          }
+          for (const dto of (sync["states"] as Dict[]) ?? []) {
+            const id = (dto["record"] as Dict | null | undefined)?.["entryId"] ?? dto["entryId"];
+            if (typeof id === "string") {
+              received.add(id);
+            }
+          }
+        }
       }
+      this.pullRespSettled(String(sender), decoded, fetchStream, received, awaited);
     } else {
       // A kind this client does not speak (the hint-gated kinds of SPEC v0.1.17 are never
       // sent to it, but a misconfigured peer could): ignored, counted, never fatal.
@@ -2571,20 +2764,40 @@ export class Peer {
     return out;
   }
 
-  /** `ReplicatedSpace.digest` for one space: `e:`/`c:` lines in key order. */
+  /**
+   * `ReplicatedSpace.digest` for one space: `e:`/`c:` lines in key order. It reads only the states, the claims and
+   * the acknowledged lines, so it is kept until one of them changes: a probe whose hash differs compares the text
+   * kind too, and building it afresh cost each such probe about 21 ms at 20,000 entries, linear in the space, which
+   * any member could ask every second (adversarial review of 2026-11-15).
+   */
   spaceDigest(space: string): Uint8Array {
+    return this.textOfSpace(space).bytes;
+  }
+
+  /** A space's text digest and, once asked, its SHA-256, as of the replica's current version. */
+  private textOfSpace(space: string): { bytes: Uint8Array; hash: Uint8Array | null } {
+    const held = this.spaceTexts.get(space);
+    if (held !== undefined && held.version === this.replicaVersion) {
+      return held;
+    }
     const summary = new Map<string, string>();
     const states = this.statesOf(space);
     for (const [entryId, dto] of states) {
-      summary.set(`e:${entryId}`, serving.stateHash(dto));
+      summary.set(`e:${entryId}`, this.stateHashOf(dto));
     }
     for (const [entryId, signed] of this.claims) {
       if (states.has(entryId)) {
         summary.set(`c:${entryId}`, serving.claimHash((signed["claim"] as Dict) ?? {}));
       }
     }
-    return utf8(serving.digestLines(summary) + this.acknowledgedLines(space));
+    const text = { version: this.replicaVersion, bytes: utf8(serving.digestLines(summary) + this.acknowledgedLines(space)),
+      hash: null as Uint8Array | null };
+    this.spaceTexts.set(space, text);
+    return text;
   }
+
+  /** Each space's text digest as last built, with the version it was built at. */
+  private readonly spaceTexts = new Map<string, { version: number; bytes: Uint8Array; hash: Uint8Array | null }>();
 
   /** `ReplicatedSpace.deltaFor`: the states and claims the remote digest does not name, as a SyncDelta. */
   spaceDeltaFor(space: string, remoteDigest: Uint8Array): Uint8Array {
@@ -2595,7 +2808,7 @@ export class Peer {
     for (const [entryId, dto] of held) {
       const key = `e:${entryId}=${serving.stateHash(dto)}`;
       if (!remote.has(key) && !remote.has(`a:${key}`)) {
-        states.push(dto);
+        states.push(this.signedStateOf(entryId, dto)); // a join nobody signed travels as its most advanced signed input
       }
     }
     for (const [entryId, signed] of this.claims) {
@@ -2691,7 +2904,12 @@ export class Peer {
       return null;
     }
     const partner = partners[Math.floor(Math.random() * partners.length)];
-    this.send("DIGEST", wire.digestBody(this.fullDigests()), partner);
+    this.expectedPulls.clear(); // as Java's round: only this round's partner may answer it with a want
+    this.digestTo(partner);
+    if (this.auditOn) {
+      // The fetch queue's turn (RE-I-03): ids a partner left out go to the next member once their backoff passes.
+      this.trieAudit.retry(this.linkedMembers());
+    }
     return partner;
   }
 
@@ -2702,6 +2920,14 @@ export class Peer {
    * advertises, and is ignored.
    */
   private onDigest(from: string, digest: Dict): void {
+    if (this.onDigestFields(from, digest)) {
+      return;
+    }
+    this.answerTextPull(from, digest);
+  }
+
+  /** The text pull of a body without a budget or ids, answered exactly as a 0.6.0 member answers it. */
+  private answerTextPull(from: string, digest: Dict): void {
     const digests = digest["digests"];
     if (digests === null || typeof digests !== "object" || Array.isArray(digests)) {
       return;
@@ -2841,6 +3067,7 @@ export class Peer {
       this.heldPeerAds.delete(peer);
       this.reachable.delete(peer);
       this.sessionPeers.delete(peer);
+      this.forgetReplicationHints(peer);
     }
     if (gone.length > 0) {
       this.appCardLevelChanged();
@@ -2879,6 +3106,9 @@ export class Peer {
     // replica is fabricated provenance and the state is dropped, counted nowhere.
     if (typeof entryId !== "string" || !dotsBoundToIssuer(dto, record) || !this.verifyState(dto, record)) {
       return; // unauthenticated record or forged mutable state: drop it
+    }
+    if (this.auditOn && hasControl(entryId)) {
+      return; // annex I.6: under wire.ae=2 an id holding a control character is dropped uncounted, as R8 drops a state
     }
     // HLC logical counter, 2026-11-08 (Rust team report): every implementation refuses a state
     // whose issue or lease stamp fails the strict parse, so the replicas converge and no such
@@ -2922,7 +3152,10 @@ export class Peer {
     // door a state past the collection horizon that a lagging replica re-offers, so a collected
     // tombstone never returns.
     this.observeLease(dto);
-    if (collectable(dto, this.now(), this.longestLeaseOf(dto))) {
+    if (this.collectableHere(dto, this.now())) {
+      // Acknowledged when this replica holds no state of the entry, so a member that keeps the tombstone longer
+      // stops re-offering it every round (SPEC §7.3, RE-H-03).
+      this.acknowledgeCollected(dto, record);
       return;
     }
     this.pendingStates.delete(entryId);
@@ -2931,8 +3164,7 @@ export class Peer {
     // replayed early state (validly signed by its author) can therefore never
     // shrink the sets, roll back the lease, or undo a completion.
     const previous = this.states.get(entryId);
-    this.states.set(entryId,
-        previous === undefined ? dto : joinStates(previous, dto));
+    this.storeJoined(entryId, previous, dto);
     if (this.collector === null) {
       this.collector = this.every(COLLECT_PERIOD_MILLIS, () => this.collectTombstones());
     }
@@ -3131,7 +3363,12 @@ export class Peer {
 
   /** Names a verified, refused state's digest line as acknowledged. */
   private acknowledge(dto: Dict, record: Dict): void {
-    this.acknowledgeLine(`e:${String(record["entryId"])}=${serving.stateHash(dto)}`, String(record["spaceId"]));
+    const line = `e:${String(record["entryId"])}=${serving.stateHash(dto)}`;
+    this.acknowledgeLine(line, String(record["spaceId"]));
+    // Annex I.6: forgotten once a holder would have collected what was refused, so the line cannot hold this
+    // replica's audited set apart from its partners' for good; a member that still holds it earns it again.
+    this.forgetRefusedAfter(line, horizon.collectionHorizon(horizonKindOf(dto), leaseExpiryOf(dto),
+      this.longestLeaseOf(dto), "legacy"));
   }
 
   /**
@@ -3141,8 +3378,19 @@ export class Peer {
   private acknowledgeLine(line: string, spaceId: string): void {
     this.refusedAck.delete(line); // re-offered: kept as the newest
     this.refusedAck.set(line, spaceId);
-    if (this.refusedAck.size > MAX_REFUSED_ACK) {
-      this.refusedAck.delete(this.refusedAck.keys().next().value!);
+    if (this.collector === null) {
+      // The sweep forgets acknowledgements whose time has come, so it runs once there is one to forget.
+      this.collector = this.every(COLLECT_PERIOD_MILLIS, () => this.collectTombstones());
+    }
+    // R7's bound is per space, as Java's refusedAck is (srad/replication-by-entry.md §10.1): one busy space's refusals
+    // never push another space's acknowledgements out.
+    if ((this.ackCounts.get(spaceId) ?? 0) > MAX_REFUSED_ACK) {
+      for (const [held, id] of this.refusedAck) {
+        if (id === spaceId) {
+          this.refusedAck.delete(held);
+          break;
+        }
+      }
     }
   }
 
@@ -3230,6 +3478,9 @@ export class Peer {
     if (claim === null || claim["entryId"] !== entryId) {
       return;
     }
+    if (this.auditOn && hasControl(entryId)) {
+      return; // annex I.6: dropped uncounted under wire.ae=2, so no line of the audited set names two sets
+    }
     const epoch = wire.claimNumber(claim["epoch"]);
     const expires = wire.claimNumber(claim["expiresAtMillis"]);
     // The proof: peer-signed, or agent-signed under a peer certificate
@@ -3241,7 +3492,9 @@ export class Peer {
     // the refusal is acknowledged in the digest so partners stop re-offering it (HLC round six,
     // 2026-11-08, R7).
     if (this.holderRevoked(signed)) {
-      this.acknowledgeLine(`c:${entryId}=${serving.claimHash(claim)}`, String(claim["spaceId"]));
+      const line = `c:${entryId}=${serving.claimHash(claim)}`;
+      this.acknowledgeLine(line, String(claim["spaceId"]));
+      this.forgetRefusedAfter(line, expires + horizon.LAPSED_GRACE_MILLIS); // a claim's holders drop it past its lapse
       return;
     }
     // HLC logical counter, 2026-11-08 (Rust team report): every implementation refuses a claim
@@ -3286,6 +3539,1033 @@ export class Peer {
     }
     this.onClaim?.(entryId, this.claims.get(entryId)!);
     this.wakeFoldWaiters();
+  }
+  // ------------------------------------------------- replication by entry (SPEC annex I.6, §5.2, §7.2, §7.3, v0.1.35)
+  // srad/replication-by-entry.md RE-L-01: the form per partner from its current card (the audit, the hashed round of
+  // v0.1.17, or the full text), the audit and the fetch by id under a budget, the probe hashes split by partner kind,
+  // the per-entry horizon with the view's and the writer's halves, and the acknowledgement of a collected tombstone.
+
+  private auditOn = true;
+  private horizonOn = true;
+  /** The members whose current card carries `wire.ae=2`, `wire.hashes=1`, and `wire.horizon=1`. */
+  readonly aePeers = new Set<string>();
+  readonly hashPeers = new Set<string>();
+  readonly horizonPeers = new Set<string>();
+  /** When each member's current stay with the horizon hint began, on this peer's clock (the writer's half, RE-H-04). */
+  private readonly hintedSince = new Map<string, number>();
+  /** The annex I.6 audit, both halves, and its fetch queue. */
+  readonly trieAudit: TrieAudit = new TrieAudit({
+    trieFor: (stream) => this.trieForStream(stream),
+    sendDigest: (to, fields) => this.send("DIGEST", wire.digestRecord(fields), to),
+    audits: (member) => this.audits(member),
+    now: () => this.now(),
+    random: () => Math.random(),
+    log: (message) => this.onReplicationLog?.(message),
+  });
+  private readonly audited: AuditedSets = new AuditedSets({
+    holding: (id, now) => this.holdingOf(id, now),
+    idsOf: (spaceId) => this.idsOfSpace(spaceId),
+    now: () => this.now(),
+  });
+  /** The acknowledged lines by entry id, and how many each space holds (R7's bound is per space). */
+  private readonly ackIndex = new Map<string, Set<string>>();
+  private readonly ackCounts = new Map<string, number>();
+  /** When each acknowledged line is forgotten: a collected tombstone's after its hold, a refusal's past its horizon. */
+  private readonly ackForgetAt = new Map<string, number>();
+  private readonly horizonModes = new Map<string, horizon.HorizonMode>();
+  private readonly stateHashes = new WeakMap<Dict, string>();
+  /** The partners whose answer to a round this peer opened is awaited, so only they draw a `want`'s text. */
+  private readonly expectedPulls = new Set<string>();
+  /**
+   * The partners a budgeted text pull went to whose answer has not come, and when it went: only such an answer's
+   * remainder continues the pull. Kept apart from `expectedPulls`, which each round clears, so a pull's chain is not
+   * cut by a round that starts while its answer is on the way.
+   */
+  private readonly budgetedPulls = new Map<string, number>();
+  private readonly continuations = new Map<string, number>();
+  private readonly lastForm = new Map<string, Form>();
+  private readonly probePulls = new Map<string, number>();
+  private hinted: { at: number; value: boolean } = { at: Number.NaN, value: false };
+  /** Since when this peer has opened no round, as first seen by a probe: its rounds have backed off past four. */
+  private quietSince: number | null = null;
+  /**
+   * One round of the group, the unit of the horizon's hysteresis and of the probe's pacing: the founding's gossip
+   * period when this peer knows it, else one second, Java's default.
+   */
+  gossipPeriodMillis = 1000;
+  /** How many times a round toward a member took another form than the round before it (RE-Q-REL-09). */
+  formChanges = 0;
+  /** Renewals that would have shortened a lease before v0.1.35 (RE-H-01); the rule kept the longer lease. */
+  renewShortenings = 0;
+  /** Re-offers of collected tombstones this replica acknowledged at its door (RE-H-03). */
+  collectedReoffersAcknowledged = 0;
+  /** What anti-entropy cost, counters that only grow (RE-F-03). */
+  readonly pacing = {
+    hashedOpeningsSent: 0, hashedOpeningsReceived: 0, wantsSent: 0, wantsReceived: 0, digestTextBytesSent: 0,
+    pullRespSent: 0, budgetedAnswers: 0, remainderSent: 0, remainderReceived: 0, pullContinued: 0, probeRounds: 0,
+    remainderUnsolicited: 0,
+  };
+  /** Where the audit logs a refusal, once per member and reason. */
+  onReplicationLog: ((message: string) => void) | null = null;
+
+  /**
+   * Whether this peer advertises `wire.hashes=1` and `wire.ae=2` and audits toward members that do (on by default).
+   * Off, it is a 0.6.0 member: it opens every round with the full text, ignores a hashed opening, and drops a body
+   * carrying a field of annex I.6. Advertise a change with {@link introduce}.
+   */
+  get audit(): boolean {
+    return this.auditOn;
+  }
+
+  set audit(on: boolean) {
+    this.auditOn = on;
+  }
+
+  /** The budget this peer puts on its requests, in bytes (annex I.6; 4 KiB to 4 MiB, 1 MiB by default). */
+  get auditBudget(): number {
+    return this.trieAudit.budget;
+  }
+
+  set auditBudget(bytes: number) {
+    this.trieAudit.budget = bytes;
+  }
+
+  /** The audit sessions this peer keeps open per asker (1 to 4). */
+  get auditSessions(): number {
+    return this.trieAudit.sessionsMax;
+  }
+
+  set auditSessions(sessions: number) {
+    this.trieAudit.sessionsMax = sessions;
+  }
+
+  /**
+   * `per-entry` (the default) advertises `wire.horizon=1` and lets a withdrawal be collected by its own lease once
+   * every member in view advertises it too; `legacy` keeps two maximum leases. Any other value is refused, so a
+   * misspelt setting never passes for the default. Advertise a change with {@link introduce}.
+   */
+  get horizon(): "per-entry" | "legacy" {
+    return this.horizonOn ? "per-entry" : "legacy";
+  }
+
+  set horizon(mode: "per-entry" | "legacy") {
+    if (mode !== "per-entry" && mode !== "legacy") {
+      throw new RangeError(`the horizon is "per-entry" or "legacy", not ${JSON.stringify(mode)}`);
+    }
+    this.horizonOn = mode === "per-entry";
+  }
+
+  /** Applies a host's replication settings; advertise a change of the hints with {@link introduce}. */
+  configureReplication(options: ReplicationOptions): void {
+    if (options.audit !== undefined) {
+      if (typeof options.audit !== "boolean") {
+        throw new TypeError(`audit is true or false, not ${JSON.stringify(options.audit)}`);
+      }
+      this.audit = options.audit;
+    }
+    if (options.auditBudget !== undefined) {
+      this.auditBudget = options.auditBudget;
+    }
+    if (options.auditSessions !== undefined) {
+      this.auditSessions = options.auditSessions;
+    }
+    if (options.horizon !== undefined) {
+      this.horizon = options.horizon;
+    }
+  }
+
+  /** Whether this peer audits with a member: both carry `wire.ae=2` (the member by its current card). */
+  audits(member: string): boolean {
+    return this.auditOn && this.aePeers.has(member);
+  }
+
+  /** The form a round toward a member takes now, read from its current card; it changes only when the card does. */
+  formToward(member: string): Form {
+    if (!this.auditOn) {
+      return "text";
+    }
+    return this.aePeers.has(member) ? "ae" : this.hashPeers.has(member) ? "hashes" : "text";
+  }
+
+  /** The form of the last round this peer opened with a member, or undefined before the first. */
+  lastFormToward(member: string): Form | undefined {
+    return this.lastForm.get(member);
+  }
+
+  /** The per-entry horizon's mode in one space (RE-H-04), as last judged. */
+  horizonModeOf(space: string): horizon.HorizonModeName {
+    return this.horizonModes.get(wireSpaceId(this.group, space))?.mode ?? "LEGACY";
+  }
+
+  /** The figures of replication by entry, for a status page (RE-F-03, RE-Q-MNT-02). */
+  replicationStatus(): {
+    forms: { [form in Form]: number }; formChanges: number; audit: AuditSignals; pacing: Peer["pacing"];
+    horizon: { [spaceId: string]: { mode: horizon.HorizonModeName; engagements: number; settlements: number;
+      disengagements: number } };
+    renewShortenings: number; collectedReoffersAcknowledged: number; acknowledged: number;
+  } {
+    const forms = { ae: 0, hashes: 0, text: 0 };
+    for (const member of this.members.keys()) {
+      forms[this.formToward(member)] += 1;
+    }
+    const modes: { [spaceId: string]: { mode: horizon.HorizonModeName; engagements: number; settlements: number;
+      disengagements: number } } = {};
+    for (const [spaceId, mode] of this.horizonModes) {
+      modes[spaceId] = { mode: mode.mode, engagements: mode.engagements, settlements: mode.settlements,
+        disengagements: mode.disengagements };
+    }
+    return { forms, formChanges: this.formChanges, audit: this.trieAudit.signals(), pacing: { ...this.pacing },
+      horizon: modes, renewShortenings: this.renewShortenings,
+      collectedReoffersAcknowledged: this.collectedReoffersAcknowledged, acknowledged: this.refusedAck.size };
+  }
+
+  /** The trie of a space (by name) as the audit reads it; built on its first read. */
+  spaceTrie(space: string): HashTrie {
+    return this.audited.trieFor(wireSpaceId(this.group, space));
+  }
+
+  // ---- the hints of the members' cards
+
+  private noteReplicationHints(issuer: string, hints: Dict): void {
+    this.hinted.at = Number.NaN;
+    const toggle = (set: Set<string>, on: boolean): void => {
+      if (on) {
+        set.add(issuer);
+      } else {
+        set.delete(issuer);
+      }
+    };
+    // RE-T-03: the form toward a member follows its current card alone, so a card that drops a hint moves the member
+    // back at the next round, and nothing else moves it (RE-Q-REL-09).
+    toggle(this.hashPeers, hints[HASHES_HINT] === "1");
+    toggle(this.aePeers, hints[AE_HINT] === AE_LEVEL);
+    const horizonHinted = hints[HORIZON_HINT] === HORIZON_LEVEL;
+    toggle(this.horizonPeers, horizonHinted);
+    if (!horizonHinted) {
+      this.hintedSince.delete(issuer);
+    } else if (!this.hintedSince.has(issuer)) {
+      this.hintedSince.set(issuer, this.now());
+    }
+  }
+
+  private forgetReplicationHints(peer: string): void {
+    this.aePeers.delete(peer);
+    this.hashPeers.delete(peer);
+    this.horizonPeers.delete(peer);
+    this.hintedSince.delete(peer);
+    this.lastForm.delete(peer);
+    this.probePulls.delete(peer);
+    this.continuations.delete(peer);
+    this.expectedPulls.delete(peer);
+    this.budgetedPulls.delete(peer);
+    this.trieAudit.memberLeft(peer);
+  }
+
+  // ---- the streams and their hashes
+
+  private heldStreams(): string[] {
+    return ["ads", "view", ...revocation.STREAMS, ...[...this.pulledSpaces].map((space) => `space:${space}`)];
+  }
+
+  private trieForStream(stream: string): HashTrie | null | undefined {
+    if (!this.servesStream(stream)) {
+      return undefined;
+    }
+    if (!this.auditOn || !stream.startsWith("space:")) {
+      return null; // held, with the text digest alone
+    }
+    return this.audited.trieFor(wireSpaceId(this.group, stream.substring("space:".length)));
+  }
+
+  /** `RevocationRegistry.digest` and `CredentialRevocationRegistry.digest`: one line per revocation, by key. */
+  private revocationDigest(stream: string): Uint8Array {
+    const lines: [string, string][] = [];
+    for (const signed of (this.revocations.exportSigned()[stream] ?? []) as Dict[]) {
+      const adBytes = signed["adBytes"];
+      if (!(adBytes instanceof Uint8Array)) {
+        continue;
+      }
+      try {
+        const ad = loads(adBytes) as Dict;
+        const key = stream === revocation.PEER_STREAM ? `r:${String(ad["revoked"])}`
+          : `c:${String((ad["target"] as Dict)["kind"])}:${revocation.canonicalTarget(ad["target"] as Dict)}`;
+        lines.push([key, serving.revocationLine(key, adBytes)]);
+      } catch {
+        // not a revocation this replica can name
+      }
+    }
+    lines.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return utf8(lines.map(([, line]) => `${line}\n`).join(""));
+  }
+
+  /** A held stream's text digest, the form every member without `wire.ae=2` compares. */
+  private textDigestOf(stream: string): Uint8Array {
+    if (stream === "ads") {
+      return this.adsDigest();
+    }
+    if (stream === "view") {
+      return this.viewDigest();
+    }
+    if (revocation.STREAMS.includes(stream)) {
+      return this.revocationDigest(stream);
+    }
+    return this.spaceDigest(stream.substring("space:".length));
+  }
+
+  private textDigests(streams: Iterable<string>): Dict {
+    const digests: Dict = {};
+    for (const stream of streams) {
+      if (this.servesStream(stream)) {
+        digests[stream] = this.textDigestOf(stream);
+      }
+    }
+    return digests;
+  }
+
+  /** A stream's hash toward a partner of one kind: its trie's stream hash toward `wire.ae=2`, else its text's. */
+  private streamHashOf(stream: string, trie: boolean): Uint8Array {
+    if (trie) {
+      const audited = this.trieForStream(stream);
+      if (audited) {
+        return audited.streamHash();
+      }
+    }
+    if (stream.startsWith("space:")) {
+      const text = this.textOfSpace(stream.substring("space:".length));
+      text.hash ??= cryptoPort().sha256(text.bytes);
+      return text.hash;
+    }
+    return cryptoPort().sha256(this.textDigestOf(stream));
+  }
+
+  /**
+   * Whether a hash a member sent names this peer's own set of a stream, compared first in the kind expected from it
+   * and then in the other, since the sender chose the kind by its view of this peer's card and the two views differ
+   * until the cards spread. Equal hashes of either kind mean equal sets (annex I.6), so this is never a false match.
+   */
+  private sameStream(stream: string, trie: boolean, theirs: Uint8Array): boolean {
+    if (equals(this.streamHashOf(stream, trie), theirs)) {
+      return true;
+    }
+    if (trie) {
+      return equals(this.streamHashOf(stream, false), theirs);
+    }
+    const audited = this.auditOn ? this.trieForStream(stream) : null;
+    return audited !== null && audited !== undefined && equals(audited.streamHash(), theirs);
+  }
+
+  // ---- the round
+
+  private expectPull(partner: string): void {
+    this.expectedPulls.delete(partner);
+    this.expectedPulls.add(partner);
+    while (this.expectedPulls.size > 64) {
+      this.expectedPulls.delete(this.expectedPulls.values().next().value!);
+    }
+  }
+
+  /**
+   * Opens a round with a member in the form its current card names (RE-T-03): the full text toward a member with
+   * neither hint, as every round went before; a hash per stream toward `wire.hashes=1`; and toward `wire.ae=2` the
+   * trie's stream hash for each space and the text's for every other stream (annex I.6).
+   */
+  private digestTo(partner: string): void {
+    this.quietSince = this.now();
+    this.continuations.delete(partner);
+    const form = this.formToward(partner);
+    const before = this.lastForm.get(partner);
+    if (before !== undefined && before !== form) {
+      this.formChanges += 1;
+    }
+    this.lastForm.set(partner, form);
+    if (form === "text") {
+      this.send("DIGEST", wire.digestBody(this.fullDigests()), partner);
+      return;
+    }
+    this.expectPull(partner);
+    const hashes: Dict = {};
+    for (const stream of this.heldStreams()) {
+      hashes[stream] = this.streamHashOf(stream, form === "ae");
+    }
+    if (form === "ae") {
+      this.trieAudit.opening(partner);
+    }
+    this.pacing.hashedOpeningsSent += 1;
+    this.send("DIGEST", wire.digestRecord({ hashes }), partner);
+  }
+
+  /** A body asking for full text digests: under this peer's budget toward `wire.ae=2`, as since v0.1.17 otherwise. */
+  private textPull(to: string, digests: Dict): Uint8Array {
+    for (const digest of Object.values(digests)) {
+      this.pacing.digestTextBytesSent += (digest as Uint8Array).length;
+    }
+    if (!this.audits(to)) {
+      return wire.digestBody(digests);
+    }
+    this.awaitBudgetedPull(to); // every caller sends the body at once
+    return wire.digestRecord({ digests, budget: this.trieAudit.budget });
+  }
+
+  /** Notes a budgeted text pull sent to a partner, whose answer's remainder may continue it. */
+  private awaitBudgetedPull(partner: string): void {
+    this.budgetedPulls.delete(partner);
+    this.budgetedPulls.set(partner, this.now());
+    while (this.budgetedPulls.size > 64) {
+      this.budgetedPulls.delete(this.budgetedPulls.keys().next().value!);
+    }
+  }
+
+  /**
+   * Whether a PULL_RESP from a partner answers a budgeted text pull this peer sent it, within the time a late copy is
+   * taken, and forgets the pull: an answer continues the pull it answers, once.
+   */
+  private budgetedPullAnswered(from: string): boolean {
+    const at = this.budgetedPulls.get(from);
+    if (at === undefined) {
+      return false;
+    }
+    this.budgetedPulls.delete(from);
+    return this.now() - at <= LATE_COPY_MILLIS;
+  }
+
+  /**
+   * The fields of a DIGEST beside a plain text pull, each handled on its own (annex I.6): `hashes` opens a round,
+   * `want` asks this peer, which opened the round, for full text, `tree` carries an audit, and a budgeted text pull or
+   * `ids` draw one bounded PULL_RESP. Returns true when the body is fully handled, false when its text digests are
+   * answered as a 0.6.0 member answers them. A body carrying a field of annex I.6 reaches a peer with the audit off
+   * only from a sender that read a stale card; it is dropped and counted, as a member without the hint drops it.
+   */
+  private onDigestFields(from: string, digest: Dict): boolean {
+    const carriesAudit = ["tree", "ids", "budget", "sketch"].some((field) => digest[field] !== undefined);
+    if (carriesAudit && !this.auditOn) {
+      this.trieAudit.refuse(from, null, "lacks-hint");
+      return true;
+    }
+    if (!this.auditOn) {
+      return false; // a hashed opening or a want reaches a 0.6.0 member only from a stale read, and is ignored
+    }
+    // Taken before want is answered, since an in-process transport delivers that answer before this body's tree.
+    const textRound = !this.audits(from) && this.expectedPulls.has(from);
+    if (digest["hashes"] !== undefined) {
+      this.onOpening(from, digest["hashes"] as Dict);
+    }
+    const want = digest["want"] as string[] | undefined;
+    if (want !== undefined && want.length > 0 && this.expectedPulls.has(from)) {
+      // Only the partner this peer opened a round with is answered, so a stranger cannot make it send its digests.
+      this.pacing.wantsReceived += 1;
+      const digests = this.textDigests(want);
+      if (Object.keys(digests).length > 0) {
+        this.send("DIGEST", this.textPull(from, digests), from);
+      }
+    }
+    const tree = digest["tree"] as { [stream: string]: Dict[] } | undefined;
+    if (tree !== undefined && Object.keys(tree).length > 0) {
+      const budget = digest["budget"] === undefined ? null : Number(digest["budget"]);
+      const fallback = this.trieAudit.onTree(from, tree as unknown as { [stream: string]: TreeNode[] }, budget,
+        textRound);
+      if (fallback.length > 0) {
+        // A stream this peer keeps no trie for came back as a root: pulled by the text form, as a want would.
+        const digests = this.textDigests(fallback);
+        if (Object.keys(digests).length > 0) {
+          this.expectPull(from);
+          this.send("DIGEST", this.textPull(from, digests), from);
+        }
+      }
+    }
+    // sketch is reserved (annex I.6, RE-F-01): never sent, and ignored when received.
+    if (digest["digests"] === null && digest["ids"] === undefined) {
+      return true;
+    }
+    if (digest["budget"] === undefined && digest["ids"] === undefined) {
+      return false;
+    }
+    this.answerPull(from, digest);
+    return true;
+  }
+
+  /**
+   * The opening of a hashed round, as the partner: the streams both hold whose hashes differ. A space this peer audits
+   * with the asker is compared by its trie and answered with its root, a session permitting; any other stream by its
+   * text digest and named in `want`. Both go in one body; nothing goes when nothing differs.
+   */
+  private onOpening(from: string, theirs: Dict): void {
+    this.pacing.hashedOpeningsReceived += 1;
+    const trie = this.audits(from);
+    const want: string[] = [];
+    const differs: string[] = [];
+    const equal: string[] = [];
+    for (const stream of Object.keys(theirs).sort()) {
+      const hash = theirs[stream];
+      if (!(hash instanceof Uint8Array) || !this.servesStream(stream)) {
+        continue;
+      }
+      const audited = trie && stream.startsWith("space:");
+      if (!this.sameStream(stream, audited, hash)) {
+        (audited ? differs : want).push(stream);
+      } else if (audited) {
+        equal.push(stream);
+      }
+    }
+    const roots = differs.length === 0 && equal.length === 0 ? {} : this.trieAudit.roots(from, differs, equal);
+    const rooted = Object.keys(roots).length > 0;
+    if (want.length === 0 && !rooted) {
+      return;
+    }
+    if (want.length > 0) {
+      this.pacing.wantsSent += 1;
+    }
+    this.send("DIGEST", wire.digestRecord({ want: want.length > 0 ? want : null,
+      tree: rooted ? roots as unknown as { [stream: string]: Dict[] } : null }), from);
+  }
+
+  /**
+   * The PULL_RESP a body's text digests and `ids` draw, in one answer (annex I.6). Without a budget every delta goes
+   * whole; with one the answer is cut to the smaller of the asker's budget and this peer's cap, the streams in the
+   * order a Java member registers them (the revocations before the spaces whose records they judge), each space's
+   * states in the annex's order, the first item always carried, and `remainder` counting per stream what was held and
+   * left out. A budgeted fetch is always answered, even with nothing held, so the asker learns at once to ask another.
+   */
+  private answerPull(from: string, digest: Dict): void {
+    const asked = digest["budget"] === undefined ? null : Number(digest["budget"]);
+    const cap = asked === null ? Number.POSITIVE_INFINITY : Math.min(asked, BUDGET_CEILING);
+    const texts = (digest["digests"] ?? {}) as { [stream: string]: Uint8Array };
+    const ids = (digest["ids"] ?? {}) as { [stream: string]: string[] };
+    const deltas: Dict = {};
+    const remainder: { [stream: string]: number } | null = asked === null ? null : {};
+    let used = 32;
+    const named = new Set([...Object.keys(texts), ...Object.keys(ids)]);
+    const order = [...revocation.STREAMS, "view", "ads"].filter((stream) => named.has(stream));
+    order.push(...[...named].filter((stream) => !order.includes(stream)).sort());
+    for (const stream of order) {
+      const text = texts[stream];
+      const wanted = ids[stream];
+      const space = stream.startsWith("space:") ? stream.substring("space:".length) : null;
+      const fetch = wanted !== undefined && wanted.length > 0 && space !== null && this.servesStream(stream);
+      if (!this.servesStream(stream) || (text === undefined && !fetch)) {
+        if (remainder !== null && wanted !== undefined) {
+          remainder[stream] = 0; // nothing of it held here: the asker asks the next member at once
+        }
+        continue;
+      }
+      const overhead = 2 * (utf8(stream).length + 9) + 9;
+      let delta: Uint8Array;
+      let left = 0;
+      if (space === null) {
+        delta = stream === "ads" ? this.adsDeltaFor(text!) : stream === "view" ? this.viewDeltaFor(text!)
+          : this.revocationDeltaFor(stream, text!);
+      } else {
+        const answer = this.boundedSpaceDelta(space, text ?? null, text === undefined ? wanted! : null,
+          cap - used - overhead, Object.keys(deltas).length === 0);
+        delta = answer.delta;
+        left = answer.left;
+      }
+      if (remainder !== null) {
+        remainder[stream] = left;
+        this.pacing.remainderSent += left;
+      }
+      if (delta.length > 0) {
+        deltas[stream] = delta;
+        used += delta.length + overhead;
+      }
+      if (text === undefined) {
+        this.trieAudit.fetchAnswered();
+      }
+    }
+    if (Object.keys(deltas).length === 0 && !(Object.keys(ids).length > 0 && asked !== null)) {
+      return;
+    }
+    this.pullsAnswered += 1;
+    this.pacing.pullRespSent += 1;
+    if (asked !== null) {
+      this.pacing.budgetedAnswers += 1;
+    }
+    this.send("PULL_RESP", wire.pullRespBody(deltas, remainder), from);
+  }
+
+  /**
+   * One space's answer under a budget (annex I.6, *The fetch* and *The budget*; RE-I-06): for a text digest, every
+   * state and claim it does not name; for ids, the state and claim of each named entry held. A state and its claim are
+   * one item; present states go before tombstones, and claims alone last, so a budget that splits a replacement sends
+   * the new revision first; within each group newest first by lease stamp, ties by id. The first item always goes.
+   */
+  private boundedSpaceDelta(space: string, text: Uint8Array | null, ids: string[] | null, budget: number,
+                            first: boolean): { delta: Uint8Array; left: number } {
+    const spaceId = wireSpaceId(this.group, space);
+    const remote = text === null ? null : serving.parseDigestLines(text);
+    type Offer = { id: string; state: Dict | null; claim: Dict | null; rank: number; stamp: CborValue | null };
+    const offers: Offer[] = [];
+    const consider = (id: string): void => {
+      const dto = this.states.get(id);
+      const state = dto !== undefined && (dto["record"] as Dict | undefined)?.["spaceId"] === spaceId ? dto : undefined;
+      const held = this.claims.get(id);
+      const claim = held !== undefined && (held["claim"] as Dict)["spaceId"] === spaceId ? held : undefined;
+      let sendState = state;
+      let sendClaim = claim;
+      if (remote !== null) {
+        const stateLine = state === undefined ? null : `e:${id}=${this.stateHashOf(state)}`;
+        if (stateLine !== null && (remote.has(stateLine) || remote.has(`a:${stateLine}`))) {
+          sendState = undefined;
+        }
+        const claimLine = claim === undefined ? null : `c:${id}=${serving.claimHash(claim["claim"] as Dict)}`;
+        if (claimLine !== null && (remote.has(claimLine) || remote.has(`a:${claimLine}`))) {
+          sendClaim = undefined;
+        }
+      }
+      if (sendState === undefined && sendClaim === undefined) {
+        return;
+      }
+      offers.push({ id, state: sendState === undefined ? null : this.signedStateOf(id, sendState), claim: sendClaim ?? null,
+        rank: sendState === undefined ? 2 : present(sendState) ? 0 : 1,
+        stamp: sendState !== undefined ? sendState["leaseStamp"] : (sendClaim!["claim"] as Dict)["stamp"] });
+    };
+    if (ids !== null) {
+      for (const id of ids) {
+        consider(id);
+      }
+    } else {
+      for (const id of this.idsOfSpace(spaceId)) {
+        consider(id);
+      }
+    }
+    offers.sort((a, b) => a.rank - b.rank || wire.compareHlc(b.stamp, a.stamp)
+      || compareBytes(utf8(a.id), utf8(b.id)));
+    const states: Dict[] = [];
+    const claims: Dict = {};
+    let used = 32;
+    let taken = 0;
+    for (const offer of offers) {
+      let size = offer.state === null ? 0 : dumps(offer.state).length;
+      if (offer.claim !== null) {
+        size += dumps(offer.claim).length + utf8(offer.id).length + 9;
+      }
+      if (used + size > budget && !(first && taken === 0)) {
+        break;
+      }
+      used += size;
+      taken += 1;
+      if (offer.state !== null) {
+        states.push(offer.state);
+      }
+      if (offer.claim !== null) {
+        claims[offer.id] = offer.claim;
+      }
+    }
+    const left = offers.length - taken;
+    if (taken === 0) {
+      return { delta: new Uint8Array(), left };
+    }
+    return { delta: dumps({ states, claims: canonicalMap(claims) }), left };
+  }
+
+  /** The stream of a fetch a PULL_RESP answers, if any; the partner's round is answered either way. */
+  private pullRespArrived(from: string, resp: Dict): string | null {
+    const named = new Set([...Object.keys((resp["deltas"] ?? {}) as Dict), ...Object.keys((resp["remainder"] ?? {}) as Dict)]);
+    const fetchStream = this.auditOn ? this.trieAudit.fetchAnswer(from, named) : null;
+    this.expectedPulls.delete(from);
+    for (const left of Object.values((resp["remainder"] ?? {}) as Dict)) {
+      this.pacing.remainderReceived += Number(left);
+    }
+    return fetchStream;
+  }
+
+  /**
+   * After a PULL_RESP folded: a fetch's answer settles the body it answers, by what it carried, and asks again for
+   * what it left out; a budgeted text pull that came back with a remainder continues at once.
+   */
+  private pullRespSettled(from: string, resp: Dict, fetchStream: string | null, received: Set<string>,
+                          awaited: boolean): void {
+    if (fetchStream !== null) {
+      const batch = this.trieAudit.settle(from, fetchStream, received);
+      if (batch !== null) {
+        const left = ((resp["remainder"] ?? {}) as Dict)[fetchStream];
+        this.trieAudit.fetched(from, batch, received, left === undefined ? 0 : Number(left));
+      }
+    } else if (resp["remainder"] !== undefined) {
+      if (!awaited) {
+        // A remainder answers a budgeted pull, and this peer sent none to the member: without this check any member
+        // could send a few bytes naming a remainder and draw this peer's full text digests, up to 64 times per round
+        // (adversarial review of 2026-11-15). Java drops an unsolicited PULL_RESP whole (ASF-003).
+        this.pacing.remainderUnsolicited += 1;
+        return;
+      }
+      this.continuePull(from, resp["remainder"] as Dict);
+    }
+  }
+
+  /**
+   * A budgeted text pull came back with a remainder: continue it now rather than a round later (RE-Q-PRF-03), with
+   * this peer's own text digest under the same budget, which now names what the answer brought; a space this peer
+   * audits with the partner continues by an audit instead, whose fetch is bounded per body. At most
+   * {@link PULL_CONTINUATIONS_MAX} per partner per round; the next round carries on.
+   */
+  private continuePull(from: string, remainder: Dict): void {
+    const text: string[] = [];
+    let reopen = false;
+    for (const [stream, left] of Object.entries(remainder)) {
+      if (!this.servesStream(stream) || Number(left) <= 0) {
+        continue;
+      }
+      if (this.audits(from) && stream.startsWith("space:")) {
+        reopen = true;
+      } else {
+        text.push(stream);
+      }
+    }
+    if (text.length === 0 && !reopen) {
+      return;
+    }
+    const sofar = (this.continuations.get(from) ?? 0) + 1;
+    this.continuations.set(from, sofar);
+    if (sofar > PULL_CONTINUATIONS_MAX) {
+      return;
+    }
+    this.pacing.pullContinued += 1;
+    if (text.length > 0) {
+      this.expectPull(from);
+      this.send("DIGEST", this.textPull(from, this.textDigests(text)), from);
+    }
+    if (reopen) {
+      this.digestTo(from); // an audit opening, which resets the count, so it is kept
+      this.continuations.set(from, sofar);
+    }
+  }
+
+  // ---- probes (SPEC §5.2)
+
+  /** The hashes a probe's answer carries toward a member of one kind: one per stream, or their root past the bound. */
+  private probeDigests(trie: boolean): { root: Uint8Array | null; hashes: Dict | null } {
+    const streams = this.heldStreams();
+    if (streams.length > PROBE_HASH_STREAMS) {
+      return { root: this.rootDigest(trie), hashes: null };
+    }
+    const hashes: Dict = {};
+    for (const stream of streams) {
+      hashes[stream] = this.streamHashOf(stream, trie);
+    }
+    return { root: null, hashes };
+  }
+
+  /** SHA-256 over each stream id in Java's String order, a zero byte, its hash, and a zero byte (annex I.6). */
+  private rootDigest(trie: boolean): Uint8Array {
+    const parts: Uint8Array[] = [];
+    for (const stream of this.heldStreams().sort()) {
+      parts.push(utf8(stream), new Uint8Array(1), this.streamHashOf(stream, trie), new Uint8Array(1));
+    }
+    let size = 0;
+    for (const part of parts) {
+      size += part.length;
+    }
+    const all = new Uint8Array(size);
+    let at = 0;
+    for (const part of parts) {
+      all.set(part, at);
+      at += part.length;
+    }
+    return cryptoPort().sha256(all);
+  }
+
+  /**
+   * A probe that carried hashes or a root (SPEC §5.2): answered with hashes of the kind the pinger reads, and when they
+   * differ from this peer's on a stream both hold, a targeted round with the pinger, at most once per round per member,
+   * so a persistent difference costs one round per period and no more. An absent value is no information.
+   */
+  private onProbeHashes(from: string, ping: Dict): void {
+    const trie = this.audits(from);
+    const hashes = ping["hashes"] as Dict | undefined;
+    let mismatch = false;
+    if (hashes !== undefined) {
+      for (const [stream, hash] of Object.entries(hashes)) {
+        if (hash instanceof Uint8Array && this.servesStream(stream) && !this.sameStream(stream, trie, hash)) {
+          mismatch = true;
+          break;
+        }
+      }
+    } else if (ping["root"] instanceof Uint8Array) {
+      const root = ping["root"];
+      mismatch = !equals(this.rootDigest(trie), root) && !equals(this.rootDigest(!trie), root);
+    }
+    const probe = this.probeDigests(trie);
+    this.send("ACK", wire.probeBody("ACK", ping["nonce"] as number | bigint, probe.root, probe.hashes), from);
+    const now = this.now();
+    // As Java's node, a probe opens a round only while this peer's own rounds have backed off: a peer that reconciles
+    // at its usual pace repairs the difference there, and a probe's round would only double it (SPEC §5.2).
+    if (this.quietSince === null) {
+      this.quietSince = now;
+    }
+    if (!mismatch || now - this.quietSince < PROBE_QUIET_ROUNDS * this.roundMillis()) {
+      return;
+    }
+    const last = this.probePulls.get(from);
+    if (last !== undefined && now - last < this.roundMillis()) {
+      return;
+    }
+    this.probePulls.set(from, now);
+    this.pacing.probeRounds += 1;
+    this.digestTo(from);
+  }
+
+  // ---- the audited sets
+
+  private stateHashOf(dto: Dict): string {
+    let hash = this.stateHashes.get(dto);
+    if (hash === undefined) {
+      hash = serving.stateHash(dto);
+      this.stateHashes.set(dto, hash);
+    }
+    return hash;
+  }
+
+  /** What one entry id holds now: its state and claim lines unless its lease lapsed, and its acknowledged lines. */
+  private holdingOf(id: string, now: number): Holding {
+    const state = this.states.get(id);
+    const signed = this.claims.get(id);
+    const claim = signed?.["claim"] as Dict | undefined;
+    const acks = this.ackIndex.get(id);
+    let spaceId: string | null = null;
+    const recordSpace = (state?.["record"] as Dict | undefined)?.["spaceId"];
+    if (typeof recordSpace === "string") {
+      spaceId = recordSpace;
+    } else if (typeof claim?.["spaceId"] === "string") {
+      spaceId = claim["spaceId"] as string;
+    } else if (acks !== undefined && acks.size > 0) {
+      spaceId = this.refusedAck.get(acks.values().next().value!) ?? null;
+    }
+    const live = state !== undefined && present(state);
+    const expiry = state === undefined ? 0 : leaseExpiryOf(state);
+    const lapsed = live && expiry <= now;
+    return {
+      spaceId,
+      state: state === undefined ? null : this.stateHashOf(state),
+      claim: claim === undefined ? null : serving.claimHash(claim),
+      lapsed,
+      acks: acks ?? [],
+      liveUntil: live && !lapsed ? expiry : null,
+    };
+  }
+
+  /** Every id with a state, a claim or an acknowledged line in a space. */
+  private idsOfSpace(spaceId: string): Set<string> {
+    const ids = new Set<string>();
+    for (const [id, dto] of this.states) {
+      if ((dto["record"] as Dict | undefined)?.["spaceId"] === spaceId) {
+        ids.add(id);
+      }
+    }
+    for (const [id, signed] of this.claims) {
+      if ((signed["claim"] as Dict | undefined)?.["spaceId"] === spaceId) {
+        ids.add(id);
+      }
+    }
+    for (const [line, lineSpace] of this.refusedAck) {
+      const id = entryIdOf(line);
+      if (lineSpace === spaceId && id !== null) {
+        ids.add(id);
+      }
+    }
+    return ids;
+  }
+
+  // ---- acknowledgements (annex I.6, *The audited set*; SPEC §7.3, RE-H-03)
+
+  private ackChanged(line: string, before: string | undefined, after: string | undefined): void {
+    const id = entryIdOf(line);
+    if (before !== undefined) {
+      this.ackCounts.set(before, (this.ackCounts.get(before) ?? 1) - 1);
+      if (id !== null) {
+        const lines = this.ackIndex.get(id);
+        lines?.delete(line);
+        if (lines?.size === 0) {
+          this.ackIndex.delete(id);
+        }
+      }
+    }
+    if (after !== undefined) {
+      this.ackCounts.set(after, (this.ackCounts.get(after) ?? 0) + 1);
+      if (id !== null) {
+        let lines = this.ackIndex.get(id);
+        if (lines === undefined) {
+          lines = new Set();
+          this.ackIndex.set(id, lines);
+        }
+        lines.add(line);
+      }
+    } else {
+      this.ackForgetAt.delete(line);
+    }
+    if (id !== null) {
+      this.audited.touched(id);
+    }
+  }
+
+  /**
+   * Acknowledges a re-offered state the door refused as past its collection horizon, when this replica holds no state
+   * of the entry: without it a member that keeps tombstones longer offers the state every round until it collects it
+   * too. The line shares R7's bound and is forgotten five minutes after the last refusal, so it cannot keep this
+   * replica's digest apart once the offerer collects; a member still holding the state earns it again. Only a state
+   * whose signatures verified reaches here.
+   */
+  private acknowledgeCollected(dto: Dict, record: Dict): void {
+    const entryId = String(record["entryId"]);
+    if (this.states.has(entryId)) {
+      return; // still held: its own sweep collects it
+    }
+    const line = `e:${entryId}=${this.stateHashOf(dto)}`;
+    const added = !this.refusedAck.has(line);
+    this.acknowledgeLine(line, String(record["spaceId"]));
+    this.ackForgetAt.set(line, this.now() + COLLECTED_ACK_HOLD_MILLIS);
+    if (added) {
+      this.collectedReoffersAcknowledged += 1;
+    }
+  }
+
+  /** Schedules an acknowledgement to be forgotten at `at`, and never sooner than the hold from now. */
+  private forgetRefusedAfter(line: string, at: number): void {
+    if (this.refusedAck.has(line)) {
+      this.ackForgetAt.set(line, Math.max(at, this.now() + COLLECTED_ACK_HOLD_MILLIS));
+    }
+  }
+
+  private forgetAcknowledgements(now: number): void {
+    for (const [line, at] of [...this.ackForgetAt]) {
+      if (at <= now) {
+        this.refusedAck.delete(line);
+      }
+    }
+  }
+
+  // ---- the per-entry horizon (SPEC §7.3, RE-H-04)
+
+  /** One round of the group: the verified founding's gossip period when this peer joined by one, else the setting. */
+  private roundMillis(): number {
+    const period = ((this.founding?.["advertisement"] as Dict | undefined)?.["gossip"] as Dict | undefined)?.["period"];
+    if (typeof period === "string") {
+      try {
+        return Math.max(1, parseDurationMillis(period));
+      } catch {
+        // an unreadable period: the setting stands
+      }
+    }
+    return this.gossipPeriodMillis;
+  }
+
+  /** Whether this peer advertises the horizon hint and every member of its view does too. */
+  private viewHinted(now: number): boolean {
+    if (this.hinted.at === now) {
+      return this.hinted.value;
+    }
+    let value = this.horizonOn;
+    if (value) {
+      for (const member of this.members.keys()) {
+        if (!this.horizonPeers.has(member)) {
+          value = false; // a member whose card this peer has not received counts as lacking the hint
+          break;
+        }
+      }
+    }
+    this.hinted = { at: now, value };
+    return value;
+  }
+
+  /** The rule the view allows in a space now, moving its mode (the view's half). */
+  private horizonRule(spaceId: string, now: number, maxLeaseMillis: number): horizon.Rule {
+    let mode = this.horizonModes.get(spaceId);
+    if (mode === undefined) {
+      mode = new horizon.HorizonMode();
+      this.horizonModes.set(spaceId, mode);
+    }
+    return mode.judge(now, this.viewHinted(now), this.roundMillis(), maxLeaseMillis);
+  }
+
+  /** Judges the mode of every space this peer joined, once per sweep, so the hysteresis counts rounds as they pass. */
+  private judgeHorizons(now: number): void {
+    for (const space of this.joinedSpaces) {
+      const spaceId = wireSpaceId(this.group, space);
+      this.horizonRule(spaceId, now, this.longestLease.get(spaceId) ?? 0);
+    }
+  }
+
+  /**
+   * The writer's half: this replica vouches for a withdrawal only when every node that wrote it (each add dot's
+   * replica) is this one, or a member of the view whose current card carries the hint and whose stay has lasted one
+   * maximum lease plus the grace, so whatever it renewed out of sight before has lapsed and passed its lapse horizon.
+   */
+  private vouchesFor(dto: Dict, now: number, maxLeaseMillis: number): boolean {
+    const adds = (dto["adds"] as Dict[] | undefined) ?? [];
+    if (adds.length === 0) {
+      return false;
+    }
+    const settle = Math.max(0, maxLeaseMillis) + horizon.LAPSED_GRACE_MILLIS;
+    for (const dot of adds) {
+      const writer = String(dot["replica"] ?? "");
+      if (writer === this.identity.peerId) {
+        continue;
+      }
+      const since = this.hintedSince.get(writer);
+      if (since === undefined || !this.members.has(writer) || since + settle > now) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Whether this replica collects a state now: by its kind's horizon under the rule the view allows, except that a
+   * withdrawal this replica cannot vouch for keeps the later of the legacy horizon and the per-entry one, so a writer
+   * leaving the view never brings a horizon closer. The sweep and the door both read this.
+   */
+  private collectableHere(dto: Dict, now: number): boolean {
+    const kind = horizonKindOf(dto);
+    const expiry = leaseExpiryOf(dto);
+    const maxLease = this.longestLeaseOf(dto);
+    if (kind !== "withdrawn") {
+      return horizon.collectableAt(kind, expiry, now, maxLease, "legacy"); // the same under both rules
+    }
+    const spaceId = String((dto["record"] as Dict | undefined)?.["spaceId"]);
+    const mode = this.horizonRule(spaceId, now, maxLease);
+    const rule = mode === "per-entry" && !this.vouchesFor(dto, now, maxLease) ? "legacy" : mode;
+    const byRule = horizon.collectableAt(kind, expiry, now, maxLease, rule);
+    if (mode === "per-entry" && rule === "legacy") {
+      return byRule && horizon.collectableAt(kind, expiry, now, maxLease, "per-entry");
+    }
+    return byRule;
+  }
+
+  // ---- the signed copy of a joined state
+
+  /** States this replica joined from two signed inputs, neither of which equals the join. */
+  private readonly joinedStates = new WeakSet<Dict>();
+  /** For such a join, the most advanced signed input, which anti-entropy forwards verbatim as Java's signedStates. */
+  private readonly signedStates = new Map<string, Dict>();
+
+  /**
+   * Stores the join of a held state and an incoming one (ASF-017). A join equal to one input is stored as that input,
+   * whose signature covers it; one equal to neither (a renewal and a completion that crossed) is stored for this
+   * replica's judgements and digest, and the most advanced signed input is kept beside it to be forwarded, since the
+   * join's own fields carry no signature anyone made. Before this, the join kept the held state's signature over the
+   * incoming state's removes, and every member it was forwarded to refused it.
+   */
+  private storeJoined(entryId: string, previous: Dict | undefined, dto: Dict): void {
+    if (previous === undefined) {
+      this.states.set(entryId, dto);
+      return;
+    }
+    const merged = joinStates(previous, dto);
+    if (sameStateContent(merged, dto)) {
+      this.states.set(entryId, dto);
+      return;
+    }
+    if (sameStateContent(merged, previous)) {
+      return; // nothing new: the held state already covers the incoming one
+    }
+    const held = this.signedStateOf(entryId, previous);
+    this.joinedStates.add(merged);
+    this.states.set(entryId, merged);
+    this.signedStates.set(entryId, advancesState(dto, held) ? dto : held);
+  }
+
+  /** The signed state to forward for an entry: the held state itself, or a join's most advanced signed input. */
+  private signedStateOf(entryId: string, dto: Dict): Dict {
+    return this.joinedStates.has(dto) ? (this.signedStates.get(entryId) ?? dto) : dto;
   }
 }
 
@@ -3381,14 +4661,24 @@ export function present(dto: Dict): boolean {
  * (at most twice the longest lease) for a lapse, or twice the longest lease ago for a completion or a
  * withdrawal.
  */
-export function collectable(dto: Dict, nowMillis: number, longestLeaseMillis: number): boolean {
-  const expiry = leaseExpiryOf(dto);
-  const live = present(dto);
-  if (live && expiry > nowMillis) {
-    return false;
+export function collectable(dto: Dict, nowMillis: number, longestLeaseMillis: number,
+                            rule: horizon.Rule = "legacy"): boolean {
+  // SPEC §7.3 (v0.1.35): a withdrawn entry keeps the drift floor under either rule (decision 22), and under the
+  // per-entry rule of wire.horizon=1 its own five minutes past its expiry rather than two maximum leases.
+  return horizon.collectableAt(horizonKindOf(dto), leaseExpiryOf(dto), nowMillis, longestLeaseMillis, rule);
+}
+
+/**
+ * What an entry is for its horizon (SPEC §7.3): present (live or lapsed), completed, withdrawn, or both withdrawn and
+ * completed, which keeps the drift floor as a withdrawal does.
+ */
+export function horizonKindOf(dto: Dict): horizon.HorizonKind {
+  if (dto["completed"]) {
+    const adds = (dto["adds"] as Dict[] | undefined) ?? [];
+    const removed = new Set(((dto["removes"] as Dict[] | undefined) ?? []).map(dotKey));
+    return adds.every((dot) => removed.has(dotKey(dot))) ? "withdrawn_completed" : "completed";
   }
-  const twice = 2 * Math.max(0, longestLeaseMillis);
-  return expiry + (live ? Math.min(twice, LAPSED_GRACE_MILLIS) : twice) <= nowMillis;
+  return present(dto) ? "present" : "withdrawn";
 }
 
 /**
@@ -3419,6 +4709,29 @@ export function joinStates(previous: Dict, incoming: Dict): Dict {
   }
   merged["completed"] = Boolean(previous["completed"]) || Boolean(incoming["completed"]);
   return merged;
+}
+
+/** Whether two states carry the same CRDT fields: dot sets, lease register, and completion. */
+function sameStateContent(a: Dict, b: Dict): boolean {
+  const dots = (x: unknown): string => (Array.isArray(x) ? x.map(dotKey).sort().join("|") : "");
+  return dots(a["adds"]) === dots(b["adds"]) && dots(a["removes"]) === dots(b["removes"])
+    && String(a["leaseStamp"]) === String(b["leaseStamp"]) && Boolean(a["completed"]) === Boolean(b["completed"]);
+}
+
+/** Java's ReplicatedSpace.advances: completion dominates, then more removes, a newer lease stamp, more adds. */
+function advancesState(a: Dict, b: Dict): boolean {
+  if (Boolean(a["completed"]) !== Boolean(b["completed"])) {
+    return Boolean(a["completed"]);
+  }
+  const removes = (x: Dict): number => ((x["removes"] as unknown[] | undefined) ?? []).length;
+  if (removes(a) !== removes(b)) {
+    return removes(a) > removes(b);
+  }
+  const stamp = wire.compareHlc(a["leaseStamp"], b["leaseStamp"]);
+  if (stamp !== 0) {
+    return stamp > 0;
+  }
+  return ((a["adds"] as unknown[] | undefined) ?? []).length >= ((b["adds"] as unknown[] | undefined) ?? []).length;
 }
 
 /** The union of two dot lists, deduplicated by (replica, counter) and

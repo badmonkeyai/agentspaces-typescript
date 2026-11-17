@@ -71,7 +71,7 @@ export { ContentKeys, TreeExchange, TreeFetch, TreeServer } from "./tree.js";
 export type { ChallengeResult, TreeExchangeOptions, TreeProgress } from "./tree.js";
 export { DbReader, compareValues } from "./db.js";
 export type { Entity, Properties } from "./db.js";
-export { Ref, Refs, PREF_TYPE, INLINE_DELTA_BYTES, MAX_SEQ, VERSION_2, KIND_DB, pref, prefTags, prefViolation, decodePRef, headsAmong,
+export { Ref, Refs, PREF_TYPE, INLINE_DELTA_BYTES, MAX_SEQ, VERSION_2, KIND_DB, pref, prefTags, prefViolation, decodePRef, headsAmong, supersededBy,
   mergeOrder, collectDelta, acceptInline, kindNamed, ANCESTRY_ATTR, ancestryCid, readAncestry } from "./refs.js";
 export type { Head, PConflict, MergeFunction, RefKind, RefKindName, RefOptions, RefsConfig, PRefFields } from "./refs.js";
 export type { PushConfig } from "./push.js";

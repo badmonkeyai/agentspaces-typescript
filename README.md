@@ -107,7 +107,7 @@ Either instance can take the order, because both run the same agent.
 
 **5. Kill one.** Make `ship` `async` with a `Promise<Shipment>` result, and add `console.log("shipping", order.orderId);` and `await new Promise((resolve) => setTimeout(resolve, 10_000));` at the top. Start both instances, write an order from the second, and run `kill -9` on whichever instance prints `shipping`. If you killed the first instance, the second prints the shipment. If you killed the second, the first prints `shipping o-1` again when the 30 second lease lapses.
 
-The [documents](docs/README.md) add the rest: the three tested walk-throughs under "How to use AI with AgentSpaces", the cross-language guarantee, joining by GroupID, bootstrap and invite keys, and layers 3 and 4 in TypeScript.
+The [documents](docs/README.md) add the rest: the three tested walk-throughs under "How to use AI with AgentSpaces", the cross-language guarantee, joining by GroupID, bootstrap and invite keys, layers 3 and 4 in TypeScript, and [replication by entry](docs/replication-by-entry.md): repair by entry under a byte budget, renewals that never shorten a lease, and the per-entry horizon, with the host settings.
 
 ## What it is
 

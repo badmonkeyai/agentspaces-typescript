@@ -245,9 +245,11 @@ for (const engine of ["chromium", "firefox", "webkit"] as const) {
 
       await t.test("the pause rule: leases stop being renewed, the channel closes, nothing outlives its lease (JS-R-03)", async () => {
         const jobId = hub.peer.writeEntry(SPACE, TASK, { topic: "job", priority: 5 }, "hub");
-        const taken = await call(tabA, "take", "a", SPACE, "job", 1000, 15_000, true);
-        assert.equal(taken, jobId, "tab A holds the hub's job under a 1 s lease");
-        await sleep(1600);
+        // The host judges a take about 900 ms after its claim (600 ms window, up to 300 ms follow-up), so a
+        // 1 s lease left only about 100 ms of hold at judgement; 1.5 s leaves a real margin for a busy browser.
+        const taken = await call(tabA, "take", "a", SPACE, "job", 1500, 15_000, true);
+        assert.equal(taken, jobId, "tab A holds the hub's job under a 1.5 s lease");
+        await sleep(1600); // longer than the lease: only the tick's renewals at half-lease keep the hold
         assert.equal(await hub.peer.takeEntry(SPACE, TASK, "hub", 60_000, 300, 700, null, jobId), null,
           `while the host runs, the tick renews the claim past its lease: the hub cannot take it\n${(await call(tabA, "hostLog", "a")).join("\n")}`);
         const renewed = await call(tabA, "renew", jobId);
@@ -263,7 +265,7 @@ for (const engine of ["chromium", "firefox", "webkit"] as const) {
         assert.equal(paused.activePages, 0);
         const refused = await call(tabA, "renew", jobId);
         assert.ok(!refused.ok && /paused/.test(refused.error), `renewal is refused while paused: ${JSON.stringify(refused)}`);
-        await sleep(1600); // the claim's lease lapses while the host is paused
+        await sleep(1600); // the claim, renewed for at most 1.5 s before the pause, lapses while the host is paused
         assert.equal(await hub.peer.takeEntry(SPACE, TASK, "hub", 60_000, 300, 1500, null, jobId), jobId,
           "the claim lapsed on time: the hub takes the job");
         // A page returns: the same identity resumes.

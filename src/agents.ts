@@ -148,6 +148,8 @@ function mark(binding: Binding): MethodDecorator {
 
 const DATA_USE = Symbol.for("agentspaces.dataUse");
 export const CATALOG_SPACE = "catalog";
+/** How many held proposals a vote binding reads when it binds: far past any vote space in practice, and a bound on a bind's work. */
+const BIND_SWEEP_LIMIT = 10_000;
 
 /**
  * One declared source and the record type its entry is written as (neutral vectors, 2026-11-09): `type` is the wire
@@ -481,16 +483,25 @@ export class Binder {
       return;
     }
     const ttl = durationMillis(this.cardTtl);
+    const written: { type: string; payload: Dict }[] = [];
     for (const use of declared) {
       const payload: Dict = { schemaVersion: 1, agent: name, peer: this.peer.identity.peerId, reads: use.reads ?? [],
         writes: use.writes ?? [], source: use.source, sensitivity: use.sensitivity ?? "", freshness: use.freshness ?? "",
         declaredBy: "decorator" };
       bound.dataUse.push(this.peer.writeEntry(CATALOG_SPACE, use.type, payload, this.agentName, ttl, this.agent));
+      written.push({ type: use.type, payload });
     }
     const renewal = this.peer.every(Math.max(250, Math.floor(ttl / 2)), () => {
-      for (const id of bound.dataUse) {
-        this.peer.renewEntry(CATALOG_SPACE, id, ttl, this.agent);
-      }
+      bound.dataUse.forEach((id, i) => {
+        try {
+          this.peer.renewEntry(CATALOG_SPACE, id, ttl, this.agent);
+        } catch {
+          // A declaration whose lease lapsed (a host that slept past it) can no longer be renewed (SPEC §7.2,
+          // v0.1.35), so it is written afresh rather than left to vanish from the catalog.
+          const { type, payload } = written[i]!;
+          bound.dataUse[i] = this.peer.writeEntry(CATALOG_SPACE, type, payload, this.agentName, ttl, this.agent);
+        }
+      });
     });
     bound.subscriptions.push({ close: () => renewal.stop() });
   }
@@ -785,8 +796,7 @@ export class Binder {
     const prefix = String(binding.prefix ?? "");
     const castFor = new Set<string>();
     const leaseMillis = durationMillis((binding.lease as number | string) ?? "1h");
-    bound.subscriptions.push(space.watch(new Template<Dict>(votes.PROPOSAL_TYPE), (event) => {
-      const proposal = event.entry.value;
+    const consider = (proposal: Dict) => {
       const pid = proposal["proposalId"];
       if (typeof pid !== "string" || !pid.startsWith(prefix) || castFor.has(pid)) {
         return;
@@ -805,7 +815,16 @@ export class Binder {
           votes.cast(this.peer, space.name, pid, String(option), leaseMillis, this.agent, this.agentName);
         }
       });
-    }));
+    };
+    bound.subscriptions.push(space.watch(new Template<Dict>(votes.PROPOSAL_TYPE), (event) => consider(event.entry.value)));
+    // A proposal that folded before this binding existed raises no WRITTEN for it, so a member that
+    // binds after it joins would owe a ballot it never casts. Until now a pull that offered no entry
+    // lines folded every state again and so rescued it; a pull with the replica's own digest does not.
+    // The binding therefore reads the open proposals it already holds, as the Python and Ruby
+    // binders do (R2, 2026-11-16). The watch is registered first, and castFor keeps it to one cast.
+    for (const held of space.entries(new Template<Dict>(votes.PROPOSAL_TYPE), BIND_SWEEP_LIMIT)) {
+      consider(held.value);
+    }
   }
 
   private startDecision(bound: Bound, instance: object, method: Method, binding: Binding): void {
@@ -832,6 +851,11 @@ export class Binder {
     const onEvent = (event: SpaceEvent<Dict>) => check(String(event.entry.value["proposalId"] ?? ""));
     bound.subscriptions.push(space.watch(new Template<Dict>(votes.BALLOT_TYPE), onEvent));
     bound.subscriptions.push(space.watch(new Template<Dict>(votes.PROPOSAL_TYPE), onEvent));
+    // A quorum that closed on ballots folded before this binding existed raises no event here again
+    // (see startBallot): judge the proposals already held once at bind time.
+    for (const held of space.entries(new Template<Dict>(votes.PROPOSAL_TYPE), BIND_SWEEP_LIMIT)) {
+      check(String(held.value["proposalId"] ?? ""));
+    }
   }
 
   private startPropose(bound: Bound, instance: object, method: Method, binding: Binding): void {

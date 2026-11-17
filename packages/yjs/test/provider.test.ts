@@ -136,7 +136,13 @@ test("a late joiner syncs the document through the hub and sees the others' awar
     c.close();
     await until(() => names(hub).length === 2 && names(b).length === 2, "C's state retired");
     assert.deepEqual(names(b), ["b", "hub"]);
-    assert.deepEqual(hub.provider.members().sort(), [b.peer.identity.peerId]);
+    // C's clean disconnect broadcasts the removal of its own state, which can retire it everywhere before
+    // the hub's next sweep (every sweepMillis, as the README says) sees C gone from its reachable set. The
+    // members are what the sweep last saw, so wait for that sweep rather than read them at once
+    // (2026-11-15: 12 of 60 loaded runs read C still there).
+    const onlyB = [b.peer.identity.peerId];
+    await until(() => JSON.stringify(hub.provider.members().sort()) === JSON.stringify(onlyB), "the hub's sweep forgot C");
+    assert.deepEqual(hub.provider.members().sort(), onlyB);
   } finally {
     stop();
   }

@@ -134,6 +134,46 @@ test("three voters over real peers elect, advertise, and commit a dial-only clie
   }
 });
 
+test("a claim the log commits after the taker's timeout still hands the entry to the taker, as Java's does", async () => {
+  // The client capped its wait on a submitted claim at its own deadline (open since 0.6.0), so a claim the log
+  // committed later named the client while the take had returned null: the entry stayed held by nobody for the whole
+  // lease. Java waits out the attempt window (OrderedTakesClusterTest
+  // aClaimTheLogCommitsAfterTheTakersTimeoutStillHandsTheEntryToTheTaker), and so does this client now.
+  const { voters, tick, connectClient, stop } = await council();
+  try {
+    const leader = await untilLeader(voters, tick);
+    // A client linked to the leader itself submits there, so no away follower can be the one that forwards it.
+    const client = await connectClient(voters.indexOf(leader));
+    await tick(3);
+    client.pullAds();
+    await settle();
+    const log = new OrderedLog(new Pipes(client));
+    assert.equal(log.submitTarget(), leader.peer.identity.peerId);
+    const entryId = voters[1].peer.writeEntry("jobs", TASK, { job: "late" }, "writer");
+    await tick(2);
+    assert.ok(client.states.has(entryId));
+    // With both followers away the leader appends the claim but cannot commit it inside the taker's 100 ms.
+    const followers = voters.filter((v) => v !== leader);
+    followers.forEach((v) => v.host.suspend());
+    const started = Date.now();
+    const taking = log.take("jobs", TASK, "clerk", 60_000, 100);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    followers.forEach((v) => v.host.resume());
+    let ticking = true;
+    const pump = (async () => { while (ticking) { await tick(); } })();
+    const taken = await taking;
+    const took = Date.now() - started;
+    ticking = false;
+    await pump;
+    assert.equal(taken, entryId, `the taker holds the entry its committed claim names (returned after ${took} ms)`);
+    assert.ok(took >= 400 && took < 3_000 + 1_000, `returned within the attempt window (${took} ms)`);
+    const claim = client.claims.get(entryId)?.["claim"] as wire.Dict;
+    assert.equal(String(claim["holder"]), `${client.identity.peerId}/clerk`);
+  } finally {
+    stop();
+  }
+});
+
 test("the leader's loss mid-fleet: the survivors elect and the next take commits (JS-V-11 in one language)", async () => {
   const { voters, tick, connectClient, stop } = await council();
   try {

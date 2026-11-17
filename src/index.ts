@@ -26,6 +26,8 @@ export { bytes };
 // spiral 6 (ISSUE-A2uiAppComponents FR-11, FR-12): the open A2UI records and component builders
 import * as a2ui from "./a2ui.js";
 export { a2ui };
+import * as geo from "./geo.js";
+export { geo };
 export { CryptoPort, cryptoPort, installCrypto, nobleCrypto } from "./crypto.js";
 export * from "./platform.js";
 export * from "./transport.js";
@@ -50,6 +52,17 @@ export { records };
 export { AD_CACHE_MAX_BYTES, AD_CACHE_MAX_ENTRIES, APPCARD_HINT, APPCARD_LEVEL, BootstrapTimeoutError, Peer,
   SpillRefusedError, appCardLevelOf } from "./peer.js";
 export type { InviteJoined, SpillStore } from "./peer.js";
+// Replication by entry (SPEC annex I.6, §5.2, §7.2, §7.3, v0.1.35): the hints, the settings a host reads, the trie, the
+// audit, and the horizon rules.
+export { AE_HINT, AE_LEVEL, COLLECTED_ACK_HOLD_MILLIS, HASHES_HINT, HORIZON_HINT, HORIZON_LEVEL, PROBE_HASH_STREAMS,
+  collectable, horizonKindOf } from "./peer.js";
+export type { Form, ReplicationOptions } from "./peer.js";
+import * as trie from "./trie.js";
+export { trie };
+import * as audit from "./audit.js";
+export { audit };
+import * as horizon from "./horizon.js";
+export { horizon };
 import * as social from "./social.js";
 export { social };
 import * as beacon from "./beacon.js";

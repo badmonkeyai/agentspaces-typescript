@@ -65,7 +65,10 @@ import {
   verifyAgentCertificateAt,
   verifySignedGroupAd,
 } from "../src/identity.js";
-import { Peer, RECORDLESS_HINT, joinStates, nameRecordless } from "../src/peer.js";
+import { Peer, RECORDLESS_HINT, collectable, joinStates, leaseExpiryOf, nameRecordless } from "../src/peer.js";
+import * as horizon from "../src/horizon.js";
+import * as records from "../src/records.js";
+import { HashTrie, slotLines } from "../src/trie.js";
 import * as vote from "../src/vote.js";
 import * as revocation from "../src/revocation.js";
 import * as wire from "../src/wire.js";
@@ -574,7 +577,10 @@ test("every golden vector decodes", () => {
     // The pdt node vectors (pdt_sealed_node among them) carry no _cbor suffix: they are
     // NodeCodec nodes (definite-length DAG-CBOR, srad/agentspaces-pdt.md §3.1), not the
     // Jackson wire form this encoder reproduces; the pdt vector tests pin them.
-    if ((name.endsWith("_cbor") || name.endsWith("_delta")) && name !== "adv_deep_nesting_cbor") {
+    // The annex I.6 refusal bodies (v0.1.35, adv_*_body) are well-formed CBOR that break a
+    // record's form rule, so they round-trip like the rest.
+    if ((name.endsWith("_cbor") || name.endsWith("_delta") || name.endsWith("_body"))
+        && name !== "adv_deep_nesting_cbor") {
       const raw = Buffer.from(value, "hex");
       const decoded = loads(raw);
       assert.notEqual(decoded, undefined);
@@ -1062,4 +1068,164 @@ test("a record under a renewed certificate matches Java and is judged at signing
   const behind = peerAt(GOLDEN["certificate_verify_at"]); // the stamp leads it beyond the drift ceiling
   foldState(behind, "delta_renewed_certificate_cbor");
   assert.equal(behind.states.size, 0);
+});
+
+// ---------------------------------------------------------------------------
+// The annex I.6 vectors (SPEC v0.1.35, I.8). This client reads wire.ae=2 since phase 6 (RE-L-01),
+// so each refusal vector is refused for the one form rule it breaks, as Java's Bodies constructors
+// refuse it, and a peer counts the frame as malformed; the accept carriers decode and re-encode to
+// their bytes.
+
+const ANNEX_I6_DIGEST_REFUSALS = [
+  "adv_digest_tree_path_nibble_body", "adv_digest_tree_path_long_body",
+  "adv_digest_tree_nodes_length_body", "adv_digest_tree_nodes_few_body",
+  "adv_digest_tree_two_forms_body", "adv_digest_tree_no_form_body",
+  "adv_digest_tree_lines_order_body", "adv_digest_tree_lines_empty_line_body",
+  "adv_digest_ids_twice_body", "adv_digest_budget_zero_body",
+];
+
+test("every annex I.6 refusal vector is judged here", () => {
+  const names = Object.keys(GOLDEN).filter((k) => k.startsWith("adv_digest_") || k.startsWith("adv_pull_resp_"));
+  assert.deepEqual(names.sort(), [...ANNEX_I6_DIGEST_REFUSALS, "adv_pull_resp_remainder_negative_body"].sort());
+});
+
+test("every annex I.6 refusal vector is undecodable and a peer counts its frame malformed", () => {
+  const peer = new Peer(identity(), GOLDEN["group_id"]);
+  const handle = (kind: string, body: Uint8Array) => (peer as unknown as { handle(env: Dict): void })
+    .handle({ kind, body, stamp: wire.hlcNow(GOLDEN["peer_id"]) });
+  for (const name of ANNEX_I6_DIGEST_REFUSALS) {
+    assert.equal(wire.decodeBody({ kind: "DIGEST", body: hex(name) }), null, name);
+    handle("DIGEST", hex(name));
+  }
+  assert.equal(wire.decodeBody({ kind: "PULL_RESP", body: hex("adv_pull_resp_remainder_negative_body") }), null);
+  handle("PULL_RESP", hex("adv_pull_resp_remainder_negative_body"));
+  assert.equal(peer.malformedFrames, ANNEX_I6_DIGEST_REFUSALS.length + 1);
+  assert.equal(peer.states.size, 0);
+});
+
+test("each annex I.6 refusal vector breaks the one form rule its name says, not the schema", () => {
+  const why = (kind: records.Schema, name: string): string => {
+    try {
+      records.decodeRecord(hex(name), kind);
+      return "decoded";
+    } catch (e) {
+      return (e as Error).message;
+    }
+  };
+  const expected: { [name: string]: RegExp } = {
+    adv_digest_tree_path_nibble_body: /nibble from 0 to 15/,
+    adv_digest_tree_path_long_body: /at most 64 nibbles/,
+    adv_digest_tree_nodes_length_body: /exactly 384 bytes/,
+    adv_digest_tree_nodes_few_body: /more than 32 slots/,
+    adv_digest_tree_two_forms_body: /exactly one of count, nodes and lines, not 2/,
+    adv_digest_tree_no_form_body: /exactly one of count, nodes and lines, not 0/,
+    adv_digest_tree_lines_order_body: /strictly ascending/,
+    adv_digest_tree_lines_empty_line_body: /no empty line/,
+    adv_digest_ids_twice_body: /an id twice/,
+    adv_digest_budget_zero_body: /positive number of bytes/,
+  };
+  for (const name of ANNEX_I6_DIGEST_REFUSALS) {
+    assert.match(why(records.DIGEST, name), expected[name]!, name);
+  }
+  assert.match(why(records.PULL_RESP, "adv_pull_resp_remainder_negative_body"), /remainder is not negative/);
+});
+
+test("the annex I.6 accept carriers decode, re-encode to their bytes, and say what the annex says", () => {
+  for (const [name, kind] of [["digest_tree_request_body_cbor", "DIGEST"], ["digest_tree_nodes_body_cbor", "DIGEST"],
+    ["digest_tree_lines_body_cbor", "DIGEST"], ["digest_ids_body_cbor", "DIGEST"],
+    ["digest_get_space_budget_body_cbor", "DIGEST"], ["pull_resp_body_cbor", "PULL_RESP"],
+    ["pull_resp_remainder_body_cbor", "PULL_RESP"]] as const) {
+    const body = wire.decodeBody({ kind, body: hex(name) });
+    assert.notEqual(body, null, name);
+    assert.deepEqual(dumps(body), hex(name), name);
+  }
+  // The root of the illustration's 33 slots e00 to e32, answered by the 384 bytes this client's trie computes.
+  const thirtyThree = new HashTrie();
+  for (let i = 0; i <= 32; i++) {
+    const id = `e${String(i).padStart(2, "0")}`;
+    thirtyThree.put(id, [`e:${id}=0`]);
+  }
+  const nodes = wire.decodeBody({ kind: "DIGEST", body: hex("digest_tree_nodes_body_cbor") })!;
+  const root = ((nodes["tree"] as Dict)["space:tasks"] as Dict[])[0]!;
+  assert.deepEqual(root["nodes"], thirtyThree.node(new Uint8Array(0)).preimage);
+  assert.equal(Buffer.from(thirtyThree.streamHash()).toString("hex"),
+    "988d034b3abe2292c17478e2f646d845710c3ce40c30dfd9732598be8c2560cb");
+  // The slot `a` answered by its lines, as the illustration's leaf.
+  const slotA = new HashTrie();
+  slotA.put("a", slotLines("a", { state: "1", claim: "2", lapsed: false, acks: [] }));
+  const lines = wire.decodeBody({ kind: "DIGEST", body: hex("digest_tree_lines_body_cbor") })!;
+  const answers = (lines["tree"] as Dict)["space:tasks"] as Dict[];
+  assert.ok(answers.some((n) => n["lines"] === new TextDecoder().decode(slotA.node(new Uint8Array(0)).preimage)));
+  assert.ok(answers.some((n) => n["lines"] === ""), "an empty node answered by the empty text");
+  // The budgeted answer carries its remainder; the frame of the fetch verifies under Java's signature.
+  const remainder = wire.decodeBody({ kind: "PULL_RESP", body: hex("pull_resp_remainder_body_cbor") })!;
+  assert.deepEqual(remainder["remainder"], { "space:tasks": 3 });
+  const frame = wire.decodeFrame(hex("digest_ids_frame_cbor"));
+  assert.notEqual(frame, null);
+  assert.deepEqual(frame!["body"], hex("digest_ids_body_cbor"));
+});
+
+// The computed cases of v0.1.35 (annex I.7 and I.9): the renewal of §7.2 and the horizons of §7.3.
+
+test("renew_clamp_cases: a renewal sets the lease to max(current, now + extension), through renewEntry", () => {
+  const cases = GOLDEN["renew_clamp_cases"] as unknown as { current: number; now: number; extension: number; expiry: number }[];
+  assert.equal(cases.length, 5);
+  for (const c of cases) {
+    let clock = c.now;
+    const peer = new Peer(identity(), GOLDEN["group_id"], () => clock);
+    (peer as unknown as { send(): void }).send = () => undefined;
+    const id = peer.writeEntry("tasks", "T", { n: 1 }, "typescript", c.current - c.now);
+    clock = c.now;
+    peer.renewEntry("tasks", id, c.extension);
+    assert.equal(leaseExpiryOf(peer.states.get(id)!), c.expiry, JSON.stringify(c));
+  }
+});
+
+/** A state of one horizon kind with the given expiry, as collectable() reads it. */
+function stateOf(kind: string, expiry: number): Dict {
+  const dot = { replica: GOLDEN["peer_id"], counter: 1 };
+  return {
+    adds: [dot],
+    removes: kind === "withdrawn" || kind === "withdrawn_completed" ? [dot] : [],
+    completed: kind === "completed" || kind === "withdrawn_completed",
+    leaseValue: { expiresAtMillis: expiry },
+  };
+}
+
+test("lapse_horizon_cases: the horizons of §7.3 under the legacy rule, the drift floor included", () => {
+  const cases = GOLDEN["lapse_horizon_cases"] as unknown as { state: string; expiry: number; max_lease: number; horizon: number }[];
+  assert.equal(cases.length, 12);
+  for (const c of cases) {
+    const kind = c.state === "lapsed" ? "present" : c.state as horizon.HorizonKind;
+    assert.equal(horizon.collectionHorizon(kind, c.expiry, c.max_lease, "legacy"), c.horizon, JSON.stringify(c));
+    const dto = stateOf(c.state, c.expiry);
+    assert.equal(collectable(dto, c.horizon - 1, c.max_lease), false, JSON.stringify(c));
+    assert.equal(collectable(dto, c.horizon, c.max_lease), true, JSON.stringify(c));
+  }
+});
+
+test("horizon_mode_cases: every row's horizon and collectability under legacy and per-entry", () => {
+  const cases = GOLDEN["horizon_mode_cases"] as unknown as { state: string; mode: string; expiry: number;
+    max_lease: number; horizon: number; now: number; collectable: boolean }[];
+  assert.equal(cases.length, 64);
+  for (const c of cases) {
+    const kind = c.state === "lapsed" ? "present" : c.state as horizon.HorizonKind;
+    const rule = c.mode as horizon.Rule;
+    assert.equal(horizon.collectionHorizon(kind, c.expiry, c.max_lease, rule), c.horizon, JSON.stringify(c));
+    assert.equal(collectable(stateOf(c.state, c.expiry), c.now, c.max_lease, rule), c.collectable, JSON.stringify(c));
+  }
+});
+
+test("the v0.1.35 PING and ACK carriers decode and re-encode to their bytes", () => {
+  for (const [name, kind] of [["ping_hashes_have_body_cbor", "PING"], ["ping_hashes_body_cbor", "PING"],
+    ["ping_have_body_cbor", "PING"], ["ping_hashes_twenty_streams_body_cbor", "PING"], ["ack_body_cbor", "ACK"],
+    ["ack_hashes_have_body_cbor", "ACK"], ["ack_hashes_body_cbor", "ACK"], ["ack_have_body_cbor", "ACK"]]) {
+    const body = wire.decodeBody({ kind, body: hex(name) });
+    assert.notEqual(body, null, name);
+    assert.ok(!("root" in (body as Dict)), `${name} carries no root`);
+    assert.deepEqual(dumps(body), hex(name), name);
+  }
+  const frame = wire.decodeFrame(hex("ping_hashes_have_frame_cbor"));
+  assert.notEqual(frame, null);
+  assert.deepEqual(frame!["body"], hex("ping_hashes_have_body_cbor"));
 });

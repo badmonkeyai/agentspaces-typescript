@@ -76,6 +76,14 @@ export type HostConfig = {
    * to the pages; absent leaves it off.
    */
   content?: ContentConfig;
+  /** Advertise `wire.ae=2` and audit toward members that carry it; on by default (SPEC annex I.6). */
+  audit?: boolean;
+  /** The bytes the host asks an anti-entropy answer to stay within; 1 MiB by default. */
+  auditBudget?: number;
+  /** The audit sessions the host keeps open per asker, 1 to 4; 4 by default. */
+  auditSessions?: number;
+  /** `per-entry` (the default, `wire.horizon=1`) or `legacy` (SPEC §7.3). */
+  horizon?: "per-entry" | "legacy";
 };
 
 /** The host's content swarm. */

@@ -120,7 +120,12 @@ npx agentspaces-node run fleet.yaml
 npx agentspaces-node id keys
 ```
 
-In code: `new ServiceHost(identity, group, { listeners, seeds, spaces, tickMillis })`, then
+The fleet file's replication keys are Java's (`docs/replication-by-entry.md` in `@agentspaces/client`):
+`gossip.audit` (`true`), `gossip.audit-budget` (`1048576` bytes), `gossip.audit-sessions` (`4`) and
+`space.horizon` (`per-entry`, or `legacy`). A misspelt value is refused, naming its key.
+
+In code: `new ServiceHost(identity, group, { listeners, seeds, spaces, tickMillis })`, with the same settings as
+`audit`, `auditBudget`, `auditSessions` and `horizon`, then
 `host.addDuty(ordered)` and `await host.start()`; `await host.stop()` drains within `drainMillis`.
 Electron and Tauri applications run the host in their Node or sidecar process the same way.
 

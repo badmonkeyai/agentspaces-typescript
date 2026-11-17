@@ -166,6 +166,7 @@ export abstract class CellHost<Env extends CellEnv = CellEnv> extends DurableObj
   private async boot(): Promise<void> {
     const identity = await loadOrCreateIdentity(this.keys);
     this.peer = new Peer(identity, this.config.group);
+    this.peer.configureReplication(this.config); // audit, auditBudget and horizon (srad/replication-by-entry.md §7.2)
     this.peer.resourceHints[RESIDENCY_HINT] = "cell";
     if (this.config.invite !== null) {
       this.peer.resourceHints[social.JOIN_HINT] = this.joinCredential(this.config.invite, identity.peerId);

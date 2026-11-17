@@ -80,6 +80,17 @@ test("the agentspaces: subtree of a Java fleet file parses, Java-only keys ignor
   assert.throws(() => parseFleet("agentspaces:\n  bind: x\n"), /names no groups/);
 });
 
+test("the fleet file's replication keys read as Java's do, and a misspelt one is refused naming its key (srad/replication-by-entry.md §7.2)", () => {
+  const head = "agentspaces:\n  groups:\n    - { name: g, founding: f }\n";
+  assert.deepEqual(parseFleet(head).replication, {}, "absent keys leave the peer's defaults");
+  const set = parseFleet(head + "  gossip:\n    audit: false\n    audit-budget: 65536\n    audit-sessions: 2\n"
+    + "  space:\n    horizon: legacy\n");
+  assert.deepEqual(set.replication, { audit: false, auditBudget: 65536, auditSessions: 2, horizon: "legacy" });
+  assert.throws(() => parseFleet(head + "  gossip:\n    audit: yes\n"), /agentspaces.gossip.audit must be true or false, not 'yes'/);
+  assert.throws(() => parseFleet(head + "  gossip:\n    audit-budget: 1MB\n"), /audit-budget must be a whole number, not '1MB'/);
+  assert.throws(() => parseFleet(head + "  space:\n    horizon: perentry\n"), /horizon must be per-entry or legacy, not 'perentry'/);
+});
+
 test("startFleet brings up the host with its listeners and ordered log, and stops it", async () => {
   const dir = mkdtempSync(join(tmpdir(), "aspace-fleet-"));
   try {
@@ -88,6 +99,10 @@ agentspaces:
   keystore: keys
   bind: 127.0.0.1:0
   tick-millis: 50
+  gossip:
+    audit-budget: 131072
+  space:
+    horizon: legacy
   groups:
     - name: council
       founding: council-v1
@@ -100,6 +115,9 @@ agentspaces:
       assert.equal(running.hosts.length, 1);
       const host = running.hosts[0];
       assert.equal(host.peer.group, groupIdFromFounding("council-v1"));
+      assert.equal(host.peer.auditBudget, 131072, "the fleet file's budget reached the peer");
+      assert.equal(host.peer.horizon, "legacy");
+      assert.equal(host.peer.audit, true, "an absent key keeps the default");
       assert.ok(existsSync(join(dir, "keys", "peer.key")), "the keystore was created under the file's directory");
       assert.ok(existsSync(join(dir, "keys", "ordered-log-tasks")), "the log store lives under the keystore by default");
       const address = host.addresses.get("tcp")!;

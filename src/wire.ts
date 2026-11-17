@@ -607,6 +607,55 @@ export function digestBody(digests: Dict): Uint8Array {
   return dumps({ digests: canonicalMap(digests) });
 }
 
+/** The fields of a DIGEST body beside the text digests (v0.1.17 and annex I.6), each omitted when absent. */
+export interface DigestFields {
+  digests?: Dict | null;
+  hashes?: Dict | null;
+  want?: string[] | null;
+  tree?: { [stream: string]: Dict[] } | null;
+  ids?: { [stream: string]: string[] } | null;
+  budget?: number | null;
+  sketch?: Dict | null;
+}
+
+/**
+ * A DIGEST body of any form (SPEC v0.1.17, annex I.6, v0.1.35): conformed to `Bodies.Digest`, so its fields go out in
+ * Java's declared order, every map in the RFC 8949 key order, `digests` written null when the body carries no text,
+ * and each other field omitted when absent. A body that breaks a form rule throws, since this peer never sends one.
+ */
+export function digestRecord(fields: DigestFields): Uint8Array {
+  const value: Dict = { digests: fields.digests ?? null };
+  for (const key of ["hashes", "want", "tree", "ids", "budget", "sketch"] as const) {
+    const field = fields[key];
+    if (field !== null && field !== undefined) {
+      value[key] = field as CborValue;
+    }
+  }
+  return dumps(records.conform(value, records.DIGEST));
+}
+
+/** A PULL_RESP body: the deltas and, in answer to a budgeted body, the states left out per stream (annex I.6). */
+export function pullRespBody(deltas: Dict, remainder: { [stream: string]: number } | null = null): Uint8Array {
+  const value: Dict = { deltas };
+  if (remainder !== null) {
+    value["remainder"] = remainder;
+  }
+  return dumps(records.conform(value, records.PULL_RESP));
+}
+
+/** A PING body with the optional probe fields of SPEC §5.2 (v0.1.17), each omitted when absent. */
+export function probeBody(kind: "PING" | "ACK", nonce: number | bigint, root: Uint8Array | null,
+                          hashes: Dict | null, onBehalf: string | null = null): Uint8Array {
+  const value: Dict = kind === "PING" ? { nonce } : { nonce, onBehalf };
+  if (root !== null) {
+    value["root"] = root;
+  }
+  if (hashes !== null) {
+    value["hashes"] = hashes;
+  }
+  return dumps(records.conform(value, kind === "PING" ? records.PING : records.ACK));
+}
+
 /**
  * A PeerAdvertisement with no endpoints: the dial-only NAT posture. The
  * resource hints are the free-form string map every member reads
@@ -890,7 +939,7 @@ export function cardComplete(stub: Dict, parts: Dict): Dict {
 
 /** A UiDeclaration in Java field order: protocol, version, components, entries {reads, writes}, catalogIds (derived). */
 export function uiDeclaration(components: Dict[], reads: string[] = [], writes: string[] = [],
-                              protocol = "a2ui", version = "v0.9.1"): Dict {
+                              protocol = "a2ui", version = "1.0"): Dict {
   const catalogIds = [...new Set(components.map(c => String(c["catalogId"])))];
   return { protocol, version, components, entries: { reads, writes }, catalogIds };
 }

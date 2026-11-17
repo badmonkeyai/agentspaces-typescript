@@ -44,6 +44,10 @@ export default { scheduled: (_e, env: Env) => env.FLEET.getByName("connector").f
 `example/wrangler.json` is the one file that deploys this unchanged: the two Durable Object
 bindings, one `new_sqlite_classes` migration, a cron that wakes the connector each minute, and the
 `vars` block `AGENTSPACES_GROUP`, `AGENTSPACES_SEEDS`, `AGENTSPACES_INVITE`, `AGENTSPACES_PROFILE`.
+Four optional vars set replication by entry (Java's appendix D keys, `docs/replication-by-entry.md` in
+`@agentspaces/client`): `AGENTSPACES_AUDIT` (`true` by default), `AGENTSPACES_AUDIT_BUDGET` (`1048576` bytes),
+`AGENTSPACES_AUDIT_SESSIONS` (`4`) and `AGENTSPACES_HORIZON` (`per-entry`, or `legacy`). A misspelt value
+is refused, naming its variable.
 The cell answers `/wake` (connect and arm the alarm), `/status`, and `/pause`. A fleet member then
 reads through `aspace:cap/data-query` (`DataQuery` with `op` and the operation's parameters; a class
 card also takes `object`) and operates through `aspace:cap/asset-invoke` (`AssetInvocations.invoke`

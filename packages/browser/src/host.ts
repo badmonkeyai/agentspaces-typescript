@@ -258,6 +258,9 @@ export class ResidentHost {
       case "take": {
         const peer = this.requireRunning();
         this.space(request.space);
+        // The 600 ms settle window is the client's default. The claim is judged after it and a follow-up wait
+        // of up to 300 ms, and only a live claim wins, so a page's lease must be longer than 900 ms;
+        // takeEntry refuses a shorter one with a RangeError.
         const entryId = await peer.takeEntry(request.space, request.schema, this.agentName(), request.leaseMillis, 600,
           request.timeoutMillis, this.agent, request.entryId);
         if (entryId !== null) {
@@ -416,6 +419,7 @@ export class ResidentHost {
     this.lock = await LockElection.acquire(lockName(config.group, identity.peerId),
       config.lockWaitMillis === undefined ? DEFAULT_LOCK_WAIT_MILLIS : config.lockWaitMillis);
     const peer = new Peer(identity, config.group, this.clock);
+    peer.configureReplication(config); // audit, auditBudget and horizon (srad/replication-by-entry.md §7.2)
     registerBrowserDialers(peer);
     peer.timers = platform({ residency: "resident", keys: this.keys }).timers;
     peer.resourceHints["js.residency"] = "resident"; // JS-R-07: what this host is, for operators; never trusted for safety

@@ -26,7 +26,7 @@
 import { isAbsolute, resolve } from "node:path";
 import { parse } from "yaml";
 import { Seed, groupIdFromFounding, parseSeed, residencyOf } from "@agentspaces/client";
-import type { Residency } from "@agentspaces/client";
+import type { ReplicationOptions, Residency } from "@agentspaces/client";
 import { loadOrCreateIdentity } from "@agentspaces/client/node";
 import { OrderedLogHost } from "@agentspaces/ordered";
 import { FileLogStore } from "./file-log-store.js";
@@ -54,6 +54,8 @@ export type FleetConfig = {
   residency: Residency;
   ws: { bind: string; allowedOrigins: string[] } | null;
   groups: GroupConfig[];
+  /** `gossip.audit`, `audit-budget`, `audit-sessions` and `space.horizon`, absent ones left to the peer's default. */
+  replication: ReplicationOptions;
 };
 
 type Tree = { [key: string]: unknown };
@@ -74,6 +76,42 @@ function list(value: unknown): unknown[] {
     return value.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
   }
   return [];
+}
+
+/**
+ * The replication keys of the fleet file, read as Java's `AgentSpacesProperties` reads them (srad/replication-by-entry.md
+ * §7.2): `gossip.audit` true or false, `gossip.audit-budget` and `gossip.audit-sessions` whole numbers, `space.horizon`
+ * `per-entry` or `legacy`. A misspelt value is refused naming its key, so it never passes for the default; the peer
+ * refuses a number out of its range when the host is built, as Java's bounds do.
+ */
+function replicationOf(a: Tree): ReplicationOptions {
+  const gossip = tree(a["gossip"]);
+  const space = tree(a["space"]);
+  const out: ReplicationOptions = {};
+  const audit = text(typeof gossip["audit"] === "boolean" ? String(gossip["audit"]) : gossip["audit"]);
+  if (audit !== null) {
+    if (audit.toLowerCase() !== "true" && audit.toLowerCase() !== "false") {
+      throw new Error(`agentspaces.gossip.audit must be true or false, not '${audit}'`);
+    }
+    out.audit = audit.toLowerCase() === "true";
+  }
+  for (const [key, field] of [["audit-budget", "auditBudget"], ["audit-sessions", "auditSessions"]] as const) {
+    const value = text(gossip[key]);
+    if (value !== null) {
+      if (!/^[0-9]+$/.test(value)) {
+        throw new Error(`agentspaces.gossip.${key} must be a whole number, not '${value}'`);
+      }
+      out[field] = Number(value);
+    }
+  }
+  const horizon = text(space["horizon"]);
+  if (horizon !== null) {
+    if (horizon !== "per-entry" && horizon !== "legacy") {
+      throw new Error(`agentspaces.space.horizon must be per-entry or legacy, not '${horizon}'`);
+    }
+    out.horizon = horizon;
+  }
+  return out;
 }
 
 /** Parses a fleet file's text; the `agentspaces:` subtree is required. */
@@ -123,6 +161,7 @@ export function parseFleet(yamlText: string): FleetConfig {
     ws: text(ws["bind"]) === null ? null
       : { bind: text(ws["bind"])!, allowedOrigins: list(ws["allowed-origins"] ?? ws["allowedOrigins"]).map(String) },
     groups,
+    replication: replicationOf(a),
   };
 }
 
@@ -151,7 +190,7 @@ export async function startFleet(config: FleetConfig, baseDir: string,
     const groupId = group.groupId ?? groupIdFromFounding(group.founding!);
     const host = new ServiceHost(identity, groupId, {
       tickMillis: config.tickMillis, seeds: group.seeds, listeners, spaces: group.spaces,
-      log: options.log, signals: options.signals ?? false,
+      log: options.log, signals: options.signals ?? false, ...config.replication,
     });
     for (const log of group.orderedLogs) {
       const members = log.members.includes(identity.peerId) ? log.members : [...log.members, identity.peerId];

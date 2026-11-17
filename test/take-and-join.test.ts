@@ -20,6 +20,16 @@
  * 1. takeEntry ended its settle window at the first fold of any entry, so in a busy space it judged the
  *    race before a rival claim arrived and kept a claim it had lost (two takers ran one task).
  * 2. joinByGroupId dialed tcp only, sent GROUP_AD_WANT once, and kept the `aspace://` prefix as the group.
+ *
+ * Defects of 2026-11-15, found when the browser host's pause-rule test failed after fix 1:
+ *
+ * 3. A take judges its claim after the settle window and a follow-up wait of up to 300 ms, and needs
+ *    that claim still live, so a lease no longer than both can never win in a quiet space. takeEntry
+ *    published doomed claims until its timeout and returned null as if it had lost a race; it now
+ *    refuses such a take at once.
+ * 4. renewClaim re-stamped the claim at a fresh epoch, so a renewal could shorten a hold and every
+ *    replica announced it as a new take. It now keeps the claim's epoch, stamp and bid and only moves
+ *    the expiry later, as Java's TakenEntry.renew does (SPEC §7.2 renewal, §6.1).
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -27,8 +37,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { Identity } from "../src/identity.js";
-import { Peer } from "../src/peer.js";
-import { Space } from "../src/space.js";
+import { Peer, takeJudgedWithinMillis } from "../src/peer.js";
+import { Space, TAKEN, Template } from "../src/space.js";
 import type { FrameChannel } from "../src/transport.js";
 import { MemoryNetwork } from "../src/transport/mem.js";
 import * as wire from "../src/wire.js";
@@ -111,6 +121,72 @@ test("a fold of another entry does not end the take's settle window, so a rival 
     assert.equal((taker.claims.get(id)!["claim"] as Dict)["holder"], worker, "the rival's claim is the winner here");
   } finally {
     [writer, taker, rival].forEach((p) => p.close());
+  }
+});
+
+test("a take whose lease cannot outlast its settle window and follow-up wait is refused at once, and one whose lease can is won", async () => {
+  const writer = new Member();
+  const taker = new Member();
+  try {
+    const id = writer.writeEntry("tasks", TASK, { job: 1 }, "w", 30 * MINUTE);
+    taker.hear(writer);
+    // A quiet space judges the claim 600 ms + 300 ms after it went out, so 600 (the window) and 800
+    // (inside the follow-up wait) have both lapsed by then.
+    for (const lease of [600, 800, 900]) {
+      const started = Date.now();
+      await assert.rejects(taker.takeEntry("tasks", TASK, "worker", lease, 600, 3_000), /must exceed 900 ms/,
+        `the lease of ${lease} ms is refused`);
+      assert.ok(Date.now() - started < 1_000, `the lease of ${lease} ms is refused at once, not after the 3 s timeout`);
+      assert.equal(taker.claims.has(id), false, `no doomed ${lease} ms claim went out`);
+    }
+    assert.equal(takeJudgedWithinMillis(600), 900);
+    assert.equal(takeJudgedWithinMillis(200), 400, "a short window's follow-up wait is the window itself");
+    assert.equal(takeJudgedWithinMillis(0), 0, "an exact take of one's own entry has no window and no wait");
+    assert.equal(await taker.takeEntry("tasks", TASK, "worker", 1_500, 600, 5_000), id,
+      "a lease longer than the window is still live when the take is judged");
+  } finally {
+    [writer, taker].forEach((p) => p.close());
+  }
+});
+
+test("a claim renewal keeps its epoch, stamp and bid, never shortens the hold, and is no new take elsewhere", async () => {
+  const writer = new Member();
+  const holder = new Member();
+  try {
+    const id = writer.writeEntry("tasks", TASK, { job: 1 }, "w", 30 * MINUTE);
+    holder.hear(writer);
+    const taken: string[] = [];
+    writer.space.watch(new Template(TASK), (event) => {
+      if (event.kind === TAKEN) {
+        taken.push(event.entry.entryId);
+      }
+    });
+    const agent = holder.identity.subordinate("worker", new Date().toISOString());
+    assert.equal(await holder.takeEntry("tasks", TASK, "worker", MINUTE, 0, 2_000, agent, id), id);
+    const first = holder.claims.get(id)!["claim"] as Dict;
+    let sent = holder.rumors.length;
+    writer.hear(holder);
+    assert.deepEqual(taken, [id], "the take is heard once");
+
+    holder.renewClaim("tasks", id, 10 * MINUTE, agent);
+    const renewed = holder.claims.get(id)!["claim"] as Dict;
+    assert.equal(Number(renewed["epoch"]), Number(first["epoch"]), "a renewal is the same take: the epoch stays");
+    assert.equal(renewed["stamp"], first["stamp"], "a renewal keeps the claim's original stamp (SPEC §6.1)");
+    assert.equal(Number(renewed["bid"]), Number(first["bid"]));
+    assert.ok(Number(renewed["expiresAtMillis"]) >= Date.now() + 10 * MINUTE - 1_000, "the hold runs ten minutes on");
+    assert.equal(holder.rumors.length, sent + 1, "the renewal went out");
+    writer.hear(holder, sent);
+    assert.equal(Number((writer.claims.get(id)!["claim"] as Dict)["expiresAtMillis"]),
+      Number(renewed["expiresAtMillis"]), "the other replica holds the renewed expiry");
+    assert.deepEqual(taken, [id], "a renewal is no new take: the watcher hears TAKEN once");
+
+    sent = holder.rumors.length;
+    holder.renewClaim("tasks", id, 1_000, agent);
+    assert.equal(Number((holder.claims.get(id)!["claim"] as Dict)["expiresAtMillis"]),
+      Number(renewed["expiresAtMillis"]), "a shorter renewal never shortens the hold (SPEC §7.2, v0.1.35)");
+    assert.equal(holder.rumors.length, sent, "a renewal that changes nothing sends nothing");
+  } finally {
+    [writer, holder].forEach((p) => p.close());
   }
 });
 

@@ -389,9 +389,132 @@ export const ACK = schema("Bodies.Ack", [["nonce", "long"], ["onBehalf", "id"], 
   ["hashes", mapOf("bytes"), "omitNull"], ["have", listOf(HAVE_ITEM), "omitNull"]]);
 export const RUMOR = schema("Bodies.Rumor", [["streamId", "String"], ["itemId", "String"], ["hopsRemaining", "int"],
   ["payload", "bytes"]]);
+/** Nodes one stream's `tree` holds at most, and distinct ids one stream's `ids` names at most (SPEC annex I.6). */
+export const TREE_NODES_MAX = 256;
+export const IDS_MAX = 4096;
+/** The leaf threshold T, nibbles in a path at most, and the bytes of an inner preimage (annex I.6). */
+const TREE_LEAF_MAX = 32;
+const TREE_PATH_MAX = 64;
+const TREE_NODES_BYTES = 384;
+
+/**
+ * The form rules of annex I.6 for one node, as Java's `Bodies.TreeNode` constructor checks them: a path of nibbles,
+ * exactly one of `count`, `nodes` and `lines`, a non-negative count, `nodes` of exactly 384 bytes whose counts sum
+ * past 32 with an empty child as 16 zero bytes, and `lines` with no empty line, no control character and every line
+ * strictly after the one before by its UTF-8 bytes. A carrier that breaks one is undecodable (P1 to P4), so a reader
+ * never parses a malformed answer.
+ */
+function checkTreeNode(node: Dict, path: string): boolean {
+  const nibbles = node["path"] as Uint8Array;
+  if (nibbles.length > TREE_PATH_MAX) {
+    refuse(`${path}.path`, `a path holds at most ${TREE_PATH_MAX} nibbles, not ${nibbles.length}`);
+  }
+  if (nibbles.some((b) => b > 0x0f)) {
+    refuse(`${path}.path`, "a path byte is a nibble from 0 to 15");
+  }
+  const set = ["count", "nodes", "lines"].filter((k) => node[k] !== undefined).length;
+  if (set !== 1) {
+    refuse(path, `a tree node holds exactly one of count, nodes and lines, not ${set}`);
+  }
+  const count = node["count"];
+  if (count !== undefined && (typeof count === "bigint" ? count < 0n : (count as number) < 0)) {
+    refuse(`${path}.count`, "a count is not negative");
+  }
+  const nodes = node["nodes"];
+  if (nodes !== undefined) {
+    const bytes = nodes as Uint8Array;
+    if (bytes.length !== TREE_NODES_BYTES) {
+      refuse(`${path}.nodes`, `nodes are exactly ${TREE_NODES_BYTES} bytes, not ${bytes.length}`);
+    }
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let sum = 0n;
+    for (let child = 0; child < 16; child++) {
+      const at = child * 24;
+      const childCount = view.getBigUint64(at + 16);
+      if (childCount > (1n << 63n) - 1n) {
+        refuse(`${path}.nodes`, "a child's count is past every set a member can hold");
+      }
+      if (childCount === 0n && bytes.subarray(at, at + 16).some((b) => b !== 0)) {
+        refuse(`${path}.nodes`, "an empty child carries 16 zero bytes");
+      }
+      sum += childCount;
+      if (sum > (1n << 63n) - 1n) {
+        refuse(`${path}.nodes`, "the children's counts overflow");
+      }
+    }
+    if (sum <= BigInt(TREE_LEAF_MAX)) {
+      refuse(`${path}.nodes`, `an inner node holds more than ${TREE_LEAF_MAX} slots, not ${sum}`);
+    }
+  }
+  const lines = node["lines"];
+  if (typeof lines === "string" && lines.length > 0) {
+    let previous: Uint8Array | null = null;
+    for (const line of lines.split("\n")) {
+      if (line.length === 0) {
+        refuse(`${path}.lines`, "lines hold no empty line");
+      }
+      for (let i = 0; i < line.length; i++) {
+        const code = line.charCodeAt(i);
+        if (code < 0x20 || code === 0x7f) {
+          refuse(`${path}.lines`, "a line holds no control character");
+        }
+      }
+      const bytes = new TextEncoder().encode(line);
+      if (previous !== null && compare(previous, bytes) >= 0) {
+        refuse(`${path}.lines`, "lines are in strictly ascending order");
+      }
+      previous = bytes;
+    }
+  }
+  return true;
+}
+
+/** `Bodies.TreeNode` (annex I.6): a request carries `count`, an answer `nodes` or `lines`. */
+export const TREE_NODE = schema("Bodies.TreeNode", [["path", "bytes", "nonNull"], ["count", "Long", "omitNull"],
+  ["nodes", "bytes", "omitNull"], ["lines", "String", "omitNull"]], checkTreeNode);
+
+/** Java's `Bodies.Digest` constructor checks: the per-stream bounds of `tree` and `ids`, distinct ids, a positive budget. */
+function checkDigest(digest: Dict, path: string): boolean {
+  for (const [stream, nodes] of Object.entries((digest["tree"] ?? {}) as Dict)) {
+    if ((nodes as CborValue[]).length > TREE_NODES_MAX) {
+      refuse(`${path}.tree.${stream}`, `a tree carries at most ${TREE_NODES_MAX} nodes per stream`);
+    }
+  }
+  for (const [stream, named] of Object.entries((digest["ids"] ?? {}) as Dict)) {
+    const ids = named as string[];
+    if (ids.length > IDS_MAX) {
+      refuse(`${path}.ids.${stream}`, `a fetch names at most ${IDS_MAX} ids per stream`);
+    }
+    if (new Set(ids).size !== ids.length) {
+      refuse(`${path}.ids.${stream}`, "a fetch names an id twice in one stream");
+    }
+  }
+  const budget = digest["budget"];
+  if (budget !== undefined && (typeof budget === "bigint" ? budget <= 0n : (budget as number) <= 0)) {
+    refuse(`${path}.budget`, "a budget is a positive number of bytes");
+  }
+  return true;
+}
+
+/**
+ * `Bodies.Digest`: the text digests, the hashed opening and `want` of v0.1.17, and the four fields of annex I.6
+ * (v0.1.35, `wire.ae=2`), each omitted when absent, so a body without them is the bytes it always was.
+ */
 export const DIGEST = schema("Bodies.Digest", [["digests", mapOf("bytes")], ["hashes", mapOf("bytes"), "omitNull"],
-  ["want", listOf("String"), "omitNull"]]);
-export const PULL_RESP = schema("Bodies.PullResp", [["deltas", mapOf("bytes")]]);
+  ["want", listOf("String"), "omitNull"], ["tree", mapOf(listOf(TREE_NODE)), "omitNull"],
+  ["ids", mapOf(listOf("id")), "omitNull"], ["budget", "Long", "omitNull"], ["sketch", mapOf("bytes"), "omitNull"]],
+  checkDigest);
+
+/** `Bodies.PullResp`: the deltas, and under a budget the states left out per stream (annex I.6), never negative. */
+export const PULL_RESP = schema("Bodies.PullResp", [["deltas", mapOf("bytes")], ["remainder", mapOf("Long"), "omitNull"]],
+  (resp, path) => {
+    for (const [stream, left] of Object.entries((resp["remainder"] ?? {}) as Dict)) {
+      if (typeof left === "bigint" ? left < 0n : (left as number) < 0) {
+        refuse(`${path}.remainder.${stream}`, "a remainder is not negative");
+      }
+    }
+    return true;
+  });
 export const RELAY_FRAME = schema("Bodies.RelayFrame", [["target", "id"], ["frame", "bytes"],
   ["path", listOf("id"), "omitNull"], ["hop", "Integer", "omitNull"]]);
 export const SESSION_HELLO = schema("Bodies.SessionHello", [["ephemeralKey", "bytes"], ["nonce", "bytes"],

@@ -324,6 +324,32 @@ test("a ballot casts once per proposal and a decision fires once at quorum", asy
   }
 });
 
+// R2, 2026-11-16: a member that binds after it joined holds proposals no WRITTEN will name again. The
+// council's Python and Ruby workers never cast, since their budgeted pulls no longer fold every state
+// again; this binder was rescued only by its own whole-space pulls. The binding reads what it holds.
+test("a ballot binding casts for a proposal folded before it bound, and a quorum closed before it fires once", async () => {
+  const peer = new StubPeer();
+  const other = new StubPeer();
+  vote.propose(other, "votes", "rel:3", "ship 3.0?", ["yes", "no"], 2);
+  vote.propose(other, "votes", "rel:4", "ship 4.0?", ["yes", "no"], 1);
+  vote.cast(other, "votes", "rel:4", "no");
+  peer.foldAllFrom(other);
+  const panelist = new Panelist();
+  const bound = new Binder(peer, { publishCard: false }).bind(panelist);
+  try {
+    assert.ok(await until(30_000, () => vote.ballots(peer, "votes", "rel:3").length === 1), "the held proposal gets its ballot");
+    assert.ok(await until(30_000, () => panelist.decided.includes("rel:4")), "the quorum closed before binding fires");
+    for (const dto of [...peer.states.values()]) {
+      (peer as unknown as Internals).fold({ ...dto });
+    }
+    await sleep(100);
+    assert.equal(vote.ballots(peer, "votes", "rel:3").length, 1, "one ballot, however often the proposal folds");
+    assert.deepEqual(panelist.decided.filter((id) => id === "rel:4"), ["rel:4"], "one decision per proposal");
+  } finally {
+    await bound.close();
+  }
+});
+
 // The data-use hook names no product's record (neutral vectors, 2026-11-09): the binder writes, into the group's
 // catalog space, the record type its caller names, one leased entry per declaration.
 const DATA_USE = "https://example.org/ns/demo/v1/DataUse";

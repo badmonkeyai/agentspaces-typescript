@@ -502,7 +502,10 @@ export class RemoteSpace {
     return subscription;
   }
 
-  /** Renews the write lease of an entry the host's agent wrote. */
+  /**
+   * Renews the write lease of an entry the host's agent wrote, to at least `lease` from now and never shorter (SPEC
+   * §7.2, v0.1.35); refused unless the entry is still present and unexpired on the host. To end it sooner, cancel it.
+   */
   async renew(entryId: string, lease: number | string = "10m"): Promise<void> {
     await this.host.request({ t: "renewEntry", space: this.name, entryId, leaseMillis: durationMillis(lease) });
   }
@@ -522,7 +525,10 @@ export class RemoteTaken<T> {
     return await this.space.host.request({ t: "complete", space: this.space.name, entryId: this.entryId, result: wire }) as string | null;
   }
 
-  /** Extends the claim (a fresh epoch under the lattice); refused while the host is paused or once the claim lapsed. */
+  /**
+   * Extends the claim to at least `lease` from now, never shorter, keeping its epoch and stamp (SPEC §7.2, v0.1.35);
+   * refused while the host is paused or once the claim lapsed.
+   */
   async renew(lease: number | string | null = null): Promise<void> {
     await this.space.host.request({ t: "renewClaim", space: this.space.name, entryId: this.entryId,
       leaseMillis: lease === null ? this.leaseMillis : durationMillis(lease) });

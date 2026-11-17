@@ -75,7 +75,13 @@ is the metadata view (`Entry<T>`: `entryId`, `value`, `tags`, `issuer`,
 watch, and `@spaceNotify(..., { on: [...] })`, deliver five kinds: `WRITTEN`,
 `TAKEN`, `COMPLETED`, `EXPIRED` (the write lease lapsed while the entry was
 open: a leased entry as a timer), and `REAPPEARED` (a take claim lapsed),
-the last two judged by a sweep on the clock, once per entry and lapse. A
+the last two judged by a sweep on the clock, once per entry and lapse.
+Renewals never shorten (SPEC §7.2, v0.1.35): `renewEntry`, `Taken.renew`
+(the take lease, as Java's `TakenEntry.renew`) and `Subscription.renew` set
+the expiry to the later of the current one and now plus the extension; only
+the issuer renews a write, while it is present and unexpired, and
+`Taken.release()` gives a taken entry back by letting its take lease lapse
+([Replication by entry](replication-by-entry.md)). A
 `new Contribution(epoch, value)` return starts the epoch on the binder's
 aggregate, and `produces` on a take or notify takes a list. The
 wire is version 3: maps a signature covers (`tags`, `costHints`,
@@ -91,7 +97,9 @@ answers to other members' queries), and `actions` and `invoke` (the actions
 the cards on the `ads` stream declare, invoked through the task space with
 the shared-fields correlation), `OrderedLog` (the Raft client: a signed
 `ClaimCommand` submitted to the advertised leader, the committed claim seen
-as the space folds it), and `vote.castPreference`/`leader` (MAJORITY_GOSSIP
+as the space folds it; a claim already submitted is waited on for its 3 s
+attempt window even past the take's timeout, as Java's `OrderedTakes` does,
+so the taker holds an entry the log granted late), and `vote.castPreference`/`leader` (MAJORITY_GOSSIP
 over push-sum shares, agreeing with Java's `VoteCapability`), and `Content`
 (the content swarm, below). A dial-only peer sends frames to its seed
 directly and to every other member through it: the seed carries a

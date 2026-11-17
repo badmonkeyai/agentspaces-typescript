@@ -334,3 +334,40 @@ test("concurrent heads: a walk reads a chain node the heads' writers lack from t
     closeAll(nodes);
   }
 });
+
+test("a linear swap whose function throws releases the taken head and rethrows the caller's error unchanged (RE-H-07, P18)", async () => {
+  // The head went back by renewing it to zero, which shortened the head's own write lease. Under SPEC §7.2 (v0.1.35) a
+  // renewal never shortens, so the take is released instead: it is renewed no more and its take lease lapses, after
+  // which the next taker wins the head, as Java's does. The head itself and its write lease are untouched.
+  const nodes = fleet(2, { modes: { counter: "linear" }, take: { leaseMillis: 1500, timeoutMillis: 4000, retries: 2 } });
+  const [a, b] = nodes as [Node, Node];
+  try {
+    const ra = a.pdt.ref<pdt.PMap<string, V>>("refs", "counter", "map");
+    const rb = b.pdt.ref<pdt.PMap<string, V>>("refs", "counter", "map");
+    await ra.swap((m) => m.assoc("n", 0));
+    await run(nodes, 2);
+    const [head] = ra.heads();
+    const lease = (n: Node): number => Number((n.peer.states.get(head!.entryId)!["leaseValue"] as Dict)["expiresAtMillis"]);
+    const before = lease(a);
+    const boom = new Error("the caller's own failure");
+    const ticking = setInterval(() => { void run(nodes, 1); }, 50);
+    try {
+      await assert.rejects(ra.swap(() => { throw boom; }), (e: unknown) => e === boom);
+      assert.equal(lease(a), before, "the head's write lease is not shortened");
+      const claim = a.peer.claims.get(head!.entryId)!["claim"] as Dict;
+      assert.ok(Number(claim["expiresAtMillis"]) <= Date.now() + 1500, "the take holds no longer than its own lease");
+      assert.deepEqual(ra.heads().map((h) => h.entryId), [head!.entryId], "the head is still the live head");
+      const started = Date.now();
+      await rb.swap((m) => m.assoc("n", Number(m.get("n")) + 1)); // won once the released take's lease lapses
+      assert.ok(Date.now() - started < 4000, `the head came back within its take lease (${Date.now() - started} ms)`);
+    } finally {
+      clearInterval(ticking);
+    }
+    await run(nodes, 3);
+    assert.equal((await ra.deref()).get("n"), 1);
+    assert.equal((await rb.deref()).get("n"), 1);
+    assert.equal(rb.heads().length, 1);
+  } finally {
+    closeAll(nodes);
+  }
+});

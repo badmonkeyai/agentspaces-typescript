@@ -65,6 +65,11 @@ export type CellConfig = {
   busyWindowMillis: number;
   /** Where the cell reports; default `console.log`, `null` for silence. */
   log: ((line: string) => void) | null;
+  /** Replication by entry (SPEC annex I.6, §7.3): `audit`, `auditBudget`, `auditSessions` and `horizon`, as every host reads them. */
+  audit?: boolean;
+  auditBudget?: number;
+  auditSessions?: number;
+  horizon?: "per-entry" | "legacy";
 };
 
 export const DEFAULT_TICK_MILLIS = 1_000;
@@ -132,5 +137,51 @@ export function cellConfig(env: CellEnv, overrides: Partial<CellConfig> = {}): C
     housekeepingMillis: overrides.housekeepingMillis ?? DEFAULT_TICK_MILLIS,
     busyWindowMillis: overrides.busyWindowMillis ?? 5_000,
     log: overrides.log === undefined ? (line) => console.log(line) : overrides.log,
+    // Absent stays absent, so the peer keeps its own default (audit on, 1 MiB, 4 sessions, per-entry).
+    ...replicationVars(env, overrides),
   };
+}
+
+/**
+ * The replication settings of `vars`, read as Java reads `agentspaces.gossip.audit`, `audit-budget`, `audit-sessions` and
+ * `agentspaces.space.horizon` (srad/replication-by-entry.md §7.2): `AGENTSPACES_AUDIT` (`true` or `false`),
+ * `AGENTSPACES_AUDIT_BUDGET` (whole bytes), `AGENTSPACES_AUDIT_SESSIONS` (a whole number) and `AGENTSPACES_HORIZON`
+ * (`per-entry` or `legacy`). A misspelt value is refused naming its variable, so it never passes for the default; the
+ * peer refuses a number out of its range when the cell boots.
+ */
+function replicationVars(env: CellEnv, overrides: Partial<CellConfig>): Partial<CellConfig> {
+  // wrangler's vars may be JSON, so `true` or `1048576` arrive as values rather than strings.
+  const text = (name: string): string | null => {
+    const value = env[name];
+    const read = typeof value === "boolean" || typeof value === "number" ? String(value) : value;
+    return typeof read === "string" && read.trim().length > 0 ? read.trim() : null;
+  };
+  const whole = (name: string): number | null => {
+    const value = text(name);
+    if (value !== null && !/^[0-9]+$/.test(value)) {
+      throw new Error(`${name} is a whole number, not ${JSON.stringify(value)}`);
+    }
+    return value === null ? null : Number(value);
+  };
+  const out: Partial<CellConfig> = {};
+  const audit = text("AGENTSPACES_AUDIT")?.toLowerCase() ?? null;
+  if (audit !== null && audit !== "true" && audit !== "false") {
+    throw new Error(`AGENTSPACES_AUDIT is true or false, not ${JSON.stringify(text("AGENTSPACES_AUDIT"))}`);
+  }
+  const horizon = text("AGENTSPACES_HORIZON");
+  if (horizon !== null && horizon !== "per-entry" && horizon !== "legacy") {
+    throw new Error(`AGENTSPACES_HORIZON is per-entry or legacy, not ${JSON.stringify(horizon)}`);
+  }
+  const values: Partial<CellConfig> = {
+    audit: overrides.audit ?? (audit === null ? undefined : audit === "true"),
+    auditBudget: overrides.auditBudget ?? whole("AGENTSPACES_AUDIT_BUDGET") ?? undefined,
+    auditSessions: overrides.auditSessions ?? whole("AGENTSPACES_AUDIT_SESSIONS") ?? undefined,
+    horizon: overrides.horizon ?? (horizon as "per-entry" | "legacy" | null) ?? undefined,
+  };
+  for (const [key, value] of Object.entries(values)) {
+    if (value !== undefined) {
+      (out as Record<string, unknown>)[key] = value;
+    }
+  }
+  return out;
 }

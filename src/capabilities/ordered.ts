@@ -37,6 +37,9 @@ import { Pipes } from "./pipes.js";
 /** The capability type URI (RaftLog.TYPE). */
 export const ORDERED_LOG_TYPE = "aspace:cap/ordered-log";
 
+/** How long a take waits on one submitted claim for the log to decide it, as Java's OrderedTakes does. */
+const ATTEMPT_MILLIS = 3_000;
+
 /** A member's view of the log, from its advertisement. */
 export type LogMember = { peer: string; role: string; term: number; leaseUntilMillis: number | null };
 
@@ -124,7 +127,10 @@ export class OrderedLog {
    * OrderedTakes.take as a client: claims a matching live entry through the
    * log and returns its id once the log committed this peer's claim for the
    * generation it asked for, or null at the timeout. The caller completes
-   * the entry as after any take.
+   * the entry as after any take. A claim already submitted is waited on for
+   * its whole attempt window (3 s) even past the timeout, so a take can return
+   * up to that much later than `timeoutMillis`, holding the entry the log
+   * granted it rather than leaving it held by nobody.
    */
   async take(space: string, typeName: string, agentName = "ts-worker", leaseMillis = 60_000,
              timeoutMillis = 15_000, agent: AgentIdentity | null = null,
@@ -170,8 +176,12 @@ export class OrderedLog {
           break; // no member of the log reachable yet: pull the ads again
         }
         // Wait for the log to decide this generation, for a bounded attempt: a command lost to a
-        // leader election is resubmitted on the next scan (OrderedTakes.take).
-        const attemptDeadline = Math.min(deadline, Date.now() + 3000);
+        // leader election is resubmitted on the next scan (OrderedTakes.take). The attempt runs its
+        // whole window even past the caller's timeout, as Java's does: a claim the log commits after
+        // the caller gave up would otherwise hold the entry for its whole lease with nobody to adopt it
+        // (the 0.6.0 regression, 2026-11-10; OrderedTakesClusterTest
+        // aClaimTheLogCommitsAfterTheTakersTimeoutStillHandsTheEntryToTheTaker).
+        const attemptDeadline = Date.now() + ATTEMPT_MILLIS;
         while (Date.now() < attemptDeadline) {
           await peer.awaitFold(Math.min(600, attemptDeadline - Date.now()));
           const decided = peer.claims.get(entryId)?.["claim"] as Dict | undefined;

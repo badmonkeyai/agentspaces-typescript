@@ -387,6 +387,29 @@ export function mergeOrder(a: Head, b: Head): number {
     || (a.root < b.root ? -1 : a.root > b.root ? 1 : 0);
 }
 
+/**
+ * The live versions a loadable version supersedes, directly or through other live versions, as Java's
+ * Refs.supersededBy; each named by root and entry id. headsAmong reads base links only among the versions it is given,
+ * so with the middle of a chain still loading, the version below it would be read as a head and merged in, and a key a
+ * later version removed would come back.
+ */
+export function supersededBy(loadable: Head[], live: Head[]): Set<string> {
+  const superseded = new Set<string>();
+  const frontier = [...loadable];
+  while (frontier.length > 0) {
+    const newer = frontier.shift()!;
+    const by = newer.seq >= MAX_SEQ ? Number.POSITIVE_INFINITY : newer.seq;
+    for (const older of live) {
+      const key = `${older.root}\n${older.entryId}`;
+      if (older.seq < by && newer.base.includes(older.root) && !superseded.has(key)) {
+        superseded.add(key);
+        frontier.push(older);
+      }
+    }
+  }
+  return superseded;
+}
+
 /** The heads among live entries: not superseded by a base link of a larger seq, equal roots folded. */
 export function headsAmong(entries: Head[]): Head[] {
   const supersededBelow = new Map<string, number>();
@@ -1068,8 +1091,22 @@ export class Refs {
   }
 
   heads(state: State): Head[] {
-    const loadable = this.liveEntries(state).filter((head) => this.loadable(state, head));
-    return headsAmong(loadable);
+    const live = this.liveEntries(state);
+    return headsAmong(this.withoutLateSuperseded(state, live.filter((head) => this.loadable(state, head)), live));
+  }
+
+  /**
+   * When some live version is still loading, a loaded version that a loaded head supersedes through it is no head either
+   * (Java's Refs.heads): a late middle version would otherwise bring removed keys back for a read, and through
+   * swapMulti's merge for every reader.
+   */
+  private withoutLateSuperseded(state: State, loadable: Head[], live: Head[]): Head[] {
+    const considered = live.filter((head) => !state.ignoredEntries.has(head.entryId));
+    if (loadable.length >= considered.length) {
+      return loadable;
+    }
+    const folded = supersededBy(loadable, live);
+    return folded.size === 0 ? loadable : loadable.filter((head) => !folded.has(`${head.root}\n${head.entryId}`));
   }
 
   private loadable(state: State, head: Head): boolean {
@@ -1121,7 +1158,7 @@ export class Refs {
         this.late(state, head.entryId, "timeout");
       }
     }
-    return headsAmong(live.filter((head) => this.held(head.root)));
+    return headsAmong(this.withoutLateSuperseded(state, live.filter((head) => this.held(head.root)), live));
   }
 
   /**
@@ -1548,7 +1585,9 @@ export class Refs {
         newRoot = state.kind.root(next);
       } catch (e) {
         this.store.drain();
-        taken.renew(0);
+        // The head goes back as Java's does: its take lease lapses and it reappears for the next taker. Renewing it to
+        // zero shortened the head's own write lease, which a renewal no longer does (SPEC §7.2, v0.1.35, RE-H-07).
+        taken.release();
         throw e;
       }
       const captured = this.store.drain();

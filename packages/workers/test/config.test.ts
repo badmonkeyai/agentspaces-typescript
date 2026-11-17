@@ -108,3 +108,24 @@ test("fleet() drives the cell's RPC verbs with the core's schemas and payloads (
     expiresAtMillis: 5, tags: {}, taken: false }], "a string schema reads raw payloads");
   assert.throws(() => fleet({}, "NOPE"), /binding 'NOPE' is not a Durable Object namespace/);
 });
+
+test("the vars block carries the replication settings, absent ones stay absent, and a misspelt one is refused (srad/replication-by-entry.md §7.2)", () => {
+  const base = { AGENTSPACES_GROUP: "g", AGENTSPACES_SEEDS: "h" };
+  const plain = cellConfig(base);
+  for (const key of ["audit", "auditBudget", "auditSessions", "horizon"] as const) {
+    assert.equal(plain[key], undefined, `${key} is left to the peer's default`);
+  }
+  const set = cellConfig({ ...base, AGENTSPACES_AUDIT: "false", AGENTSPACES_AUDIT_BUDGET: "262144", AGENTSPACES_AUDIT_SESSIONS: "2",
+    AGENTSPACES_HORIZON: "legacy" });
+  assert.deepEqual([set.audit, set.auditBudget, set.auditSessions, set.horizon], [false, 256 * 1024, 2, "legacy"]);
+  assert.equal(cellConfig({ ...base, AGENTSPACES_AUDIT: "TRUE" }).audit, true, "as Java, the case does not matter");
+  const json = cellConfig({ ...base, AGENTSPACES_AUDIT: false, AGENTSPACES_AUDIT_BUDGET: 65536 });
+  assert.deepEqual([json.audit, json.auditBudget], [false, 65536], "wrangler's JSON vars read as their text");
+  const overridden = cellConfig({ ...base, AGENTSPACES_AUDIT: "false" }, { audit: true, horizon: "per-entry" });
+  assert.equal(overridden.audit, true, "an override wins over the vars");
+  assert.equal(overridden.horizon, "per-entry");
+  assert.throws(() => cellConfig({ ...base, AGENTSPACES_AUDIT: "yes" }), /AGENTSPACES_AUDIT is true or false/);
+  assert.throws(() => cellConfig({ ...base, AGENTSPACES_AUDIT_BUDGET: "1MB" }), /AGENTSPACES_AUDIT_BUDGET is a whole number/);
+  assert.throws(() => cellConfig({ ...base, AGENTSPACES_AUDIT_SESSIONS: "four" }), /AGENTSPACES_AUDIT_SESSIONS is a whole number/);
+  assert.throws(() => cellConfig({ ...base, AGENTSPACES_HORIZON: "per_entry" }), /AGENTSPACES_HORIZON is per-entry or legacy/);
+});

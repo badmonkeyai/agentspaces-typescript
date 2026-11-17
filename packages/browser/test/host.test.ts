@@ -273,10 +273,16 @@ test("the pause rule: the last active page's loss closes the channel and stops r
     await b.request({ t: "hello", config, pageId: "b", active: true });
     await until(() => service.peer.inbound.size === 1, "connected");
     const jobId = service.peer.writeEntry("tasks", TASK, { topic: "job", priority: 1 }, "hub");
-    const taken = await a.request({ t: "take", space: "tasks", schema: TASK, entryId: jobId, leaseMillis: 600,
+    // The host takes with a 600 ms settle window and judges the claim after it and a follow-up wait of up to
+    // 300 ms, so a 600 ms lease has always lapsed by then: the take is refused at once rather than running
+    // to its timeout for nothing.
+    await assert.rejects(a.request({ t: "take", space: "tasks", schema: TASK, entryId: jobId, leaseMillis: 600,
+      timeoutMillis: 5000, keepAlive: true }), /must exceed 900 ms/);
+    // A 1.5 s lease outlasts the 900 ms judgement with time to spare, and the 100 ms tick renews it at half-lease.
+    const taken = await a.request({ t: "take", space: "tasks", schema: TASK, entryId: jobId, leaseMillis: 1500,
       timeoutMillis: 5000, keepAlive: true });
     assert.equal(taken, jobId);
-    await sleep(1000);
+    await sleep(2000); // longer than the lease: only the tick's renewals keep the hold
     assert.equal(await service.peer.takeEntry("tasks", TASK, "hub", 60_000, 200, 500, null, jobId), null,
       "renewed past its lease while running");
     // One page hides: still running. Both hide: paused.
@@ -288,9 +294,9 @@ test("the pause rule: the last active page's loss closes the channel and stops r
     const paused = await a.request({ t: "status" }) as HostState;
     assert.equal(paused.paused, true);
     assert.equal(paused.reason, "no active page");
-    await assert.rejects(a.request({ t: "renewClaim", space: "tasks", entryId: jobId, leaseMillis: 600 }), /paused/);
+    await assert.rejects(a.request({ t: "renewClaim", space: "tasks", entryId: jobId, leaseMillis: 1500 }), /paused/);
     await assert.rejects(a.request({ t: "write", space: "tasks", schema: TASK, payload: cbor.dumps({ topic: "x" }), leaseMillis: 1000, tags: cbor.dumps({}) }), /paused/);
-    await sleep(900); // the claim lapses while paused
+    await sleep(1700); // the claim, last renewed before the pause for at most 1.5 s, lapses while paused
     assert.equal(await service.peer.takeEntry("tasks", TASK, "hub", 60_000, 200, 1500, null, jobId), jobId,
       "the claim did not outlive its lease: the hub takes the job");
     assert.equal(host.pauses, 1);
@@ -365,7 +371,11 @@ test("the snapshot round trip: a change is saved soon after, and a fresh host re
   const second = new ResidentHost({ shared: true, log: null });
   const again = attachPage(second);
   try {
-    await assert.rejects(again.request({ t: "hello", config, pageId: "b", active: true }), /no seed answered/, "no hub to dial");
+    // The page's replication settings (srad/replication-by-entry.md §7.2) reach the host's peer before it dials.
+    const tuned = { ...config, audit: false, auditBudget: 65536, auditSessions: 2, horizon: "legacy" as const };
+    await assert.rejects(again.request({ t: "hello", config: tuned, pageId: "b", active: true }), /no seed answered/, "no hub to dial");
+    assert.deepEqual([second.peer!.audit, second.peer!.auditBudget, second.peer!.auditSessions, second.peer!.horizon],
+      [false, 65536, 2, "legacy"]);
     assert.equal(second.identity!.peerId, state.peerId, "the same identity from the store");
     assert.ok(second.peer!.states.has(id), "the replica was restored from the snapshot");
     // The failed hello detached the page (its port answers nothing more); the host's own space reads the replica.

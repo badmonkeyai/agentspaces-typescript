@@ -29,6 +29,13 @@
  *     for (const task of space.readAll(new Template(Task, { priority: gte(3) }, { region: "eu" }))) { ... }
  *     const taken = await space.take(new Template(Task), "1m", "15s");
  *     taken?.complete(new Finding(taken.value.topic, "done"));
+ *
+ * Leases (SPEC §7.2, v0.1.35): a renewal never shortens. `Taken.renew` extends the take lease and `Subscription.renew`
+ * the subscription's, each to the later of its current expiry and now plus the extension; `peer.renewEntry` does the
+ * same for a write, for its issuer alone and only while the entry is present and unexpired. `Taken.release()` gives a
+ * taken entry back by letting its take lease lapse, and `peer.cancelEntry` ends a write sooner. Nothing here depends
+ * on how the peer replicates: it audits toward members whose cards carry `wire.ae=2` and collects withdrawals by their
+ * own lease under `wire.horizon=1`, both on by default (`peer.configureReplication`, docs/replication-by-entry.md).
  */
 
 import { Emitter, contextStore } from "./emitter.js";
@@ -306,9 +313,15 @@ export class Taken<T> {
   /**
    * Completes the take, writing `result` first (into the take space, or
    * `resultSpace`) so a caller correlating on it sees it with the completion.
+   * Throws, writing nothing, when the take no longer holds the entry: its lease
+   * lapsed, a better claim that reached this replica after the settle window
+   * displaced it, or the entry completed meanwhile (SPEC §7.4, the settle
+   * guarantee). The completion checked this before, but only after the result
+   * was written, so a displaced take left a second result.
    */
   complete(result: object | null = null, lease: number | string = "1h", tags: Dict = {},
            resultSpace: Space | null = null): string | null {
+    this.space.peer.requireHeld(this.space.name, this.entryId, this.space.agent);
     let resultId: string | null = null;
     if (result !== null) {
       resultId = (resultSpace ?? this.space).write(result, lease, tags);
@@ -317,10 +330,31 @@ export class Taken<T> {
     return resultId;
   }
 
+  /**
+   * Extends the take lease to at least `lease` from now (the take's own lease again when none is given), as Java's
+   * `TakenEntry.renew`: it never shortens the hold, so the new expiry is the later of the current one and now plus
+   * `lease` (SPEC §7.2, v0.1.35), and a renewal that would change nothing sends nothing. Throws when the take no
+   * longer holds the entry. Before v0.1.35 this renewed the entry's write lease, which only its issuer may renew.
+   */
   renew(lease: number | string | null = null): void {
+    if (this.released) {
+      throw new Error(`the take of ${this.entryId} was released; it holds nothing to renew`);
+    }
     const millis = lease === null ? this.leaseMillis : durationMillis(lease);
-    this.space.peer.renewEntry(this.space.name, this.entryId, millis, this.space.agent);
+    this.space.peer.renewClaim(this.space.name, this.entryId, millis, this.space.agent);
   }
+
+  /**
+   * Gives the entry back: this take renews it no more and lets its take lease lapse, after which the entry reappears
+   * for other takers, as Java's taker does. No shorter lease can travel, since a renewal never shortens and the claim
+   * lattice keeps the later of two equal claims' expiries, so the release is the lapse. A caller that wanted it back
+   * sooner takes with a shorter lease.
+   */
+  release(): void {
+    this.released = true;
+  }
+
+  private released = false;
 }
 
 // ------------------------------------------------------ return conventions
@@ -402,7 +436,11 @@ export class Subscription<T> extends Emitter {
     return !this.closed;
   }
 
-  /** Extends the lease (the same length again when none is given); a lapsed subscription stays closed. */
+  /**
+   * Extends the lease to at least `lease` from now (the same length again when none is given), never shorter (SPEC
+   * §7.2, v0.1.35, as a write lease): the subscription lapses at the later of its current expiry and now plus `lease`.
+   * A lapsed subscription stays closed.
+   */
   renew(lease: number | string | null = null): void {
     if (this.closed) {
       return;
@@ -412,6 +450,12 @@ export class Subscription<T> extends Emitter {
       return; // a watch without a lease never lapses
     }
     this.leaseMillis = millis;
+    const now = this.space.peer.now();
+    const until = Math.max(this.expiresAt ?? Number.NEGATIVE_INFINITY, now + millis);
+    if (this.expiry !== null && until === this.expiresAt) {
+      return; // it already runs that long
+    }
+    this.expiresAt = until;
     const timers = this.space.peer.timers;
     if (this.expiry !== null) {
       timers.clearTimeout(this.expiry);
@@ -419,8 +463,11 @@ export class Subscription<T> extends Emitter {
     this.expiry = timers.setTimeout(() => {
       this.expiry = null;
       this.close("lapsed");
-    }, millis);
+    }, until - now);
   }
+
+  /** When the subscription lapses, on the peer's clock; null for a watch without a lease. */
+  private expiresAt: number | null = null;
 
   close(reason = "closed"): void {
     if (this.closed) {
@@ -542,7 +589,11 @@ export class Space {
     }
   }
 
-  /** An exclusive take of one matching entry under the space's strategy; the bid function prices it under AUCTION. */
+  /**
+   * An exclusive take of one matching entry under the space's strategy; the bid function prices it under AUCTION.
+   * The take waits a 600 ms settle window and then up to 300 ms for a last pull to fold before it judges its claim,
+   * so its lease must be longer than 900 ms (a shorter one throws a RangeError); leave a margin for late timers.
+   */
   async take<T>(template: Template<T>, lease: number | string = "1m",
                 timeout: number | string = "15s"): Promise<Taken<T> | null> {
     const millis = durationMillis(lease);

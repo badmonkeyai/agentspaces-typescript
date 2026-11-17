@@ -25,6 +25,7 @@
  */
 
 import { Identity, Peer, Seed } from "@agentspaces/client";
+import type { ReplicationOptions } from "@agentspaces/client";
 import type { FrameChannel, Listener, ListenerHandle, Residency } from "@agentspaces/client";
 import { TcpListener } from "@agentspaces/client/node";
 import { WsListener } from "./ws-listener.js";
@@ -62,7 +63,7 @@ export type ServiceHostOptions = {
   log?: ((line: string) => void) | null;
   /** The clock, for tests of the drift rule. */
   clock?: () => number;
-};
+} & ReplicationOptions;
 
 /** Consecutive drifting ticks before the host drops to visitor duties, and the quiet span that restores them. */
 export const DRIFT_TICKS = 3;
@@ -96,6 +97,7 @@ export class ServiceHost {
   constructor(identity: Identity, group: string, options: ServiceHostOptions = {}) {
     this.clock = options.clock ?? Date.now;
     this.peer = new Peer(identity, group, this.clock);
+    this.peer.configureReplication(options); // audit, auditBudget and horizon (srad/replication-by-entry.md §7.2)
     this.tickMillis = options.tickMillis ?? 1000;
     this.seeds = options.seeds ?? [];
     this.listeners = options.listeners ?? [];

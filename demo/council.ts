@@ -92,16 +92,20 @@ async function main(): Promise<number> {
   const bound = new Binder(peer, { agent: agentIdentity }).bind(new Councillor());
   aggregate.start("load", value);
   aggregate.run(250);
+  // One settle watch for the whole run, as the Ruby worker keeps. A one-second awaitSettled
+  // inside the loop started a new watch each turn, and a new watch needs four ticks with fresh
+  // frames before its three-tick streak can close, which a one-second window at a 250 ms tick
+  // seldom holds, so this worker often ended with no estimate (R2, 2026-11-16).
   let settled: number | null = null;
+  aggregate.onEstimate((epoch) => epoch === "load", Settle.after(3, 0.01), (estimate) => {
+    if (settled === null) {
+      settled = estimate.value;
+      console.log(`  [ts] epoch load settled at ${estimate.value.toFixed(3)}`);
+    }
+  });
   const deadline = Date.now() + maxSeconds * 1000;
   try {
     while (Date.now() < deadline) {
-      if (settled === null) {
-        settled = await aggregate.awaitSettled("load", Settle.after(3, 0.01), 1000);
-        if (settled !== null) {
-          console.log(`  [ts] epoch load settled at ${settled.toFixed(3)}`);
-        }
-      }
       peer.pullSpace("tasks");
       peer.pullSpace("votes");
       await sleep(500);
