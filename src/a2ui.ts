@@ -21,7 +21,8 @@
  * classes whose fields are in Java's declared order, so a record encodes to the bytes the Java vectors pin; a version
  * 2 field is left out of a version 1 record. Each factory refuses what the Java constructor refuses. The
  * builders shape the components of the open catalogs as `Surfaces` does in Java: `titleBar`, `menu`, `split` of
- * agentspaces-viz, and `chat`, `fileTree`, `filePreview` of agentspaces-widgets.
+ * agentspaces-viz, and `chat`, `fileTree`, `filePreview` of agentspaces-widgets. They hold each component to A2UI 1.0
+ * as Java does: a binding is `{ "@path": ... }`, an id is an identifier, and a component's kept keys carry their `@`.
  */
 
 import { entry } from "./space.js";
@@ -234,16 +235,88 @@ export function chatProgress(v: { key: string; inReplyTo: string; agent: string;
   return p;
 }
 
-// ---- the component builders, each the shape Surfaces writes in Java
+// ---- the component builders, each the shape Surfaces writes in Java, held to A2UI 1.0 as Java holds them
 
 type Component = Record<string, unknown>;
+
+/** An A2UI 1.0 data binding: a JSON pointer into the surface's data model. v0.9.1's `{ path }` is not one. */
+export type Binding = { "@path": string };
+
+/**
+ * A2UI 1.0's component envelope keys (spec §2.9): the only `@`-prefixed keys at a component's top level. `id` and
+ * `component` stay bare. The open catalogs declare the first three on every component, so a builder takes them as options.
+ */
+export const ENVELOPE_KEYS = ["@catalogId", "@accessibility", "@metadata", "@checks"] as const;
+
+const ID = /^[\p{Alphabetic}_][\p{Alphabetic}\p{Nd}_]*$/u;
+
+/**
+ * Refuses a component id A2UI 1.0 refuses, naming a form it takes: an id is a Unicode identifier (UAX #31), so
+ * `barMenu` and `bar_menu` pass and `bar-menu` does not. Returns the id. Java's pen checks the same rule as it writes.
+ */
+export function componentId(id: string): string {
+  const s = String(id ?? "");
+  if (!ID.test(s)) {
+    const words = s.split(/[^\p{Alphabetic}\p{Nd}_]+/u).filter(w => w);
+    const hint = words.length ? words.reduce((a, b) => a + b[0].toUpperCase() + b.slice(1)) : "root";
+    throw new RangeError(`component id '${s}' is not an A2UI 1.0 identifier (UAX #31): use letters, digits and _ only, such as ${hint}`);
+  }
+  return s;
+}
+
+/** A key in 1.0's reserved single-`@` namespace, `^@([^@]|$)`; a doubled `@@` is a literal. */
+const reserved = (key: string): boolean => key.startsWith("@") && !key.startsWith("@@");
+
+/**
+ * Walks a value to its leaves as Java's `Surfaces.binding` does: v0.9.1's `{ path }` binding and `{ call }` function call
+ * are refused, naming where they sit, as is a key in 1.0's reserved `@` namespace other than `@path` and `@call` (a
+ * literal one is written doubled, `@@type`). An action's `context` is a record whose keys are names, so an entry called
+ * `path` there passes, and its values are walked like any other.
+ */
+function binding(where: string, value: unknown, keysAreNames = false): void {
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => binding(`${where}[${i}]`, v));
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  const m = value as Record<string, unknown>;
+  if (!keysAreNames && "path" in m && !("@path" in m)) throw new RangeError(`${where} binds with A2UI 1.0's {"@path": ...}, not v0.9.1's {"path": ...}`);
+  if (!keysAreNames && "call" in m && !("@call" in m)) throw new RangeError(`${where} calls a function with A2UI 1.0's {"@call": ...}, not v0.9.1's {"call": ...}`);
+  for (const [k, v] of Object.entries(m)) {
+    if (reserved(k) && k !== "@path" && k !== "@call") throw new RangeError(`${where}.${k} is a reserved A2UI 1.0 key; a literal key that starts with @ is written @${k}`);
+    binding(`${where}.${k}`, v, k === "context" && !keysAreNames && "name" in m);
+  }
+}
+
+/**
+ * Holds one built component to A2UI 1.0, as Java's `Surfaces.bindings` does: its id is an identifier, its kept keys
+ * carry their `@` (a bare `catalogId`, `accessibility`, `metadata` or `checks` is refused, naming the `@` key), no
+ * other top-level key starts with a single `@`, and every property is walked by {@link binding}. Returns the component.
+ */
+function checked(m: Component): Component {
+  const name = String(m.component);
+  componentId(String(m.id));
+  for (const [k, v] of Object.entries(m)) {
+    if ((ENVELOPE_KEYS as readonly string[]).includes("@" + k)) throw new RangeError(`${name}.${k} is A2UI 1.0's @${k} envelope key, not ${k}`);
+    if (reserved(k) && !(ENVELOPE_KEYS as readonly string[]).includes(k)) throw new RangeError(`${name}.${k} is a reserved A2UI 1.0 key; a component's top level takes only ${ENVELOPE_KEYS.join(", ")}`);
+    if (k !== "id" && k !== "component") binding(`${name}.${k}`, v);
+  }
+  return m;
+}
+
 const comp = (id: string, component: string): Component => ({ id, component });
 const putText = (m: Component, key: string, value: string | undefined | null) => { if (value && value.trim()) m[key] = value; };
 const sorted = (options: Record<string, unknown>): Record<string, unknown> => Object.fromEntries(Object.keys(options).sort().map(k => [k, options[k]]));
 
-/** Refuses an option a component does not take, or a word outside its list, as the Java builders check the catalog. */
+/**
+ * Refuses an option a component does not take, or a word outside its list, as the Java builders check the catalog.
+ * The envelope keys the open catalogs declare on every component (`@catalogId`, `@accessibility`, `@metadata`) are
+ * taken, and a bare one is refused naming its `@` key.
+ */
 function check(component: string, options: Record<string, unknown>, known: Record<string, readonly string[] | null>, max: Record<string, number> = {}) {
   for (const [k, v] of Object.entries(options)) {
+    if (k === "@catalogId" || k === "@accessibility" || k === "@metadata") continue;
+    if (!(k in known) && (ENVELOPE_KEYS as readonly string[]).includes("@" + k)) throw new RangeError(`${component}.${k} is A2UI 1.0's @${k} envelope key, not ${k}`);
     if (!(k in known)) throw new RangeError(`${component} has no property ${k}; it takes ${Object.keys(known).join(", ")}`);
     const words = known[k];
     if (words) for (const w of Array.isArray(v) ? v : [v]) if (!words.includes(String(w))) throw new RangeError(`${component}.${k} takes ${words.join(", ")}, not ${w}`);
@@ -251,8 +324,8 @@ function check(component: string, options: Record<string, unknown>, known: Recor
   }
 }
 
-/** The page's one bar: a title (a literal or `{ path }`), a subtitle, an icon, a status, buttons, and a menu by id. */
-export function titleBar(id: string, title: string | { path: string }, subtitle = "", icon = "", status?: Component | null, actions: Component[] = [], menu = ""): Component {
+/** The page's one bar: a title (a literal or `{ "@path": ... }`), a subtitle, an icon, a status, buttons, and a menu by id. */
+export function titleBar(id: string, title: string | Binding, subtitle = "", icon = "", status?: Component | null, actions: Component[] = [], menu = ""): Component {
   const m = comp(id, "TitleBar");
   m.title = title;
   putText(m, "subtitle", subtitle);
@@ -260,7 +333,7 @@ export function titleBar(id: string, title: string | { path: string }, subtitle 
   if (status && Object.keys(status).length) m.status = status;
   if (actions.length) m.actions = [...actions];
   putText(m, "menu", menu);
-  return m;
+  return checked(m);
 }
 
 /** A title bar's status: the path of the WorkingOn rows, and the words for working and for idle. */
@@ -284,7 +357,7 @@ export function menu(id: string, trigger: Component, items: Component[] | string
   const m = comp(id, "Menu");
   m.trigger = trigger;
   m.items = Array.isArray(items) ? [...items] : items;
-  return m;
+  return checked(m);
 }
 
 /** What opens a menu: `button`, `overflow`, or `context`, and its words. */
@@ -303,13 +376,16 @@ export function menuItem(id: string, label: string, actionName: string, more: Re
     else if (v !== null && v !== undefined && !(typeof v === "string" && !v.trim())) m[k] = v;
   }
   m.action = action;
+  binding("Menu.items[]", m);
   return m;
 }
 
 /** A submenu: an item whose items open beside it, one level deep. */
 export function submenu(id: string, label: string, items: Component[]): Component {
   for (const i of items) if ("items" in i) throw new RangeError(`a menu has one level of submenu: ${i.id} holds items of its own`);
-  return { id, label, items: [...items] };
+  const m: Component = { id, label, items: [...items] };
+  binding("Menu.items[]", m);
+  return m;
 }
 
 /** Two or three panes, side by side or one over another, kept under `persist`, stacked below `stackBelow` pixels. */
@@ -322,7 +398,7 @@ export function split(id: string, orientation: "horizontal" | "vertical" | "" = 
   putText(m, "persist", persist);
   if (stackBelow > 0) m.stackBelow = stackBelow;
   m.panes = [...panes];
-  return m;
+  return checked(m);
 }
 
 /** One pane of a split: its id, its child (blank for an empty pane), its share, its minimum in pixels, whether it collapses, and its name. */
@@ -345,10 +421,24 @@ const PREVIEW = { files: null, maxBytes: null, csvRows: null, kinds: ["text/plai
 /** The one agentic chat of agentspaces-widgets: the agent named over the thread, its key, and its other options. */
 export function chat(id: string, agent: string, key: string, options: Record<string, unknown> = {}): Component {
   check("Chat", options, CHAT, { max: 1000 });
+  suggestions(options.suggestions);
   const m = comp(id, "Chat");
   putText(m, "agent", agent);
   m.key = key ?? "";
-  return Object.assign(m, sorted(options));
+  return checked(Object.assign(m, sorted(options)));
+}
+
+/**
+ * A Chat's `suggestions` is a list of strings, or one binding `{ "@path": "/..." }` to the rows the agent writes, as the
+ * catalog's `oneOf` says; anything else is refused here, and an old form is named by {@link binding}.
+ */
+function suggestions(value: unknown): void {
+  if (value === undefined || value === null) return;
+  binding("Chat.suggestions", value);
+  if (Array.isArray(value) && value.every(v => typeof v === "string")) return;
+  const m = value as Record<string, unknown>;
+  if (m && typeof m === "object" && !Array.isArray(m) && Object.keys(m).length === 1 && typeof m["@path"] === "string" && (m["@path"] as string).startsWith("/")) return;
+  throw new RangeError(`Chat.suggestions is a list of strings or one binding {"@path": "/..."} to the agent's rows, not ${JSON.stringify(value)}`);
 }
 
 /** A tree of files over the SharedFile rows at `reads`. */
@@ -356,13 +446,13 @@ export function fileTree(id: string, reads = "/files", options: Record<string, u
   check("FileTree", options, TREE);
   const m = comp(id, "FileTree");
   m.reads = reads || "/files";
-  return Object.assign(m, sorted(options));
+  return checked(Object.assign(m, sorted(options)));
 }
 
-/** One file by its media type: a file id, or `{ path }` where a tree puts the person's choice. */
-export function filePreview(id: string, file: string | { path: string }, options: Record<string, unknown> = {}): Component {
+/** One file by its media type: a file id, or `{ "@path": ... }` where a tree puts the person's choice. */
+export function filePreview(id: string, file: string | Binding, options: Record<string, unknown> = {}): Component {
   check("FilePreview", options, PREVIEW, { maxBytes: 16777216, csvRows: 5000 });
   const m = comp(id, "FilePreview");
   m.file = file;
-  return Object.assign(m, sorted(options));
+  return checked(Object.assign(m, sorted(options)));
 }

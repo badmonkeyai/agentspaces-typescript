@@ -74,9 +74,9 @@ test("a writer writes version 2 only when every reader advertises the hint (FR-1
 
 test("the builders shape the six components as the Java Surfaces does", () => {
   const status = a2ui.titleStatus("/working", "Agent working", "Ready");
-  assert.deepEqual(a2ui.titleBar("bar", { path: "/app/title" }, "Claims desk", "briefcase", status, [a2ui.titleAction("share", "Share", "share", "share")], "bar-menu"), {
-    id: "bar", component: "TitleBar", title: { path: "/app/title" }, subtitle: "Claims desk", icon: "briefcase", status: { from: "/working", labels: { working: "Agent working", idle: "Ready" } },
-    actions: [{ id: "share", label: "Share", icon: "share", action: { name: "share" } }], menu: "bar-menu" });
+  assert.deepEqual(a2ui.titleBar("bar", { "@path": "/app/title" }, "Claims desk", "briefcase", status, [a2ui.titleAction("share", "Share", "share", "share")], "barMenu"), {
+    id: "bar", component: "TitleBar", title: { "@path": "/app/title" }, subtitle: "Claims desk", icon: "briefcase", status: { from: "/working", labels: { working: "Agent working", idle: "Ready" } },
+    actions: [{ id: "share", label: "Share", icon: "share", action: { name: "share" } }], menu: "barMenu" });
   assert.deepEqual(Object.keys(a2ui.titleBar("bar", "Workbench")), ["id", "component", "title"]);
   const items = [a2ui.menuItem("new-chat", "New chat", "chat.new", { shortcut: "Ctrl+Shift+O" }), a2ui.submenu("share", "Share", [a2ui.menuItem("copy", "Copy link", "share.link")])];
   assert.deepEqual(a2ui.menu("more", a2ui.trigger("overflow", "More"), items), { id: "more", component: "Menu", trigger: { kind: "overflow", label: "More" }, items: [
@@ -93,7 +93,34 @@ test("the builders shape the six components as the Java Surfaces does", () => {
   assert.throws(() => a2ui.chat("chat", "a", "main", { colour: "red" }), /colour/);
   assert.deepEqual(a2ui.fileTree("tree", "/files", { working: "/working", upload: true, chat: "chat" }), { id: "tree", component: "FileTree", reads: "/files", chat: "chat", upload: true, working: "/working" });
   assert.throws(() => a2ui.fileTree("tree", "/files", { actions: ["burn"] }), /actions/);
-  assert.deepEqual(a2ui.filePreview("preview", { path: "/selected/file" }, { files: "/files", csvRows: 500 }), { id: "preview", component: "FilePreview", file: { path: "/selected/file" }, csvRows: 500, files: "/files" });
+  assert.deepEqual(a2ui.filePreview("preview", { "@path": "/selected/file" }, { files: "/files", csvRows: 500 }), { id: "preview", component: "FilePreview", file: { "@path": "/selected/file" }, csvRows: 500, files: "/files" });
   assert.throws(() => a2ui.filePreview("preview", "f-1", { maxBytes: 17000000 }), /16 MiB/);
   assert.throws(() => a2ui.filePreview("preview", "f-1", { kinds: ["text/html"] }), /kinds/);
+});
+
+test("the builders hold a component to A2UI 1.0 as Java's do", () => {
+  // v0.9.1's binding and call are refused wherever they sit, naming the place
+  assert.throws(() => a2ui.titleBar("bar", { path: "/title" } as never), /TitleBar\.title binds with A2UI 1\.0's \{"@path"/);
+  assert.throws(() => a2ui.filePreview("preview", { path: "/selected/file" } as never), /FilePreview\.file binds/);
+  assert.throws(() => a2ui.menuItem("pin", "Pin", "pin", { checked: { path: "/pinned" } }), /Menu\.items\[\]\.checked binds/);
+  assert.throws(() => a2ui.menuItem("go", "Go", "go", { context: { row: { call: "now", args: {} } } }), /context\.row calls a function with A2UI 1\.0's \{"@call"/);
+  // an action's context keys are names: an entry called path with a literal passes, and 1.0's forms pass
+  assert.doesNotThrow(() => a2ui.menu("more", a2ui.trigger("overflow"), [a2ui.menuItem("go", "Go", "go", { context: { path: "/docs/a", row: { "@path": "/row" } } })]));
+  // an id is an identifier
+  assert.throws(() => a2ui.split("main-split", "horizontal", "", 0, [a2ui.pane("a", "x", 0.5), a2ui.pane("b", "y", 0.5)]), /not an A2UI 1\.0 identifier.*mainSplit/);
+  assert.equal(a2ui.componentId("bar_menu"), "bar_menu");
+  assert.equal(a2ui.componentId("Überblick2"), "Überblick2");
+  // the kept keys take their @; a bare one is named, and the @ ones are options every open component takes
+  for (const bare of ["catalogId", "accessibility", "metadata"]) {
+    assert.throws(() => a2ui.fileTree("tree", "/files", { [bare]: {} }), new RegExp(`FileTree\\.${bare} is A2UI 1\\.0's @${bare} envelope key`));
+  }
+  assert.deepEqual(a2ui.fileTree("tree", "/files", { "@accessibility": { label: "Files" } }),
+    { id: "tree", component: "FileTree", reads: "/files", "@accessibility": { label: "Files" } });
+  // below the top level a single @ is reserved; doubled, it is a literal
+  assert.throws(() => a2ui.menuItem("go", "Go", "go", { context: { row: { "@type": "Claim" } } }), /context\.row\.@type is a reserved A2UI 1\.0 key.*@@type/);
+  assert.doesNotThrow(() => a2ui.menuItem("go", "Go", "go", { context: { row: { "@@type": "Claim" } } }));
+  // a Chat's suggestions: strings, or one 1.0 binding to the agent's rows
+  assert.deepEqual(a2ui.chat("chat", "a", "main", { suggestions: { "@path": "/followups" } }).suggestions, { "@path": "/followups" });
+  assert.throws(() => a2ui.chat("chat", "a", "main", { suggestions: { path: "/followups" } }), /Chat\.suggestions binds/);
+  assert.throws(() => a2ui.chat("chat", "a", "main", { suggestions: { "@path": "/followups", extra: 1 } }), /list of strings or one binding/);
 });
