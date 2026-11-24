@@ -40,7 +40,7 @@ const hex = (name: string): Uint8Array => {
 };
 
 test("the closed values are the four connection kinds and idp or none", () => {
-  assert.deepEqual([...records.APP_CARD_KINDS], ["peer", "fed", "gateway", "assembled"]);
+  assert.deepEqual([...records.APP_CARD_KINDS], ["peer", "fed", "gateway", "assembled", "dynamic"]);
   assert.deepEqual([...records.APP_CARD_SIGN_ONS], ["idp", "none"]);
   assert.deepEqual([...records.APP_CARD_SHAPES], ["web", "desktop", "static", "a2ui"]);
   assert.deepEqual([...records.APP_CARD_TRANSPORTS], ["views", "a2a"]);
@@ -49,7 +49,7 @@ test("the closed values are the four connection kinds and idp or none", () => {
 });
 
 test("the accept vectors read strictly and re-encode byte for byte", () => {
-  for (const name of ["app_card_host_cbor", "app_card_origin_formats_cbor", "app_card_spill_cbor"]) {
+  for (const name of ["app_card_host_cbor", "app_card_origin_formats_cbor", "app_card_spill_cbor", "app_card_dynamic_cbor"]) {
     const raw = hex(name);
     assert.deepEqual(dumps(records.decodeRecord(raw, records.APP_CARD)), raw, name);
   }

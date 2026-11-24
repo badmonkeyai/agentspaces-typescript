@@ -568,7 +568,7 @@ export const CARD_ACTION = schema("CardAction", required([["name", "String"], ["
 // its decoder calls. A closed value this build does not know makes the card undecodable (§6.1b, Unknown values).
 
 /** How an app connects: a member, fed by an agent, behind the A2A gateway, or a static app that reads nothing live. */
-export const APP_CARD_KINDS = ["peer", "fed", "gateway", "assembled"] as const;
+export const APP_CARD_KINDS = ["peer", "fed", "gateway", "assembled", "dynamic"] as const;   // v0.1.38 adds dynamic
 export const APP_CARD_SHAPES = ["web", "desktop", "static", "a2ui"] as const;
 export const APP_CARD_TRANSPORTS = ["views", "a2a"] as const;
 /** `idp`, the identity provider of whoever runs the host, enforced at its door; or `none`. */
