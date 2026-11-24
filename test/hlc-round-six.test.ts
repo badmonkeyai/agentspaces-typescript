@@ -483,16 +483,28 @@ test("R10: claims for entries the replica collected or never held go once they e
 
 test("R10: a replica that holds only claims still runs its collector, so their expiry drops them", () => {
   const peer = new ClockPeer();
-  const runs: (() => void)[] = [];
-  peer.timers = { setTimeout: () => 0, clearTimeout: () => undefined,
-    every: (_period, fn) => { runs.push(fn); return { lastDriftMillis: 0, lateRuns: 0, stop: () => undefined }; } };
+  // Hand-run timers on the test's clock (the collection is due work since SPEC v0.1.36 §9.5: it arms a timeout at the
+  // earliest claim lapse, where it was a 1 s ticker): `runs` fires every timeout due by the clock.
+  const timeouts: Array<{ at: number; fn: () => void }> = [];
+  peer.timers = { now: () => peer.now(), clearTimeout: () => undefined,
+    setTimeout: (fn, millis) => { timeouts.push({ at: peer.now() + millis, fn }); return timeouts.length; },
+    every: () => ({ lastDriftMillis: 0, lateRuns: 0, stop: () => undefined }) };
+  const fireDue = (): void => {
+    for (let guard = 0; guard < 100; guard++) {
+      const i = timeouts.findIndex((t) => t.at <= peer.now());
+      if (i < 0) {
+        return;
+      }
+      timeouts.splice(i, 1)[0]!.fn();
+    }
+  };
   const holder = Identity.generate();
   const spaceId = String(((writtenState(holder))["record"] as Dict)["spaceId"]);
   peer.rumor(holder, wire.claimDelta("never-held", claimOn(holder, "never-held", spaceId, `${NOW}:0:${holder.peerId}`, 1,
     NOW + 1_000)));
   assert.equal(peer.claims.size, 1);
   peer.millis = NOW + 1_500;
-  runs.forEach((run) => run());
+  fireDue();
   assert.equal(peer.claims.size, 0);
 });
 

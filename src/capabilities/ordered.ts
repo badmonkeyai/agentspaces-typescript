@@ -138,15 +138,15 @@ export class OrderedLog {
     const peer = this.peer;
     const holder = agent !== null ? agent.agentId : peer.identity.agent(agentName);
     const spaceId = spaceIdLocal(`${peer.group}/${space}`);
-    const deadline = Date.now() + timeoutMillis;
-    let lastPull = 0;
-    while (Date.now() < deadline) {
-      if (Date.now() - lastPull >= 600) {
-        lastPull = Date.now();
+    const deadline = peer.monotonic() + timeoutMillis;
+    let lastPull = Number.NEGATIVE_INFINITY;
+    while (peer.monotonic() < deadline) {
+      if (peer.monotonic() - lastPull >= 600) {
+        lastPull = peer.monotonic();
         peer.pullAds();
         peer.pullSpace(space);
       }
-      await peer.awaitFold(Math.min(600, deadline - Date.now()));
+      await peer.awaitFold(Math.min(600, deadline - peer.monotonic()));
       const now = peer.now();
       for (const [entryId, dto] of peer.states) {
         const record = dto["record"] as Dict | undefined;
@@ -181,9 +181,9 @@ export class OrderedLog {
         // the caller gave up would otherwise hold the entry for its whole lease with nobody to adopt it
         // (the 0.6.0 regression, 2026-11-10; OrderedTakesClusterTest
         // aClaimTheLogCommitsAfterTheTakersTimeoutStillHandsTheEntryToTheTaker).
-        const attemptDeadline = Date.now() + ATTEMPT_MILLIS;
-        while (Date.now() < attemptDeadline) {
-          await peer.awaitFold(Math.min(600, attemptDeadline - Date.now()));
+        const attemptDeadline = peer.monotonic() + ATTEMPT_MILLIS;
+        while (peer.monotonic() < attemptDeadline) {
+          await peer.awaitFold(Math.min(600, attemptDeadline - peer.monotonic()));
           const decided = peer.claims.get(entryId)?.["claim"] as Dict | undefined;
           if (decided && Number(decided["epoch"]) >= epoch) {
             if (decided["holder"] === holder && Number(decided["epoch"]) === epoch
@@ -192,8 +192,8 @@ export class OrderedLog {
             }
             break; // someone else won this generation; try another entry
           }
-          if (Date.now() - lastPull >= 600) {
-            lastPull = Date.now();
+          if (peer.monotonic() - lastPull >= 600) {
+            lastPull = peer.monotonic();
             peer.pullSpace(space);
           }
         }

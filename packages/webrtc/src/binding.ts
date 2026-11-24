@@ -184,6 +184,8 @@ class WebRtcChannel implements FrameChannel {
     }
     if (frame !== null) {
       this.events.deliver(frame);
+    } else {
+      this.events.progress(); // a chunk of a frame still arriving (owner decision 4 of 2026-11-23)
     }
   }
 
@@ -236,6 +238,10 @@ class WebRtcChannel implements FrameChannel {
 
   onClose(listener: (reason: string) => void): void {
     this.events.onClose(listener);
+  }
+
+  onProgress(listener: () => void): void {
+    this.events.onProgress(listener);
   }
 
   close(): void {

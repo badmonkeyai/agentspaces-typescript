@@ -299,13 +299,13 @@ export class KeyTickets {
    * null when still undecided, which the caller treats as "release and retry".
    */
   async awaitFirstCommitted(key: string): Promise<string | null> {
-    const deadline = Date.now() + Math.max(1000, this.takeLeaseMillis / 2);
+    const deadline = this.space.peer.monotonic() + Math.max(1000, this.takeLeaseMillis / 2);
     for (;;) {
       const firing = this.decided(key);
       if (firing !== null) {
         return firing;
       }
-      if (Date.now() >= deadline || !this.active) {
+      if (this.space.peer.monotonic() >= deadline || !this.active) {
         return null;
       }
       await pause(this.space.peer, 20);
@@ -345,13 +345,13 @@ export class KeyTickets {
    * resolved by then (release and retry).
    */
   async awaitEarliestLive(key: string, mine: string): Promise<string | null> {
-    const deadline = Date.now() + Math.max(1000, this.takeLeaseMillis / 2);
+    const deadline = this.space.peer.monotonic() + Math.max(1000, this.takeLeaseMillis / 2);
     for (;;) {
       const earliest = this.earliestLive(key);
       if (earliest !== null && (this.committed.get(key) ?? []).includes(mine)) {
         return earliest;
       }
-      if (Date.now() >= deadline || !this.active) {
+      if (this.space.peer.monotonic() >= deadline || !this.active) {
         return null;
       }
       await pause(this.space.peer, 20);
@@ -366,7 +366,7 @@ export class KeyTickets {
       return;
     }
     this.resolvedClaims.add(mark);
-    this.pendingClaims.push({ entryId, stamp, sinceMillis: Date.now() });
+    this.pendingClaims.push({ entryId, stamp, sinceMillis: this.space.peer.monotonic() });
     if (this.pendingClaims.length > READ_LIMIT * 4) {
       this.pendingClaims.shift();
     }
@@ -384,7 +384,7 @@ export class KeyTickets {
     if (this.pendingClaims.length === 0) {
       return;
     }
-    const now = Date.now();
+    const now = this.space.peer.monotonic();
     const peer = this.space.peer;
     this.pendingClaims.sort((a, b) => compareHlc(a.stamp, b.stamp));
     const rest: typeof this.pendingClaims = [];
@@ -721,12 +721,12 @@ export class JoinBinding {
    * the ticket it holds.
    */
   private async fireWhenPartsReadable(key: string): Promise<boolean> {
-    const deadline = Date.now() + Math.min(this.config.takeLeaseMillis / 2, 5000);
+    const deadline = this.config.space.peer.monotonic() + Math.min(this.config.takeLeaseMillis / 2, 5000);
     for (;;) {
       if (await this.fire(key)) {
         return true;
       }
-      if (Date.now() >= deadline || !this.running) {
+      if (this.config.space.peer.monotonic() >= deadline || !this.running) {
         return false;
       }
       await pause(this.config.space.peer, 20);

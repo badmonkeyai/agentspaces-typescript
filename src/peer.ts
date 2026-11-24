@@ -44,6 +44,8 @@ import { DIALER_PACKAGES, Dialer, FrameChannel, defaultDialers } from "./transpo
 import "./transport/defaults.js";
 import { Seed, schemeOf, seedUrl } from "./seed.js";
 import { Repeating, TimerPort, systemTimers } from "./platform.js";
+import { DueLoop, Watchdog, monotonicMillis, monotonicOf } from "./time.js";
+import { RedialTable } from "./redial.js";
 import { AuditedSets, TrackedMap } from "./audited.js";
 import type { Holding } from "./audited.js";
 import { BUDGET_CEILING, LATE_COPY_MILLIS, TrieAudit } from "./audit.js";
@@ -287,6 +289,127 @@ export const MAX_TRACKED_LEASE_MILLIS = 24 * 60 * 60_000;
 
 /** How often a replica collects its tombstones (SPEC §7.3). */
 const COLLECT_PERIOD_MILLIS = 1000;
+/** The tombstone collection's name on the peer's loop. */
+const COLLECT_TASK = "collect";
+
+/**
+ * A forward wall step longer than this is a resume (SPEC v0.1.36 §9.5): the 30 s member TTL a 0.6.0 Java member judges
+ * this peer by, the keepalive bound every Java member keeps; a peer silent that long may have left other members' views.
+ */
+export const RESUME_STEP_MILLIS = 30_000;
+/**
+ * The dead-seed rule for a dial-only link (owner decision 1 of 2026-11-23): a dialed channel this peer has read nothing
+ * from for this long is asked with a PING to the seed, which answers every PING at once (SPEC §5.2). 1.5 times the
+ * 30 s keepalive bound a member keeps, so a live seed in a quiet group is asked rarely, and a seed whose own probes or
+ * relayed PINGs keep the link busy is never asked.
+ */
+export const LINK_QUIET_MILLIS = 45_000;
+/**
+ * A link asked and still silent this long after the PING is dead: a seed that left without a FIN (power loss, a
+ * partition, a laptop moved to another network) is otherwise read from until TCP gives up, minutes later, so this peer
+ * would not fail over and its relay.via would go on naming a holder that is gone. The channel is closed and the close
+ * signal fails over to another seed (the silent one is dialled last). This is the ping timeout,
+ * 2 s, the one a prober gives each PING (SPEC §9.4, the core's `GroupMembership`), as the decision names it and as
+ * Python's `LINK_ANSWER_S` keeps it.
+ */
+export const LINK_ANSWER_MILLIS = 2_000;
+/**
+ * How long a wake holds off judging the members whose advertisement lapsed while this peer did not run (owner decision
+ * 3 of 2026-11-23): each is PINGed first, and dropped only if it stays silent this long. 1.5 times the 2 s ping timeout
+ * ({@link LINK_ANSWER_MILLIS}), since the PING and its answer may each cross the seed.
+ */
+export const WAKE_PROBE_MILLIS = 3_000;
+/**
+ * The bucket a dial-only peer answers each asker's relayed or non-seed DIGESTs from (owner decision 1 of 2026-11-23):
+ * at most this many at once, refilled at {@link RELAYED_ANSWER_PER_SECOND}, one bucket per asker (the cross-client
+ * check of 2026-11-23: a shared bucket let one member flooding relayed DIGESTs starve every winner's targeted round).
+ * The Rust figures; the same in every client.
+ */
+export const RELAYED_ANSWER_BURST = 16;
+export const RELAYED_ANSWER_PER_SECOND = 4;
+/** At most this many askers' buckets are kept; the one asked least recently goes first. */
+export const RELAYED_ANSWER_ASKERS = 1_024;
+/**
+ * How long a member that answered a wake's probe is kept with a lapsed advertisement, waiting for a fresh one (the
+ * wake's view pull, or the member's own refresh): 1.5 times the 60 s refresh a dial-only member keeps
+ * ({@link SELF_AD_REFRESH_MILLIS}). It is judged by its advertisement again after that.
+ */
+export const WAKE_KEEP_MILLIS = 90_000;
+/**
+ * The connection attempt delay between the starts of two seed dials (owner decision 2 of 2026-11-23, RFC 8305 Happy
+ * Eyeballs): the seeds are dialled in list order, one start every 250 ms, and a dial that fails starts the next at once.
+ */
+export const SEED_STAGGER_MILLIS = 250;
+/** The most seed dials of one round in flight at once (a seed name may expand to many addresses), as Rust, Python and Ruby. */
+export const SEED_DIALS_IN_FLIGHT_MAX = 16;
+/** The due-work task that judges the dialed link by the dead-seed rule. */
+const SEED_LINK_TASK = "seed-link";
+/** The task that re-leases this peer's self-advertisement while a dialed link holds (see {@link SELF_AD_REFRESH_MILLIS}). */
+const SELF_AD_TASK = "self-ad";
+/**
+ * How often a dial-only peer re-issues its self-advertisement on its link (SPEC §5.2: every member periodically
+ * republishes it). A member that dropped this peer for silence (a sleep, a lost relay) admits it again only on an
+ * advertisement issued after the drop, and a peer that re-issued nothing while its link held stayed out of that view
+ * for good (the mixed idle run of 2026-11-23: a Java member slept 60 s never held the TypeScript members again).
+ * The rumor is flooded by the seed, so card readers of other dial-only members hold a live card too.
+ */
+export const SELF_AD_REFRESH_MILLIS = 60_000;
+
+/**
+ * How long a relayed probe waits for the target's ACK before it is forgotten. A prober waits one ping timeout for the
+ * relay's answer (about a second in the reference implementation); 10 s is generous, and only bounds memory.
+ */
+export const RELAY_HOLD_MILLIS = 10_000;
+/** The most PING_REQ relays held at once; past it the eldest is forgotten. */
+export const MAX_RELAYS = 4_096;
+
+/** At most this many displaced claims, or unproven completions, per entry (SPEC §7.4; Java DISPLACED_PER_ENTRY). */
+export const DISPLACED_PER_ENTRY = 4;
+/** At most this many offers of one displaced claim (Java REOFFER_MAX). */
+export const REOFFER_MAX = 6;
+/** The first backoff between offers of a displaced claim; it doubles after each (Java REOFFER_BACKOFF_MILLIS). */
+export const REOFFER_BACKOFF_MILLIS = 1_000;
+/** At most this many entries per settle map; past it the eldest goes (Java OUTBID_COMPLETIONS_CAP). */
+export const SETTLE_LINES_CAP = 1_024;
+/**
+ * At most this many targeted anti-entropy rounds toward the holders one entry's winning claim displaced (Java
+ * DISPLACED_PULL_MAX, owner decision 4 of 2026-11-23): at once, then after 1, 2, 4, 8 and 16 s.
+ */
+export const DISPLACED_PULL_MAX = 6;
+/** The due-work task that opens the targeted rounds toward displaced holders. */
+const DISPLACED_PULL_TASK = "displaced-pull";
+
+/** Forgets the eldest lines of an insertion-ordered map past SETTLE_LINES_CAP. */
+function capLines(map: Map<string, unknown>): void {
+  while (map.size > SETTLE_LINES_CAP) {
+    map.delete(map.keys().next().value as string);
+  }
+}
+
+/** The peer part of a claim's holder (`<peer>/<agent>`). */
+function holderPeer(claim: Dict): string {
+  const holder = String(claim["holder"] ?? "");
+  const slash = holder.indexOf("/");
+  return slash < 0 ? holder : holder.substring(0, slash);
+}
+
+/** Whether two claims are the same claim (every field). */
+function sameClaim(a: Dict, b: Dict): boolean {
+  return equals(dumps(a), dumps(b));
+}
+
+/** One watchdog per timer port: the runtime's timers share one per process, a test's virtual time has its own. */
+const watchdogs = new WeakMap<object, Watchdog>();
+
+/** The shared watchdog of a timer port. */
+export function watchdogFor(timers: TimerPort): Watchdog {
+  let dog = watchdogs.get(timers);
+  if (dog === undefined) {
+    dog = new Watchdog(timers);
+    watchdogs.set(timers, dog);
+  }
+  return dog;
+}
 
 /**
  * After its settle window a take pulls the space once more and waits up to this long for the answer to fold,
@@ -367,8 +490,17 @@ export class Peer {
   /** How many rumor keys stay remembered for duplicate suppression: a cache size, not a cap on anything. */
   rumorMemory = 65_536;
   private readonly rumorsSeen = new Set<string>();
-  /** PING_REQ relays in flight: the relay nonce to who asked, their nonce, and the target vouched for. */
-  private readonly relays = new Map<string, { origin: string; originNonce: number | bigint; target: string }>();
+  /**
+   * PING_REQ relays in flight: the relay nonce to who asked, their nonce, the target vouched for, and when the relay's
+   * PING went out on the monotonic clock. Bounded by time ({@link RELAY_HOLD_MILLIS}) and size ({@link MAX_RELAYS}):
+   * under the targeted relay (SPEC v0.1.36 §5.2) a member named in `relay.via` receives about one PING_REQ per prober
+   * per quiet cycle for each dial-only peer it holds, and a target that never answers must not grow the table.
+   */
+  private readonly relays = new Map<string, { origin: string; originNonce: number | bigint; target: string; at: number }>();
+  /** PING_REQs dropped because this peer holds no route to the target (no link, no dialed channel). */
+  pingReqsUnroutable = 0;
+  /** Relays forgotten unanswered past their hold, or evicted by the size bound. */
+  relaysExpired = 0;
   /** Frames sent under a session key rather than a signature. */
   sessionFramesSent = 0;
   /** Session hellos ignored as older than the hello age window (never a strike). */
@@ -449,6 +581,237 @@ export class Peer {
   timers: TimerPort = systemTimers;
   private readonly repeating: Repeating[] = [];
 
+  /** This peer's monotonic clock, for local periods (SPEC v0.1.36 §9.5): its timers' `now()`, else the runtime's. */
+  monotonic(): number {
+    return monotonicOf(this.timers)();
+  }
+
+  private dueLoop: DueLoop | null = null;
+  private unwatchLoop: (() => void) | null = null;
+
+  /**
+   * This peer's due work (srad/agentspaces-event-loop.md §3.2, parity for this client): one sequential loop on this
+   * peer's timers that runs each task when its deadline falls due or when a fold wakes it, in place of fixed-rate
+   * tickers. Made on first use, on the timers installed then (a test installs {@link VirtualTime} first), watched by
+   * the {@link watchdog}, and stopped by {@link close}. Hosts add their own tasks to it.
+   */
+  get loop(): DueLoop {
+    if (this.dueLoop === null) {
+      const loop = new DueLoop(this.timers, {
+        wall: () => this.now(),
+        name: `peer ${this.identity.peerId.slice(0, 12)}`,
+        log: (line) => this.onLoopLog?.(line),
+        onWallStep: (step) => this.onWallStep(step),
+        onLateWake: (late) => this.onLateWake(late),
+      });
+      this.dueLoop = loop;
+      this.unwatchLoop = (this.watchdog ?? watchdogFor(this.timers)).watch(loop);
+    }
+    return this.dueLoop;
+  }
+
+  /** Re-arms the loop {@link close} paused (a peer that dials again keeps its tasks), or makes it. */
+  private openLoop(): void {
+    const loop = this.loop;
+    if (loop.isPaused) {
+      loop.resume();
+      this.unwatchLoop = (this.watchdog ?? watchdogFor(this.timers)).watch(loop);
+    }
+  }
+
+  /** The watchdog this peer's loop registers with; the per-timers shared one when null (one per process for real time). */
+  watchdog: Watchdog | null = null;
+  /** Where the loop reports a failed task or a re-arm; nowhere by default. */
+  onLoopLog: ((line: string) => void) | null = null;
+  /** Wall steps longer than {@link RESUME_STEP_MILLIS} forward this peer answered with a resume (SPEC §9.5). */
+  resumes = 0;
+
+  /**
+   * A wall step the loop saw (an NTP step, or a suspend that the monotonic clock did not count). Every deadline the
+   * loop holds is asked again by the loop itself. A forward step longer than the member TTL other members judge this
+   * peer by is a resume (SPEC §9.5, EL-C-14): this peer re-introduces itself on every link at once and pulls the view,
+   * so it rejoins without waiting for a probe cycle, and PINGs its seed under the dead-seed rule ({@link resume}).
+   */
+  protected onWallStep(stepMillis: number): void {
+    this.onWallStepListeners.forEach((listener) => listener(stepMillis));
+    if (stepMillis > RESUME_STEP_MILLIS) {
+      this.resume();
+    }
+  }
+
+  /**
+   * The watchdog's tick came back `lateMillis` past its period with no wall step: a runtime whose monotonic clock
+   * counts a suspend (some browsers' `performance.now()`), or a process frozen that long. The members have judged this
+   * peer silent just the same, so it is a resume too.
+   */
+  protected onLateWake(lateMillis: number): void {
+    this.onLateWakeListeners.forEach((listener) => listener(lateMillis));
+    if (lateMillis >= RESUME_STEP_MILLIS) {
+      this.lateWakeResumes += 1;
+      this.resume();
+    }
+  }
+
+  /** Resumes started by a late watchdog tick rather than a wall step. */
+  lateWakeResumes = 0;
+
+  /**
+   * Re-introduces this peer after a suspend (SPEC §9.5, EL-C-14) and checks its seed (owner decision 3 of 2026-11-23).
+   * With the link up, the seed is PINGed and the dead-seed rule applies: no frame within the ping timeout
+   * ({@link LINK_ANSWER_MILLIS}) closes the link and fails over at once. With no link, the seeds are dialled at once.
+   * Either way the redial table starts again from its first wait.
+   */
+  private resume(): void {
+    if (this.running) {
+      this.resumes += 1;
+      this.redialTable.reset(); // a wake redials at once, and any later wait starts from the table's first
+      if (this.channel !== null) {
+        // The socket may be dead without knowing it, and the seed may have dropped this peer while it slept. A PING
+        // costs one frame where a redial costs a handshake, and the same rule judges the link as everywhere else.
+        // A PING already waiting is not sent again (as every client): it becomes the wake's ask.
+        if (this.seedAskedAt === null) {
+          this.wakePings += 1;
+          this.askSeed(this.monotonic());
+          this.seedVerdictFor = null;
+        }
+        this.wakeAsked = this.seedAskedAt;
+        this.loop.reschedule(SEED_LINK_TASK, this.seedAskedAt! + LINK_ANSWER_MILLIS);
+      } else if (this.reconnectTimer !== null) {
+        // Asleep while backing off between dials: the pause was judged on a clock that did not count the suspend, so
+        // the rest of it would still be waited out after the wake. The resume dials at once instead.
+        this.resumeRedials += 1;
+        this.timers.clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+        this.reconnect();
+      }
+      if (this.channel !== null || this.inbound.size > 0) {
+        this.introduce();
+        this.pullView();
+      }
+      this.probeLapsedMembers();
+    }
+  }
+
+  /** Members a wake PINGed before judging them, and those that answered (monotonic instant of the answer). */
+  private readonly wakeSuspects = new Set<string>();
+  private readonly wakeAnswered = new Map<string, number>();
+  /** When the wake's probes are judged (monotonic), or null with none out. */
+  private wakeJudgeAt: number | null = null;
+  /** Members a wake PINGed because their advertisement lapsed while this peer did not run, and those that answered. */
+  wakeMemberProbes = 0;
+  wakeProbesAnswered = 0;
+  /** Drops {@link expireMembers} held back for a wake's probe, or for a member that answered one. */
+  wakeDropsDeferred = 0;
+
+  /**
+   * Owner decision 3 of 2026-11-23: before judging members by elapsed time after a wake, re-probe them. Each member
+   * heard on no link of this peer's whose advertisement lapsed is PINGed (through the seed when it is not on a link
+   * of this peer's own), and {@link expireMembers} holds its drop for {@link WAKE_PROBE_MILLIS}: a member whose age
+   * is past its TTL only because this peer was frozen or asleep gets a probe, not a drop.
+   */
+  private probeLapsedMembers(): void {
+    const now = this.now();
+    const linked = new Set(this.linkedMembers());
+    let probed = false;
+    for (const [peer, ad] of this.members) {
+      if (linked.has(peer) || peer === this.identity.peerId || !this.adLapsed(ad, now)) {
+        continue;
+      }
+      this.wakeSuspects.add(peer);
+      this.wakeMemberProbes += 1;
+      probed = true;
+      this.sendAddressed("PING", wire.pingBody(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)), peer);
+    }
+    if (probed) {
+      this.wakeJudgeAt = this.monotonic() + WAKE_PROBE_MILLIS;
+    }
+  }
+
+  /** Whether an advertisement's lease has passed at `now` (wall); an unreadable or issue-less one never lapses here. */
+  private adLapsed(ad: Dict, now: number): boolean {
+    if (ad["issued"] === undefined) {
+      return false;
+    }
+    try {
+      return parseInstantMillis(ad["issued"]) + parseDurationMillis(ad["ttl"]) <= now;
+    } catch {
+      return false;
+    }
+  }
+
+  /** A member a wake probed was heard: it is kept for {@link WAKE_KEEP_MILLIS} while its fresh advertisement comes. */
+  private heardSuspect(peer: string): void {
+    if (this.wakeSuspects.delete(peer)) {
+      this.wakeProbesAnswered += 1;
+      this.wakeAnswered.set(peer, this.monotonic());
+    }
+  }
+
+  /**
+   * Whether {@link expireMembers} holds a lapsed member's drop after a wake: its probe still waits, or it answered one
+   * within {@link WAKE_KEEP_MILLIS}. Ends the wake's window once it has passed.
+   */
+  private wakeHolds(peer: string, mono: number): boolean {
+    if (this.wakeJudgeAt !== null && mono >= this.wakeJudgeAt) {
+      this.wakeSuspects.clear();
+      this.wakeJudgeAt = null;
+    }
+    if (this.wakeSuspects.has(peer)) {
+      return true;
+    }
+    const answered = this.wakeAnswered.get(peer);
+    if (answered !== undefined && mono - answered < WAKE_KEEP_MILLIS) {
+      return true;
+    }
+    this.wakeAnswered.delete(peer);
+    return false;
+  }
+
+  /** Reconnect pauses a resume cut short to dial at once. */
+  resumeRedials = 0;
+  /** PINGs to the seed a resume sent with the link up (the dead-seed rule then judges the link). */
+  wakePings = 0;
+  /** The ask a resume made; its verdict fails over at once, however young the link (see {@link failoverClosed}). */
+  private wakeAsked: number | null = null;
+  /** The dialed channel the dead-seed verdict after a wake closed: its close fails over at once, no quick drop. */
+  private failoverClosed: FrameChannel | null = null;
+  /** The seed whose link last ended while this peer ran; every round dials it last (owner decision 2 of 2026-11-23). */
+  private lostSeedUrl: string | null = null;
+  /** Seed dials started, and channels that opened after another seed had won and were closed. */
+  seedDials = 0;
+  lateSeedChannels = 0;
+  /** The pause before the next round of reconnect dials, on this peer's timers. */
+  private reconnectTimer: unknown = null;
+
+  private readonly onWallStepListeners: Array<(stepMillis: number) => void> = [];
+
+  /** Hears every wall step this peer's loop sees (a host re-dials its seed on a resume). */
+  onWallStepped(listener: (stepMillis: number) => void): () => void {
+    this.onWallStepListeners.push(listener);
+    return () => {
+      const i = this.onWallStepListeners.indexOf(listener);
+      if (i >= 0) {
+        this.onWallStepListeners.splice(i, 1);
+      }
+    };
+  }
+
+  private readonly onLateWakeListeners: Array<(lateMillis: number) => void> = [];
+
+  /**
+   * Hears every late wake this peer's loop sees: a watchdog tick that came back long past its period with no wall step,
+   * a suspend the monotonic clock counted (the other half of a wake, beside {@link onWallStepped}).
+   */
+  onLateWoke(listener: (lateMillis: number) => void): () => void {
+    this.onLateWakeListeners.push(listener);
+    return () => {
+      const i = this.onLateWakeListeners.indexOf(listener);
+      if (i >= 0) {
+        this.onLateWakeListeners.splice(i, 1);
+      }
+    };
+  }
+
   /** Runs `fn` every `periodMillis` on this peer's timers until {@link close}; never holds a Node process open. */
   every(periodMillis: number, fn: () => void): Repeating {
     const handle = this.timers.every(periodMillis, fn);
@@ -480,12 +843,18 @@ export class Peer {
   /** The dialed channel a CHANNEL_HELLO went out on, so one announcement serves one connection. */
   private helloSentOn: FrameChannel | null = null;
   malformedFrames = 0;
-  // A lost socket is reconnected to the seeds in turn (the next seed first, a pause after every
-  // full round that backs off from reconnectIntervalMs to six times it with a random spread) and
-  // the peer re-introduced and re-pulled, until a close() by the owner, which is final (swarm retries).
+  // A lost socket is reconnected to the seeds, dialled in list order 250 ms apart with the first to open winning and
+  // the lost seed last, a wait from the redial table after every round in which none opened, and the peer
+  // re-introduced and re-pulled, until a close() by the owner, which is final (swarm retries; owner decisions 1 and 2
+  // of 2026-11-23).
   reconnects = 0;
-  /** The pause after the first full round of reconnect dials; each later round doubles it, up to six times it. */
+  /**
+   * The first wait of the redial table (5 s): the table's waits are 1, 2, 4 and 6 times it, then wrap. It is also the
+   * quick-drop window: a link that ends sooner after its dial counts as a failed round.
+   */
   reconnectIntervalMs = 5000;
+  /** This peer's position in the redial table (owner decision 1 of 2026-11-23); a test installs one with a fixed spread. */
+  redialTable = new RedialTable();
   /**
    * Whether a lost link re-dials the seeds on its own. A host whose own durable timer owns every dial, as the
    * workers cell's alarm does, turns it off and dials again with `connectAny` (swarm retries, ROBUSTNESS.md §10.3 E5).
@@ -511,6 +880,18 @@ export class Peer {
    * declares the seed as its relay in the `relay.via` hint so members reach it the same way back.
    */
   seedPeer: string | null = null;
+  /** The seed (its URL) {@link seedPeer} was learned on, and the seed the dialed channel is on now. */
+  private seedPeerOn: string | null = null;
+  private dialedSeed: string | null = null;
+  /** Times a failover to another seed withdrew a `relay.via` that named the old one. */
+  relayViaCleared = 0;
+
+  /** Declares `peer`, the member on the other end of the dialed channel, as this peer's relay (SPEC §5.4). */
+  private adoptSeedPeer(peer: string): void {
+    this.seedPeer = peer;
+    this.seedPeerOn = this.dialedSeed;
+    this.resourceHints["relay.via"] = peer;
+  }
   /** The longest path a relayed frame of this peer's names (LB-R-03). */
   maxPathHops = 4;
   /** Frames this peer sent through its seed. */
@@ -577,8 +958,8 @@ export class Peer {
   private readonly joinedSpaces = new Set<string>();
   /** The longest lease observed per space id, capped at MAX_TRACKED_LEASE_MILLIS, for the collection horizon (SPEC §7.3, HLC round five, 2026-11-08). */
   private readonly longestLease = new Map<string, number>();
-  /** The periodic tombstone collection, started by the first state this replica stores. */
-  private collector: Repeating | null = null;
+  /** Whether the tombstone collection runs as due work on this peer's loop (from the first state or claim stored). */
+  private collector = false;
   private pulledAds = false;
 
   private founderId(): string | null {
@@ -595,10 +976,11 @@ export class Peer {
   }
 
   /**
-   * Dials the seeds in order until one answers, then introduces this peer to
-   * the group (DB-X-02). A lost socket later fails over to the next seed
-   * inside the reconnect window (ROBUSTNESS.md §6a). Rejects when no seed
-   * answers, with the last dial's error.
+   * Dials the seeds in list order, one start every 250 ms, with the first
+   * to answer winning (owner decision 2 of 2026-11-23, RFC 8305), then introduces this peer to the group
+   * (DB-X-02). A lost socket later fails over to another seed inside the
+   * reconnect window (ROBUSTNESS.md §6a). Rejects when no seed answers,
+   * with the last dial's error.
    */
   /**
    * Takes a connection a listener accepted (JS-R-04): frames on it are handled like those on
@@ -610,6 +992,7 @@ export class Peer {
     const link: Link = { channel, session: null, peers: new Set() };
     this.inbound.set(channel, link);
     this.running = true;
+    this.openLoop(); // the loop sees a wall step (a resume) even when no task is due
     channel.onFrame((frame) => this.onFrame(frame, link));
     channel.onClose(() => this.onInboundClosed(link));
     this.sendOn(link, "RUMOR", this.selfAdRumor(), null);
@@ -696,20 +1079,98 @@ export class Peer {
     this.seeds = expanded;
     this.seedIndex = 0;
     this.running = true;
-    let lastError: unknown = null;
-    for (let i = 0; i < this.seeds.length; i++) {
-      this.seedIndex = i;
-      try {
-        await this.dial(this.seeds[i]);
-        return;
-      } catch (e) {
-        lastError = e;
-      }
+    this.openLoop(); // the loop sees a wall step (a resume) even when no task is due
+    try {
+      await this.dialSeeds();
+    } catch (lastError) {
+      this.running = false;
+      throw new Error(`no seed answered (${this.seeds.map((s) => schemeOf(s) === "tcp" && s.scheme === undefined
+        ? `${s.host}:${s.port}` : seedUrl(s)).join(", ")}): `
+        + (lastError instanceof Error ? lastError.message : String(lastError)));
     }
-    this.running = false;
-    throw new Error(`no seed answered (${this.seeds.map((s) => schemeOf(s) === "tcp" && s.scheme === undefined
-      ? `${s.host}:${s.port}` : seedUrl(s)).join(", ")}): `
-      + (lastError instanceof Error ? lastError.message : String(lastError)));
+  }
+
+  /**
+   * Dials the seeds in list order, one start every {@link SEED_STAGGER_MILLIS} (owner decision 2 of 2026-11-23, RFC 8305
+   * Happy Eyeballs): a dial that fails starts the next at once, the first channel to open becomes the link, the seeds
+   * not yet started are never dialled, and a channel that opens after the winner is closed with nothing sent on it. At
+   * most {@link SEED_DIALS_IN_FLIGHT_MAX} dials are in flight at once; with every slot taken, a failure starts the next. So
+   * a dead or blackholed first seed costs 250 ms, not its connect timeout, and with every seed up the first listed
+   * wins. The seed whose link last ended ({@link lostSeedUrl}) is dialled last, so a seed that accepts dials and then
+   * goes silent or drops them is not picked again ahead of a live one. Rejects with the last error when no seed opens.
+   */
+  private dialSeeds(): Promise<void> {
+    const seeds = this.seeds;
+    const lost = seeds.findIndex((s) => seedUrl(s) === this.lostSeedUrl);
+    const order = seeds.map((_, i) => i).filter((i) => i !== lost);
+    if (lost >= 0) {
+      order.push(lost);
+    }
+    return new Promise<void>((resolve, reject) => {
+      if (order.length === 0) {
+        reject(new Error("no seed to dial"));
+        return;
+      }
+      let next = 0;
+      let inFlight = 0;
+      let settled = false;
+      let lastError: unknown = new Error("the peer was closed while dialing");
+      let stagger: unknown = null;
+      const stopStagger = (): void => {
+        if (stagger !== null) {
+          this.timers.clearTimeout(stagger);
+          stagger = null;
+        }
+      };
+      const giveUpIfDone = (): void => {
+        if (!settled && inFlight === 0 && (next >= order.length || !this.running)) {
+          settled = true;
+          stopStagger();
+          reject(lastError);
+        }
+      };
+      const start = (): void => {
+        stopStagger();
+        if (settled || next >= order.length || !this.running) {
+          giveUpIfDone();
+          return;
+        }
+        if (inFlight >= SEED_DIALS_IN_FLIGHT_MAX) {
+          return; // every slot is taken: the next dial starts when one fails
+        }
+        const i = order[next++]!;
+        inFlight += 1;
+        if (next < order.length) {
+          stagger = this.timers.setTimeout(() => { stagger = null; start(); }, SEED_STAGGER_MILLIS);
+          unref(stagger);
+        }
+        this.seedDials += 1;
+        this.openSeed(seeds[i]!).then((channel) => {
+          inFlight -= 1;
+          if (settled) {
+            this.lateSeedChannels += 1;
+            channel.close(); // another seed answered first
+            return;
+          }
+          settled = true;
+          stopStagger(); // the seeds not yet started are never dialled
+          if (this.running) {
+            this.seedIndex = i;
+            this.adopt(channel, seeds[i]!);
+          } else {
+            channel.close(); // closed while dialing
+          }
+          resolve();
+        }, (e: unknown) => {
+          inFlight -= 1;
+          lastError = e;
+          if (!settled) {
+            start(); // a refused dial starts the next at once
+          }
+        });
+      };
+      start();
+    });
   }
 
   /** DB-X-03: each dialer may expand a seed (a hostname into one seed per address, for tcp). */
@@ -736,7 +1197,9 @@ export class Peer {
    * document's only group), verifies its founding advertisement with the
    * four checks `joinByGroupId` applies and, when `groupId` is given, that
    * it is exactly that group, then dials the document's seeds of every scheme
-   * this peer dials, in priority order (JS-P-07). Returns the group selected.
+   * this peer dials, in the JS-P-07 priority order one start every 250 ms,
+   * with the first to answer winning (owner decision 2 of 2026-11-23,
+   * RFC 8305). Returns the group selected.
    *
    * `timeoutMs` (3 000 by default) bounds one fetch of the document and
    * `joinTimeoutMs` (10 000) bounds the whole call. A first attempt that
@@ -760,7 +1223,7 @@ export class Peer {
   } = {}): Promise<beacon.BeaconGroup> {
     const joinTimeoutMs = options.joinTimeoutMs ?? 10_000;
     const attemptMs = options.timeoutMs ?? 3_000;
-    const deadline = Date.now() + joinTimeoutMs;
+    const deadline = monotonicMillis() + joinTimeoutMs;
     let fetches = 0;
     const dialed = new Set<string>();
     let lastError: unknown = null;
@@ -768,7 +1231,7 @@ export class Peer {
     let seeds: Seed[] = [];
     let slice = JOIN_SLICE_FIRST_MS;
     for (;;) {
-      const started = Date.now();
+      const started = monotonicMillis();
       if (seeds.length === 0) {
         fetches += 1;
         try {
@@ -791,9 +1254,9 @@ export class Peer {
           lastError = e; // the beacon is unreachable or answered an error: ask again
         }
       }
-      if (seeds.length > 0 && Date.now() < deadline) {
+      if (seeds.length > 0 && monotonicMillis() < deadline) {
         try {
-          await this.dialAny(seeds); // one dial per seed, in order
+          await this.dialAny(seeds); // the seeds in list order, 250 ms apart
           this.introduce();
           this.pullRevocations();
           return group as beacon.BeaconGroup;
@@ -805,12 +1268,14 @@ export class Peer {
           }
         }
       }
-      const now = Date.now();
+      const now = monotonicMillis();
       const wait = Math.min(slice - (now - started), deadline - now);
       if (wait > 0) {
         await sleep(wait);
       }
-      if (Date.now() >= deadline) {
+      // A wait that ran to the deadline ends the call even when the timer fired a fraction of a millisecond early
+      // (Node runs timers on whole milliseconds of its own clock), so the budget never buys one more attempt.
+      if (wait >= deadline - now || monotonicMillis() >= deadline) {
         const last = lastError instanceof Error ? lastError.message : String(lastError);
         throw new BootstrapTimeoutError(`no join through ${url} within ${joinTimeoutMs} ms: ${fetches} fetch(es), `
           + `0 of ${dialed.size} seed(s) connected; last error: ${last}`, fetches, dialed.size, 0, lastError);
@@ -914,24 +1379,33 @@ export class Peer {
   /**
    * After a lost socket: dials the seeds again, then introduces this peer again and pulls what it
    * had pulled before, so a network hiccup costs a few seconds rather than the membership
-   * (ROBUSTNESS.md §3.6). The pauses between rounds back off 5, 10, 20, 30 s with a random spread,
-   * so the clients of a seed that restarts do not all dial it at once, and the dials go on until the
-   * owner closes the peer (swarm retries, ROBUSTNESS.md §10.3 E5).
+   * (ROBUSTNESS.md §3.6). Each round dials the seeds in list order 250 ms apart, the lost seed last, and
+   * the waits between rounds follow the redial table, 5, 10, 20, 30 s and then 5 s again, each with a
+   * spread of +/-10%, so the clients of a seed that restarts do not all dial it at once (owner decisions 1
+   * and 2 of 2026-11-23). The dials go
+   * on until the owner closes the peer (swarm retries, ROBUSTNESS.md §10.3 E5).
    */
   private reconnecting = false;
 
-  private reconnect(rounds: number, lastTried: number): void {
+  private reconnect(): void {
     if (!this.running || this.seeds.length === 0) {
       this.reconnecting = false;
       return;
     }
     this.reconnecting = true;
-    // The next seed first: a lost link to one seed is the moment to try another; the one that
-    // dropped comes round again after the others.
-    this.seedIndex = (lastTried + 1) % this.seeds.length;
-    const tried = this.seedIndex;
-    const seed = this.seeds[tried];
-    this.dial(seed).then(() => {
+    this.dialSeeds().then(() => {
+      if (!this.running) {
+        this.reconnecting = false;
+        return; // closed by the owner while dialing: the channel is closed and nothing goes out
+      }
+      if (this.channel === null) {
+        // The seed accepted and dropped the link before this turn: its close signal came while this round was still
+        // reconnecting and left the next dial to it. A quick drop, so the round waits the table's next wait, and the
+        // seed that dropped it is now the lost seed, dialled last, so a seed that accepts and drops every dial cannot
+        // keep winning the race against a live one.
+        this.pauseThenReconnect(this.redialTable.next(this.reconnectIntervalMs));
+        return;
+      }
       this.reconnecting = false;
       this.reconnects += 1;
       this.introduce();
@@ -947,32 +1421,35 @@ export class Peer {
         this.reconnecting = false;
         return;
       }
-      // One dial at a time, never a tight loop: the seeds of a round are tried back to back and
-      // every full round of refusals waits its backoff.
-      const endOfRound = (tried + 1) % this.seeds.length === this.roundStart;
-      const done = endOfRound ? rounds + 1 : rounds;
-      const pause = endOfRound ? this.reconnectPause(done) : 0;
-      const timer = setTimeout(() => this.reconnect(done, tried), pause);
-      unref(timer);
+      // Never a tight loop: every round in which no seed opened waits the redial table's next wait.
+      this.pauseThenReconnect(this.redialTable.next(this.reconnectIntervalMs));
     });
   }
 
-  /** The pause after the `rounds`-th failed round of dials: the interval doubling to six times it, with a spread of up to a quarter. */
-  private reconnectPause(rounds: number): number {
-    return Math.min(6 * this.reconnectIntervalMs, this.reconnectIntervalMs * 2 ** Math.min(rounds - 1, 3)) * (1 + Math.random() / 4);
+  /**
+   * Waits `pause` on this peer's timers (a virtual clock in a test), then dials the seeds again. A resume cuts the
+   * wait short ({@link onWallStep}).
+   */
+  private pauseThenReconnect(pause: number): void {
+    const timer = this.timers.setTimeout(() => {
+      if (this.reconnectTimer === timer) {
+        this.reconnectTimer = null;
+        this.reconnect();
+      }
+    }, pause);
+    this.reconnectTimer = timer;
+    unref(timer);
   }
 
-  /** Where the current round of reconnect dials began: the seed after the one that dropped. */
-  private roundStart = 0;
-  /** When the current link was dialed, and how many links in a row ended within the reconnect interval (swarm retries). */
+  /** When the current link was dialed (the quick-drop window is judged from it). */
   private linkSince = 0;
-  private quickDrops = 0;
 
   private onChannelClosed(channel: FrameChannel): void {
     if (this.channel !== channel) {
       return; // an old link, already replaced
     }
     this.channel = null;
+    this.lostSeedUrl = this.dialedSeed; // dialled last in the rounds that follow (owner decision 2 of 2026-11-23)
     this.session = null; // a session ends with its connection
     this.dialPeers.clear();
     for (const peer of [...this.reachable]) {
@@ -981,17 +1458,19 @@ export class Peer {
       }
     }
     if (this.running && this.redial && this.seeds.length > 0 && !this.reconnecting) {
-      this.roundStart = (this.seedIndex + 1) % this.seeds.length;
-      // A link that ended within the reconnect interval counts as a failed round of dials, so a seed that accepts each
-      // dial and drops it at once gets the backoff and no dial loop (swarm retries, ROBUSTNESS.md §10.6).
-      const quick = Date.now() - this.linkSince < this.reconnectIntervalMs;
-      this.quickDrops = quick ? this.quickDrops + 1 : 0;
-      const last = this.seedIndex;
+      // Owner decision 1 of 2026-11-23: a link that ended within the reconnect interval (5 s) counts as a failed round
+      // of dials and waits the redial table's next step without resetting it, so a seed that accepts each dial and
+      // drops it at once climbs the table and gets no dial loop (swarm retries, ROBUSTNESS.md §10.6). A link that held
+      // at least that long succeeded: the table goes back to its first wait and the seeds are dialled at once. A link
+      // this peer closed on the dead-seed verdict after a wake fails over at once, however young.
+      const quick = channel !== this.failoverClosed && this.monotonic() - this.linkSince < this.reconnectIntervalMs;
+      this.failoverClosed = null;
       if (quick) {
         this.reconnecting = true;
-        unref(setTimeout(() => this.reconnect(0, last), this.reconnectPause(this.quickDrops)));
+        this.pauseThenReconnect(this.redialTable.next(this.reconnectIntervalMs));
       } else {
-        this.reconnect(0, last);
+        this.redialTable.reset();
+        this.reconnect();
       }
     }
   }
@@ -1096,9 +1575,17 @@ export class Peer {
 
   close(): void {
     this.running = false;
+    if (this.reconnectTimer !== null) {
+      this.timers.clearTimeout(this.reconnectTimer); // a closed peer dials nothing more
+      this.reconnectTimer = null;
+      this.reconnecting = false; // as the cleared pause would have found it: a peer that connects again re-dials
+    }
     for (const handle of this.repeating.splice(0)) {
       handle.stop();
     }
+    this.dueLoop?.pause(); // its tasks and deadlines stay for a peer that dials again (a resident host's resume)
+    this.unwatchLoop?.();
+    this.unwatchLoop = null;
     const channel = this.channel;
     this.channel = null;
     channel?.close();
@@ -1132,6 +1619,9 @@ export class Peer {
     channel.send(wire.encodeFrame(env, this.identity));
   }
 
+  /** The millisecond the last self-advertisement rumor was named for. */
+  private lastSelfAdItemMillis = Number.NEGATIVE_INFINITY;
+
   /** This peer's advertisement as of now: its endpoints, hints, and lease (whole seconds, as always stamped). */
   private selfAd(): Dict {
     const now = this.now();
@@ -1159,7 +1649,11 @@ export class Peer {
   /** The `peers` rumor carrying this peer's signed advertisement. */
   private selfAdRumor(): Uint8Array {
     const payload = wire.signedPeerAd(this.selfAd(), this.identity);
-    const itemId = `peer:${this.identity.peerId}:${this.now()}`;
+    // Issued at least a millisecond after the last one (SPEC v0.1.36, srad/agentspaces-event-loop.md §10.16): a changed
+    // advertisement in the millisecond of the last shared its gossip item id, and every member dropped it as a duplicate.
+    const at = Math.max(Math.trunc(this.now()), this.lastSelfAdItemMillis + 1);
+    this.lastSelfAdItemMillis = at;
+    const itemId = `peer:${this.identity.peerId}:${at}`;
     return wire.rumorBody("peers", itemId, this.rumorHops, payload);
   }
 
@@ -1246,7 +1740,61 @@ export class Peer {
 
   /** Layer 4 (SPEC §6, §8): the members heard from (peer id to its advertisement, `{}` when only heard). */
   readonly members: Map<string, Dict> = new TrackedMap<string, Dict>()
-    .track(() => { this.hinted.at = Number.NaN; }); // a member that comes or goes is judged afresh by the horizon
+    .track(() => {
+      this.hinted.at = Number.NaN; // a member that comes or goes is judged afresh by the horizon
+      this.wakeCollector();
+      for (const listener of this.membersListeners) {
+        listener(); // due work that judges the view (a host's member expiry, the collection's horizon) is asked again
+      }
+    });
+  private readonly membersListeners: Array<() => void> = [];
+
+  /** Hears every change of the member view (a member admitted, updated, or gone). */
+  onMembersChanged(listener: () => void): () => void {
+    this.membersListeners.push(listener);
+    return () => {
+      const i = this.membersListeners.indexOf(listener);
+      if (i >= 0) {
+        this.membersListeners.splice(i, 1);
+      }
+    };
+  }
+
+  /** The earliest wall instant a member's advertisement lapses ({@link expireMembers}'s next due), or null. */
+  nextMemberExpiry(): number | null {
+    let next: number | null = null;
+    const linked = new Set(this.linkedMembers());
+    for (const [peer, ad] of this.members) {
+      if (linked.has(peer) || ad["issued"] === undefined) {
+        continue; // a member heard on a link is kept while the link lasts
+      }
+      try {
+        let at = parseInstantMillis(ad["issued"]) + parseDurationMillis(ad["ttl"]);
+        const held = this.wakeHeldUntil(peer);
+        if (held !== null && held > at) {
+          at = held; // a lapsed member a wake probed is judged when its hold ends, not before
+        }
+        next = next === null ? at : Math.min(next, at);
+      } catch {
+        // an unreadable advertisement never lapses here, as expireMembers keeps it
+      }
+    }
+    return next;
+  }
+
+  /** The wall instant a wake's hold on a member's drop ends ({@link wakeHolds}), or null with none. */
+  private wakeHeldUntil(peer: string): number | null {
+    const mono = this.monotonic();
+    let until: number | null = null;
+    if (this.wakeSuspects.has(peer) && this.wakeJudgeAt !== null) {
+      until = this.wakeJudgeAt;
+    }
+    const answered = this.wakeAnswered.get(peer);
+    if (answered !== undefined) {
+      until = Math.max(until ?? 0, answered + WAKE_KEEP_MILLIS);
+    }
+    return until === null ? null : this.now() + Math.max(0, until - mono);
+  }
   /** The signed `peers` payloads held per member, served on the `view` stream (SPEC §5.2, v0.1.17). */
   private readonly heldPeerAds = new Map<string, Uint8Array>();
   /**
@@ -1632,7 +2180,7 @@ export class Peer {
 
   /** Asks the entry's issuing peer (and the seed) for a block, at most once a second. */
   wantBlock(cid: string, dto: Dict | null = null): void {
-    const now = Date.now();
+    const now = this.monotonic();
     if (now - (this.blockAsked.get(cid) ?? Number.NEGATIVE_INFINITY) < 1000) {
       return;
     }
@@ -1835,7 +2383,7 @@ export class Peer {
 
   /** Pulls a space unless it was pulled within `settleMillis` (JS-Q-PRF-01: one DIGEST per settle window). */
   private pullSpacePaced(space: string, settleMillis: number): void {
-    const now = Date.now();
+    const now = this.monotonic();
     if (now - (this.lastPullMillis.get(space) ?? -Infinity) >= settleMillis) {
       this.lastPullMillis.set(space, now);
       this.pullSpace(space);
@@ -1907,6 +2455,7 @@ export class Peer {
       }
       this.states.delete(entryId);
       this.claims.delete(entryId);
+      this.forgetSettleLines(entryId);
     }
     if (released.size > 0) {
       for (const dto of this.states.values()) {
@@ -1923,6 +2472,114 @@ export class Peer {
     }
     this.onCollected?.(collected);
     return collected;
+  }
+
+  /**
+   * Brings the tombstone collection forward to the wall instant `wallMillis` (SPEC v0.1.36 §9.5: the space sweep runs
+   * when the earliest lapse falls due, not on a fixed 1 s ticker as before), registering it on the loop the first time.
+   */
+  private collectBy(wallMillis: number): void {
+    if (!Number.isFinite(wallMillis)) {
+      wallMillis = this.now();
+    }
+    const loop = this.loop;
+    if (!this.collector) {
+      this.collector = true;
+      loop.add(COLLECT_TASK, (nowMono) => {
+        this.collectTombstones();
+        const next = this.nextCollection();
+        return next === null ? null : nowMono + Math.max(0, next - this.now());
+      }, null);
+    }
+    const at = loop.now() + Math.max(0, wallMillis - this.now());
+    const current = loop.dueOf(COLLECT_TASK);
+    if (current === null || at < current) {
+      loop.reschedule(COLLECT_TASK, at);
+    }
+  }
+
+  /** Asks the collection to judge again soon (the view or its hints changed), when it runs at all. */
+  private wakeCollector(): void {
+    if (this.collector && this.dueLoop !== null && !this.dueLoop.isStopped) {
+      this.collectBy(this.now() + COLLECT_PERIOD_MILLIS);
+    }
+  }
+
+  /** The earliest wall instant the collection has anything to do: a horizon, a claim's lapse, a forgotten line. */
+  private nextCollection(): number | null {
+    const now = this.now();
+    let next = Number.POSITIVE_INFINITY;
+    // An instant already past whose work did not happen (a withdrawal no member vouches for keeps the later horizon)
+    // is judged again a collection period on, so a past deadline never spins the loop.
+    const due = (at: number): void => {
+      next = Math.min(next, at > now ? at : now + COLLECT_PERIOD_MILLIS);
+    };
+    for (const [entryId, signed] of this.claims) {
+      if (!this.states.has(entryId)) {
+        due(wire.claimNumber((signed["claim"] as Dict)["expiresAtMillis"]));
+      }
+    }
+    for (const at of this.ackForgetAt.values()) {
+      due(at);
+    }
+    for (const dto of this.states.values()) {
+      for (const at of this.horizonsOf(dto)) {
+        due(at);
+      }
+    }
+    for (const space of this.joinedSpaces) {
+      const spaceId = wireSpaceId(this.group, space);
+      const at = this.horizonModes.get(spaceId)?.nextJudgement(now, this.viewHinted(now), this.roundMillis(),
+        this.longestLease.get(spaceId) ?? 0);
+      if (at !== undefined && at !== null) {
+        due(at);
+      }
+    }
+    return Number.isFinite(next) ? next : null;
+  }
+
+  /**
+   * The instants a state could become collectable, under each rule (the rule in force moves with the view; running
+   * early is safe, the run judges again). A present entry never before its own lapse.
+   */
+  private horizonsOf(dto: Dict): number[] {
+    const kind = horizonKindOf(dto);
+    const expiry = leaseExpiryOf(dto);
+    const maxLease = this.longestLeaseOf(dto);
+    const legacy = horizon.collectionHorizon(kind, expiry, maxLease, "legacy");
+    if (kind === "present") {
+      return [Math.max(legacy, expiry)];
+    }
+    if (kind !== "withdrawn") {
+      return [legacy]; // only a bare withdrawal's horizon depends on the rule (keepMillis)
+    }
+    // A withdrawal takes the per-entry horizon only while its space's mode is engaged and this replica vouches for
+    // every writer (collectableHere): the vouch comes one longest lease plus the grace into each writer's hinted stay.
+    const spaceId = String((dto["record"] as Dict | undefined)?.["spaceId"]);
+    if (this.horizonModes.get(spaceId)?.mode !== "PER_ENTRY") {
+      return [legacy];
+    }
+    const adds = (dto["adds"] as Dict[] | undefined) ?? [];
+    if (adds.length === 0) {
+      return [legacy]; // nobody to vouch for: the legacy horizon (vouchesFor)
+    }
+    let vouchAt = Number.NEGATIVE_INFINITY;
+    for (const dot of adds) {
+      const writer = String(dot["replica"] ?? "");
+      if (writer === this.identity.peerId) {
+        continue;
+      }
+      const since = this.hintedSince.get(writer);
+      vouchAt = Math.max(vouchAt, since === undefined || !this.members.has(writer) ? Number.POSITIVE_INFINITY
+        : since + Math.max(0, maxLease) + horizon.LAPSED_GRACE_MILLIS);
+    }
+    const perEntry = horizon.collectionHorizon(kind, expiry, maxLease, "per-entry");
+    return [Math.min(legacy, Math.max(perEntry, vouchAt))];
+  }
+
+  /** The earliest of {@link horizonsOf}. */
+  private horizonOf(dto: Dict): number {
+    return Math.min(...this.horizonsOf(dto));
   }
 
   /** Whether `ref` names a payload the content seam holds: a `b` root that is no persistent tree. */
@@ -2080,12 +2737,12 @@ export class Peer {
     if (this.revocations.refuses(holder, agent?.publicRaw ?? null, null)) {
       return null; // a revoked agent takes nothing, even locally
     }
-    const deadline = Date.now() + timeoutMillis;
-    while (Date.now() < deadline) {
+    const deadline = this.monotonic() + timeoutMillis;
+    while (this.monotonic() < deadline) {
       // Fold-driven (JS-V-02): one pull per settle window at most, then wait for a fold rather
       // than a fixed sleep, so an entry that arrives wakes the take at once.
       this.pullSpacePaced(space, settleMillis);
-      await this.foldOrTimeout(Math.min(settleMillis, deadline - Date.now()));
+      await this.foldOrTimeout(Math.min(settleMillis, deadline - this.monotonic()));
       const now = this.now();
       for (const [entryId, dto] of this.states) {
         const record = dto["record"] as Dict | undefined;
@@ -2117,7 +2774,7 @@ export class Peer {
           wire.hlcNow(holder, now), holder, price, now + leaseMillis);
         const signed = wire.signedClaim(claim, this.identity, agent);
         this.observeClaimLease(signed);
-        this.claims.set(entryId, wire.mergeClaims(this.claims.get(entryId), signed));
+        this.mergeHeldClaim(entryId, signed);
         this.send("RUMOR", wire.rumorBody(`space:${space}`,
           `c:${entryId}:${claim["stamp"]}`, 6, wire.claimDelta(entryId, signed)));
         // The settle window is waited in full, as the Python and Java takes wait it: a competing
@@ -2134,6 +2791,17 @@ export class Peer {
             // core cancel events, 2026-11-09: an entry completed or withdrawn during the settle window is nobody's
             && present(this.states.get(entryId) ?? {})
             && !this.revocations.refuses(holder, agent?.publicRaw ?? null, null)) {
+          if (this.outbidCompletions.get(entryId) === epoch) {
+            // The holder this claim displaced completed the entry during the window (SPEC §7.4, rule two): the work
+            // is done, so this take acknowledges that completion instead of doing it again, and comes back empty here.
+            try {
+              this.acknowledgeDisplacedCompletion(space, entryId, agent);
+            } catch {
+              // the claim lapsed or a better one arrived meanwhile: whoever holds it completes it
+            }
+            continue;
+          }
+          this.outbidCompletions.delete(entryId);
           // As Java's take fires TAKEN for the claim it won (HLC round six, 2026-11-08, R9).
           this.onClaim?.(entryId, this.claims.get(entryId)!);
           return entryId;
@@ -2150,6 +2818,15 @@ export class Peer {
    */
   completeEntry(space: string, entryId: string, agent: AgentIdentity | null = null): void {
     this.requireHeld(space, entryId, agent);
+    const heldEpoch = wire.claimNumber((this.claims.get(entryId)!["claim"] as Dict)["epoch"]);
+    if (this.outbidCompletions.get(entryId) === heldEpoch) {
+      this.outbidCompletions.delete(entryId);
+      this.displacedAcknowledged += 1; // the acknowledgement of a displaced holder's completion (SPEC §7.4)
+    } else {
+      // This holder does the work, so a displaced holder's completion that arrives later is a duplicate.
+      this.completedHere.set(entryId, { epoch: heldEpoch, space });
+      capLines(this.completedHere);
+    }
     // A claim taken as an agent must be completed as that agent (A6, v0.1.13).
     const previous = this.states.get(entryId)!;
     const dto = wire.signState({ ...previous, completed: true }, this.identity, agent, this.now());
@@ -2325,23 +3002,145 @@ export class Peer {
 
   // ------------------------------------------------------------------ internals
 
-  private async dial(seed: Seed): Promise<void> {
+  /**
+   * Opens a channel to one seed. The channel becomes this peer's link only once {@link adopt}ed: a refused dial ends
+   * too, and that end must not start a second reconnect chain.
+   */
+  private async openSeed(seed: Seed): Promise<FrameChannel> {
     const dialer = this.dialers.get(schemeOf(seed));
     if (dialer === undefined) {
       throw new Error(`no dialer for ${schemeOf(seed)}`);
     }
-    // The channel becomes this peer's link only once open: a refused dial ends too,
-    // and that end must not start a second reconnect chain (one dial per interval).
-    const channel = await dialer.dial(seed, { identity: this.identity });
-    if (!this.running) {
-      channel.close(); // closed while dialing
-      return;
-    }
+    return dialer.dial(seed, { identity: this.identity });
+  }
+
+  /** Makes an opened channel to `seed` this peer's dialed link. */
+  private adopt(channel: FrameChannel, seed: Seed): void {
     this.channel = channel;
     this.session = null;
-    this.linkSince = Date.now();
-    channel.onFrame((frame) => this.onFrame(frame, null));
+    this.linkSince = this.monotonic();
+    this.dialedSeed = seedUrl(seed);
+    const attested = channel.attestedPeer();
+    if (attested !== null && attested !== this.identity.peerId) {
+      this.adoptSeedPeer(attested); // the transport proved who the seed is: it is the member this peer dialled
+    } else if (this.seedPeer !== null && this.seedPeerOn !== this.dialedSeed) {
+      // A failover to another seed: the one relay.via named no longer holds this peer's link, and a Java member's
+      // targeted relay (SPEC v0.1.36 §5.2) would probe it through that member. The hint goes until the new seed's
+      // first addressed frame names it.
+      this.seedPeer = null;
+      this.seedPeerOn = null;
+      delete this.resourceHints["relay.via"];
+      this.relayViaCleared += 1;
+    }
+    this.seedHeardAt = this.linkSince;
+    this.seedAskedAt = null;
+    this.seedVerdictFor = null;
+    this.wakeAsked = null;
+    channel.onFrame((frame) => {
+      if (this.channel === channel) {
+        this.seedHeard(); // any frame read off the link shows the seed still writes to it
+      }
+      this.onFrame(frame, null);
+    });
+    channel.onProgress?.(() => {
+      if (this.channel === channel) {
+        // Owner decision 4 of 2026-11-23 (SPEC v0.1.37's dead-seed row): bytes of a frame still arriving answer the
+        // seed's PING too, so a large frame trickling over a slow link is no dead seed. Local only; no wire change.
+        this.seedProgress += 1;
+        this.seedHeard();
+      }
+    });
     channel.onClose(() => this.onChannelClosed(channel));
+    this.loop.add(SEED_LINK_TASK, (now) => this.judgeSeedLink(now), this.seedHeardAt + LINK_QUIET_MILLIS);
+    this.loop.add(SELF_AD_TASK, (now) => this.reLeaseSelfAd(now), this.linkSince + SELF_AD_REFRESH_MILLIS);
+  }
+
+  /** Self-advertisements re-issued by {@link SELF_AD_TASK}. */
+  selfAdRefreshes = 0;
+
+  /** Re-issues the self-advertisement every {@link SELF_AD_REFRESH_MILLIS} while a dialed link holds. */
+  private reLeaseSelfAd(now: number): number | null {
+    if (this.channel === null || !this.running) {
+      return null; // the next dial arms it again
+    }
+    this.selfAdRefreshes += 1;
+    this.introduce();
+    return now + SELF_AD_REFRESH_MILLIS;
+  }
+
+  /** When a frame was last read off the dialed channel, and when this peer asked a silent one (monotonic; null: not asked). */
+  private seedHeardAt = 0;
+  private seedAskedAt: number | null = null;
+  /** PINGs sent to a silent seed, and dialed links closed because the seed answered none (the dead-seed rule). */
+  seedPings = 0;
+  linksSilent = 0;
+
+  /**
+   * The dead-seed rule (owner decision 1 of 2026-11-23), a task on this peer's loop: a dialed channel silent for
+   * {@link LINK_QUIET_MILLIS} is asked with a PING to the seed; one still silent {@link LINK_ANSWER_MILLIS} after the
+   * PING is closed, and the close signal fails over to another seed. A run that comes late by more than the answer
+   * window (a stalled runtime, whose frames may still wait unread) asks again rather than judge the seed by this
+   * peer's own stall. Returns the next deadline; with no dialed channel it waits for the next dial.
+   */
+  private judgeSeedLink(now: number): number | null {
+    const channel = this.channel;
+    if (channel === null || !this.running) {
+      return null;
+    }
+    const asked = this.seedAskedAt;
+    if (asked === null) {
+      const due = this.seedHeardAt + LINK_QUIET_MILLIS;
+      if (now < due) {
+        return due;
+      }
+      this.askSeed(now);
+      return now + LINK_ANSWER_MILLIS;
+    }
+    const due = asked + LINK_ANSWER_MILLIS;
+    if (now < due) {
+      return due;
+    }
+    if (now - due > LINK_ANSWER_MILLIS) {
+      this.askSeed(now); // this peer did not run for the whole window: the silence may be its own
+      return now + LINK_ANSWER_MILLIS;
+    }
+    if (this.seedVerdictFor !== asked) {
+      // The verdict waits one more turn of the runtime: a frame the seed sent in time may still sit unread behind
+      // this timer (Node runs its due timers before it polls its sockets), and any frame read meanwhile clears the
+      // ask. A timer set from a timer runs on the next turn, after that poll.
+      this.seedVerdictFor = asked;
+      return now + 1;
+    }
+    this.seedVerdictFor = null;
+    this.linksSilent += 1;
+    if (asked === this.wakeAsked) {
+      this.failoverClosed = channel; // the wake's ask: a link young in monotonic time still fails over at once
+    }
+    this.wakeAsked = null;
+    this.seedAskedAt = null;
+    channel.close(); // the close signal fails over (onChannelClosed); a link this old is no quick drop
+    return null;
+  }
+
+  /** Reads off the dialed link that brought part of a frame and no whole one, each counted as the seed heard. */
+  seedProgress = 0;
+
+  /** The seed wrote to the dialed link (a whole frame, or bytes of one still arriving): any ask is answered. */
+  private seedHeard(): void {
+    this.seedHeardAt = this.monotonic();
+    this.seedAskedAt = null;
+    this.wakeAsked = null;
+  }
+
+  /** The ask whose verdict waits one turn for frames already arrived (see {@link judgeSeedLink}). */
+  private seedVerdictFor: number | null = null;
+
+  /** A PING to the seed on the dialed channel (addressed once the seed is known), which every member answers at once. */
+  private askSeed(now: number): void {
+    this.seedAskedAt = now;
+    this.seedPings += 1;
+    this.sendOn(null, "PING", wire.pingBody(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)),
+      this.seedPeer ?? (this.session?.confirmed ? this.session.remote : null));
   }
 
   /**
@@ -2518,9 +3317,15 @@ export class Peer {
     wire.hlcObserve(this.identity.peerId, env["stamp"], this.now());
     const kind = env["kind"];
     const sender = env["from"];
+    // How a probe's answer goes back (SPEC v0.1.36 §5.2): set below for a frame heard through another member.
+    let heardRelayed = relayedFrame;
+    let carrier: string | null = null;
     if (typeof sender === "string" && sender !== this.identity.peerId) {
       if (!this.members.has(sender)) {
         this.members.set(sender, {}); // a verified frame is a member heard from
+      }
+      if (this.wakeSuspects.size > 0) {
+        this.heardSuspect(sender); // any verified frame answers a wake's probe, relayed or not
       }
       // A relayed inner frame arrives on a link whose other end is someone else (the session's or
       // the attestation's peer): its signer is heard, not reachable, so an answer to it goes back
@@ -2529,6 +3334,8 @@ export class Peer {
       const session = link === null ? this.session : link.session;
       const linkPeer = channel?.attestedPeer() ?? (session?.established() !== null && session?.established() !== undefined ? session.remote : null);
       const relayed = relayedFrame || (linkPeer !== null && linkPeer !== undefined && linkPeer !== sender);
+      heardRelayed = relayed;
+      carrier = linkPeer ?? null;
       if (!relayed) {
         this.reachable.add(sender);
         (link === null ? this.dialPeers : link.peers).add(sender);
@@ -2536,8 +3343,7 @@ export class Peer {
             && this.seedPeer !== sender) {
           // On the dialed channel an addressed frame is the seed's own; it is the relay this peer
           // declares, so members behind other seeds reach it through the seed (SPEC §5.4).
-          this.seedPeer = sender;
-          this.resourceHints["relay.via"] = sender;
+          this.adoptSeedPeer(sender);
           reintroduce = true; // after this frame's own answer, so a probe's ACK stays first
         }
       }
@@ -2550,7 +3356,7 @@ export class Peer {
     } else if (kind === "RELAY_FRAME") {
       this.onRelayFrame(decoded, link);
     } else if (kind === "DIGEST") {
-      this.onDigest(String(sender), decoded);
+      this.onDigest(String(sender), decoded, heardRelayed, link);
     } else if (kind === "PING_REQ") {
       this.onPingReq(String(sender), decoded);
     } else if (kind === "ACK") {
@@ -2572,10 +3378,16 @@ export class Peer {
       // Java's probe nonces are random 64-bit longs: echo the decoded integer
       // as is (a bigint beyond 2^53), since a Number would lose it and the
       // encoder would refuse it, leaving the probe unanswered and this peer evicted.
+      // The ACK goes to the prober, as Java answers send(group, from, ACK): addressed, on the link the PING came in
+      // on, or back through the member that relayed it (a prober with a relay path to this peer). Unaddressed, it went
+      // to the seed, which never asked and reads it as an answer to a probe of its own, and to every other link.
+      const answer = typeof sender === "string"
+        ? (body: Uint8Array): void => this.answerProbe(body, sender, link, heardRelayed, carrier)
+        : (body: Uint8Array): void => this.send("ACK", body);
       if (this.auditOn && typeof sender === "string" && (decoded["hashes"] !== undefined || decoded["root"] !== undefined)) {
-        this.onProbeHashes(sender, decoded); // SPEC §5.2: hashes are answered with hashes, of the kind the pinger reads
+        this.onProbeHashes(sender, decoded, answer); // SPEC §5.2: hashes are answered with hashes, of the kind the pinger reads
       } else {
-        this.send("ACK", wire.ackBody(decoded["nonce"] as number | bigint));
+        answer(wire.ackBody(decoded["nonce"] as number | bigint));
       }
     } else if (kind === "GROUP_AD") {
       this.offerGroupAd(env); // only a join in progress cares (§10.1)
@@ -2747,9 +3559,15 @@ export class Peer {
   }
 
   /** The streams this peer serves: the spaces it pulled or wrote, the ads, and the revocations. */
+  /**
+   * Whether this peer answers a digest of the stream. A space is served once joined (pulled, written, or opened), not
+   * only once pulled (owner decision 2 of 2026-11-23): a dial-only peer that wrote to a space it never pulled answers
+   * its seed's DIGEST with its own states, so a rumor of its own lost on its only link is repaired by the seed's round.
+   * Only the rounds this peer opens ({@link fullDigests}, {@link heldStreams}) stay on the pulled spaces.
+   */
   private servesStream(stream: string): boolean {
     return stream === "ads" || stream === "view" || revocation.STREAMS.includes(stream)
-      || (stream.startsWith("space:") && this.pulledSpaces.has(stream.substring("space:".length)));
+      || (stream.startsWith("space:") && this.joinedSpaces.has(stream.substring("space:".length)));
   }
 
   /** The entry states of one space (by its SpaceId), as held. */
@@ -2800,18 +3618,27 @@ export class Peer {
   private readonly spaceTexts = new Map<string, { version: number; bytes: Uint8Array; hash: Uint8Array | null }>();
 
   /** `ReplicatedSpace.deltaFor`: the states and claims the remote digest does not name, as a SyncDelta. */
-  spaceDeltaFor(space: string, remoteDigest: Uint8Array): Uint8Array {
+  spaceDeltaFor(space: string, remoteDigest: Uint8Array, only: Map<string, Dict> | null = null): Uint8Array {
     const remote = serving.parseDigestLines(remoteDigest);
     const states: Dict[] = [];
     const claims: Dict = {};
     const held = this.statesOf(space);
+    if (only !== null) {
+      for (const entryId of [...held.keys()]) {
+        if (!only.has(entryId)) {
+          held.delete(entryId); // a dial-only peer's answer to a relayed DIGEST: its displaced entries alone
+        }
+      }
+    }
     for (const [entryId, dto] of held) {
       const key = `e:${entryId}=${serving.stateHash(dto)}`;
       if (!remote.has(key) && !remote.has(`a:${key}`)) {
         states.push(this.signedStateOf(entryId, dto)); // a join nobody signed travels as its most advanced signed input
       }
     }
-    for (const [entryId, signed] of this.claims) {
+    // A dial-only peer's answer to a relayed DIGEST carries its own displaced claim, not the one its lattice kept.
+    const claimsOf: Iterable<[string, Dict]> = only ?? this.claims;
+    for (const [entryId, signed] of claimsOf) {
       if (!held.has(entryId)) {
         continue;
       }
@@ -2919,11 +3746,161 @@ export class Peer {
    * hashed opening (`hashes`) or a `want` list belongs to the hashed round this peer never
    * advertises, and is ignored.
    */
-  private onDigest(from: string, digest: Dict): void {
+  private onDigest(from: string, digest: Dict, relayed = false, link: Link | null = null): void {
+    if (this.dialsOnly() && !this.fromOwnSeed(from, relayed, link)) {
+      this.answerDisplacedPull(from, digest);
+      return;
+    }
     if (this.onDigestFields(from, digest)) {
       return;
     }
     this.answerTextPull(from, digest);
+  }
+
+  /** Whether this peer only dials: it names no endpoint of its own and holds no accepted link (SPEC §9.4's row). */
+  private dialsOnly(): boolean {
+    return this.endpoints.length === 0 && this.inbound.size === 0;
+  }
+
+  /**
+   * Whether a frame is its own seed's: read directly off the dialed link (not relayed, not a forwarded copy) from the
+   * seed's PeerID, or, before the seed's first addressed frame names it, from the link's other end.
+   */
+  private fromOwnSeed(from: string, relayed: boolean, link: Link | null): boolean {
+    return link === null && !relayed && (this.seedPeer === null || from === this.seedPeer);
+  }
+
+  /** DIGESTs a dial-only peer left unanswered: relayed or from a member other than its seed, naming nothing it holds displaced. */
+  digestsIgnored = 0;
+  /** Relayed or non-seed DIGESTs a dial-only peer answered with its displaced entries alone (owner decision 1). */
+  displacedDigestAnswers = 0;
+  /** Such DIGESTs left unanswered because the asker's answer bucket was empty. */
+  relayedAnswersPaced = 0;
+  /** The relayed answers' buckets, per asker: tokens left, and when each was last refilled (monotonic). */
+  private readonly answerBuckets = new Map<string, { tokens: number; at: number }>();
+
+  /**
+   * Owner decision 1 of 2026-11-23 (SPEC §9.4's dial-only DIGEST row, §14's open question settled): a dial-only peer
+   * answers a DIGEST that reached it relayed, or from any member but its seed, only for the spaces where it holds a
+   * claim made here that a better claim displaced, with or without its completion ({@link displacedHeld}, as the
+   * core), and sends only those entries: the displaced claim, and the entry's state (its completion, if any), each only
+   * where the asker's digest lacks it. So a winner's targeted round (§7.4) reaches the
+   * holder its claim displaced, while no member can draw the rest of this peer's state through the seed (upload
+   * amplification). The fields read are the core's: `hashes` (an opening, answered with `want` for the spaces holding
+   * a displaced claim whose text form differs), `digests` (the text pull), and `want` for a round this peer opened;
+   * every other field (an audit's `tree`, `ids`) and every stream but a space's is left out. Each asker's answers take its own bucket, {@link RELAYED_ANSWER_BURST}
+   * refilled at {@link RELAYED_ANSWER_PER_SECOND} on the monotonic clock (as in every client), so one member flooding
+   * relayed DIGESTs cannot starve another winner's round; the seed's own round stays outside them. The answer goes back through the seed ({@link sendAddressed}).
+   */
+  private answerDisplacedPull(from: string, digest: Dict): void {
+    let answered = false;
+    const asked = digest["want"] as string[] | undefined;
+    if (Array.isArray(asked) && asked.length > 0 && this.expectedPulls.has(from)) {
+      // A round this peer opened: answered as ever (the core's onDigestDisplacedOnly).
+      this.pacing.wantsReceived += 1;
+      const digests = this.textDigests(asked);
+      if (Object.keys(digests).length > 0) {
+        this.sendAddressed("DIGEST", this.textPull(from, digests), from);
+        answered = true;
+      }
+    }
+    // An opening of hashes: the spaces holding a displaced claim whose text form differs, named in want, so the
+    // winner sends its text digests (by the text form even toward an auditing member, as the core).
+    const want: string[] = [];
+    const hashes = digest["hashes"];
+    if (hashes !== null && typeof hashes === "object" && !Array.isArray(hashes)) {
+      for (const stream of Object.keys(hashes as Dict).sort()) {
+        const hash = (hashes as Dict)[stream];
+        if (!(hash instanceof Uint8Array) || !stream.startsWith("space:") || !this.servesStream(stream)) {
+          continue;
+        }
+        if (this.displacedAnswerable(stream.substring("space:".length)).size > 0
+            && !equals(this.streamHashOf(stream, false), hash)) {
+          want.push(stream);
+        }
+      }
+    }
+    const digests = digest["digests"];
+    const deltas: Dict = {};
+    if (digests !== null && typeof digests === "object" && !Array.isArray(digests)) {
+      for (const [stream, remote] of Object.entries(digests as Dict)) {
+        if (!(remote instanceof Uint8Array) || !stream.startsWith("space:") || !this.servesStream(stream)) {
+          continue;
+        }
+        const space = stream.substring("space:".length);
+        const only = this.displacedAnswerable(space);
+        if (only.size === 0) {
+          continue;
+        }
+        const delta = this.spaceDeltaFor(space, remote, only);
+        if (delta.length > 0) {
+          deltas[stream] = delta;
+        }
+      }
+    }
+    if (want.length === 0 && Object.keys(deltas).length === 0) {
+      if (!answered) {
+        this.digestsIgnored += 1;
+      }
+      return;
+    }
+    if (!this.takeAnswerToken(from)) {
+      this.relayedAnswersPaced += 1;
+      return; // the asker's next round finds a token
+    }
+    if (want.length > 0) {
+      this.pacing.wantsSent += 1;
+      this.displacedDigestAnswers += 1;
+      this.sendAddressed("DIGEST", wire.digestRecord({ want }), from);
+    }
+    if (Object.keys(deltas).length > 0) {
+      this.pullsAnswered += 1;
+      this.displacedDigestAnswers += 1;
+      this.sendAddressed("PULL_RESP", dumps({ deltas: canonicalMap(deltas) }), from);
+    }
+  }
+
+  /** Takes one token of `asker`'s answer bucket, refilled on the monotonic clock; false when it is empty. */
+  private takeAnswerToken(asker: string): boolean {
+    const mono = this.monotonic();
+    const held = this.answerBuckets.get(asker);
+    this.answerBuckets.delete(asker); // re-inserted last: the least recently asked goes first past the cap
+    const tokens = held === undefined ? RELAYED_ANSWER_BURST
+      : Math.min(RELAYED_ANSWER_BURST, held.tokens + (mono - held.at) * RELAYED_ANSWER_PER_SECOND / 1000);
+    const spent = tokens >= 1;
+    this.answerBuckets.set(asker, { tokens: spent ? tokens - 1 : tokens, at: mono });
+    while (this.answerBuckets.size > RELAYED_ANSWER_ASKERS) {
+      this.answerBuckets.delete(this.answerBuckets.keys().next().value as string);
+    }
+    return spent;
+  }
+
+  /**
+   * The entries of one space for which this peer holds a claim made here that a better claim displaced, with or
+   * without a completion under it ({@link displacedHeld}, then each claim still offered again), each with that claim,
+   * as the core's displacedFor; a line whose claim lapsed, whose stamp is half the drift ceiling old, or whose entry is
+   * gone is dropped here. Read from this peer's own lattice alone, never from the asker's digest, so an asker cannot
+   * widen it.
+   */
+  private displacedAnswerable(space: string): Map<string, Dict> {
+    const out = new Map<string, Dict>();
+    const now = this.now();
+    const spaceId = wireSpaceId(this.group, space);
+    for (const [entryId, signed] of [...this.displacedHeld]) {
+      const claim = signed["claim"] as Dict;
+      if (wire.claimNumber(claim["expiresAtMillis"]) <= now
+          || now - wire.hlcPhysical(claim["stamp"]) > wire.MAX_HLC_SKEW_MILLIS / 2 || !this.states.has(entryId)) {
+        this.displacedHeld.delete(entryId);
+      } else if (claim["spaceId"] === spaceId) {
+        out.set(entryId, signed);
+      }
+    }
+    for (const [entryId, line] of this.displacedOwn) {
+      if (line.space === space && !out.has(entryId) && this.states.has(entryId)) {
+        out.set(entryId, line.signed);
+      }
+    }
+    return out;
   }
 
   /** The text pull of a body without a budget or ids, answered exactly as a 0.6.0 member answers it. */
@@ -2947,7 +3924,10 @@ export class Peer {
     }
     if (Object.keys(deltas).length > 0) {
       this.pullsAnswered += 1;
-      this.send("PULL_RESP", dumps({ deltas: canonicalMap(deltas) }), from); // P2, HLC round six, 2026-11-08
+      // Through the seed when the asker is not on a link of this peer's own: a dial-only peer's addressed frame on its
+      // dialed channel is dropped by a seed that is not its recipient, so a member's (a winner's targeted) DIGEST that
+      // reached it in a RELAY_FRAME was never answered (owner decision 4 of 2026-11-23).
+      this.sendAddressed("PULL_RESP", dumps({ deltas: canonicalMap(deltas) }), from); // P2, HLC round six, 2026-11-08
     }
   }
 
@@ -3026,11 +4006,64 @@ export class Peer {
     if (typeof target !== "string" || target === this.identity.peerId) {
       return;
     }
+    // A holder probes the target over its own link (SPEC v0.1.36 §5.2, the targeted relay); with no link to it and no
+    // dialed channel to route through, the PING would go to every link this peer holds, so it goes nowhere.
+    if (this.linkFor(target) === null && this.channel === null) {
+      this.pingReqsUnroutable += 1;
+      return;
+    }
+    const now = this.monotonic();
+    this.forgetRelays(now);
     const nonce = BigInt.asIntN(64, (BigInt(Math.floor(Math.random() * 2 ** 32)) << 32n)
       | BigInt(Math.floor(Math.random() * 2 ** 32)));
-    this.relays.set(String(nonce), { origin: from, originNonce: (request["nonce"] as number | bigint | undefined) ?? 0, target });
+    this.relays.set(String(nonce), { origin: from, originNonce: (request["nonce"] as number | bigint | undefined) ?? 0,
+      target, at: now });
     this.pingsRelayed += 1;
-    this.send("PING", wire.pingBody(nonce), target);
+    if (this.linkFor(target) !== null) {
+      this.send("PING", wire.pingBody(nonce), target);
+    } else {
+      // Over the dialed channel: a dial-only peer asked as one of a Java prober's random members (the escalated round
+      // of SPEC v0.1.36 §5.2) reaches any member but its seed inside a RELAY_FRAME the seed carries; addressed and
+      // bare, the seed would drop it.
+      this.sendAddressed("PING", wire.pingBody(nonce), target);
+    }
+  }
+
+  /** Forgets relays past their hold, and the eldest beyond the size bound. */
+  private forgetRelays(now: number): void {
+    for (const [nonce, relay] of this.relays) {
+      if (now - relay.at <= RELAY_HOLD_MILLIS && this.relays.size < MAX_RELAYS) {
+        break; // insertion order is time order: the rest are younger
+      }
+      this.relays.delete(nonce);
+      this.relaysExpired += 1;
+    }
+  }
+
+  /**
+   * Answers a probe to its prober (SPEC v0.1.36 §5.2): addressed, on the link it was heard on; a PING heard through
+   * another member (inside a `RELAY_FRAME`, or forwarded on a link whose other end is not its signer) goes back the
+   * same way, wrapped in a `RELAY_FRAME` to the member that carried it, so the prober's own nonce reaches the prober.
+   */
+  private answerProbe(body: Uint8Array, to: string, link: Link | null, relayed: boolean, carrier: string | null): void {
+    if (!relayed) {
+      this.send("ACK", body, to);
+      return;
+    }
+    const inner = wire.encodeFrame(wire.envelope(this.group, "ACK", this.identity.peerId,
+      wire.hlcNow(this.identity.peerId, this.now()), body, to), this.identity);
+    this.relayedFrames += 1;
+    this.probesAnsweredRelayed += 1;
+    this.sendOn(link, "RELAY_FRAME", wire.relayFrameBody(to, inner), carrier ?? (link === null ? this.seedPeer : null));
+    this.noteRelayed(to);
+  }
+
+  /** PINGs heard through another member and answered back through it. */
+  probesAnsweredRelayed = 0;
+
+  /** PING_REQ relays awaiting the target's ACK (bounded; for tests and operators). */
+  get relaysInFlight(): number {
+    return this.relays.size;
   }
 
   private onAck(from: string, ack: Dict): void {
@@ -3046,24 +4079,27 @@ export class Peer {
    * has no SWIM prober; a member that left or died ages out with its advertisement).
    */
   expireMembers(): string[] {
+    if (this.dueLoop !== null) {
+      // A frozen process whose watchdog has not run yet: the wake is seen (and its probes sent) before any judgement.
+      (this.watchdog ?? watchdogFor(this.timers)).catchUp();
+    }
     const now = this.now();
+    const mono = this.monotonic();
     const gone: string[] = [];
     const linked = new Set(this.linkedMembers());
     for (const [peer, ad] of this.members) {
-      if (linked.has(peer) || ad["issued"] === undefined) {
+      if (linked.has(peer) || !this.adLapsed(ad, now)) {
         continue;
       }
-      try {
-        if (parseInstantMillis(ad["issued"]) + parseDurationMillis(ad["ttl"]) > now) {
-          continue;
-        }
-      } catch {
+      if (this.wakeHolds(peer, mono)) {
+        this.wakeDropsDeferred += 1; // a probe, not a drop (owner decision 3 of 2026-11-23)
         continue;
       }
       gone.push(peer);
     }
     for (const peer of gone) {
       this.members.delete(peer);
+      this.wakeAnswered.delete(peer);
       this.heldPeerAds.delete(peer);
       this.reachable.delete(peer);
       this.sessionPeers.delete(peer);
@@ -3083,7 +4119,9 @@ export class Peer {
     }
     if (delta["state"] !== null && typeof delta["state"] === "object") {
       this.fold(delta["state"] as Dict);
+      this.staleOffered(delta["state"] as Dict);
     }
+    this.offerDisplaced();
   }
 
   private fold(dto: Dict): void {
@@ -3104,7 +4142,13 @@ export class Peer {
     // ASF-025, as Java's ReplicatedSpace.dotsBoundToIssuer and before the signatures (HLC round six,
     // 2026-11-08, reference rule): only an entry's writer mints its dots, so a dot naming another
     // replica is fabricated provenance and the state is dropped, counted nowhere.
-    if (typeof entryId !== "string" || !dotsBoundToIssuer(dto, record) || !this.verifyState(dto, record)) {
+    if (typeof entryId !== "string" || !dotsBoundToIssuer(dto, record)) {
+      return; // fabricated provenance: drop it
+    }
+    if (!this.verifyState(dto, record)) {
+      if (dto["completed"] && this.rememberUnproven(entryId, dto)) {
+        this.judgeDisplaced(entryId); // a displaced holder's completion whose claim came in another frame (§7.4)
+      }
       return; // unauthenticated record or forged mutable state: drop it
     }
     if (this.auditOn && hasControl(entryId)) {
@@ -3165,9 +4209,7 @@ export class Peer {
     // shrink the sets, roll back the lease, or undo a completion.
     const previous = this.states.get(entryId);
     this.storeJoined(entryId, previous, dto);
-    if (this.collector === null) {
-      this.collector = this.every(COLLECT_PERIOD_MILLIS, () => this.collectTombstones());
-    }
+    this.collectBy(this.horizonOf(this.states.get(entryId)!));
     this.onState?.(this.states.get(entryId)!, previous);
     this.wakeFoldWaiters();
     if (pending !== undefined) {
@@ -3218,7 +4260,7 @@ export class Peer {
    * peer key verifies at `signedAt`, and verify under its agent key; and an
    * agent-attested party's transitions must be agent-signed (A6, v0.1.13).
    */
-  private verifyState(dto: Dict, record: Dict): boolean {
+  private verifyState(dto: Dict, record: Dict, proof: Dict | null = null): boolean {
     const issuerKey = dto["issuerPublicKey"];
     if (!(issuerKey instanceof Uint8Array) || issuerKey.length !== 32) {
       return false;
@@ -3236,7 +4278,7 @@ export class Peer {
     let party: unknown;
     let partyAttested: boolean;
     if (dto["completed"]) {
-      const signed = this.claims.get(String(record["entryId"]));
+      const signed = proof ?? this.claims.get(String(record["entryId"]));
       if (!signed) {
         return false; // no authenticated holder to attribute the completion to
       }
@@ -3378,10 +4420,9 @@ export class Peer {
   private acknowledgeLine(line: string, spaceId: string): void {
     this.refusedAck.delete(line); // re-offered: kept as the newest
     this.refusedAck.set(line, spaceId);
-    if (this.collector === null) {
-      // The sweep forgets acknowledgements whose time has come, so it runs once there is one to forget.
-      this.collector = this.every(COLLECT_PERIOD_MILLIS, () => this.collectTombstones());
-    }
+    // The sweep forgets acknowledgements whose time has come, so it runs once there is one to forget (the forget
+    // times below bring it forward).
+    this.collectBy(this.now() + COLLECTED_ACK_HOLD_MILLIS);
     // R7's bound is per space, as Java's refusedAck is (srad/replication-by-entry.md §10.1): one busy space's refusals
     // never push another space's acknowledgements out.
     if ((this.ackCounts.get(spaceId) ?? 0) > MAX_REFUSED_ACK) {
@@ -3533,12 +4574,383 @@ export class Peer {
       return;
     }
     this.observeClaimLease(signed);
-    this.claims.set(entryId, wire.mergeClaims(this.claims.get(entryId), signed));
-    if (this.collector === null) {
-      this.collector = this.every(COLLECT_PERIOD_MILLIS, () => this.collectTombstones()); // R10: claims expire too
+    if (committed) {
+      this.logDecidedEpochs.set(entryId, Math.max(this.logDecidedEpochs.get(entryId) ?? 0, epoch));
+      capLines(this.logDecidedEpochs);
     }
+    this.mergeHeldClaim(entryId, signed);
+    this.collectBy(wire.claimNumber(signed["claim"] && (signed["claim"] as Dict)["expiresAtMillis"])); // R10: claims expire too
     this.onClaim?.(entryId, this.claims.get(entryId)!);
     this.wakeFoldWaiters();
+    this.judgeDisplaced(entryId);
+    this.offerDisplaced();
+  }
+
+  // ------------------------------------------------- the settle guarantee's second rule, paired (SPEC §7.4, v0.1.36)
+  // As Java's ReplicatedSpace (the store race of 2026-11-22): the winner remembers, per entry and bounded, the claims
+  // its own claim displaced and the completions it dropped for want of their claim, and judges each pair when its
+  // second half arrives, from any frame; a displaced holder that completed offers its claim again with a doubling
+  // backoff. No frame, field or vector changes.
+
+  /** The entries whose displaced holder's authentic completion this peer's take acknowledges, by the held epoch. */
+  private readonly outbidCompletions = new Map<string, number>();
+  /** The entries an agent of this peer completed with its own work, by epoch and space name. */
+  private readonly completedHere = new Map<string, { epoch: number; space: string }>();
+  /** Verified claims this peer's held claim displaced, at most DISPLACED_PER_ENTRY per entry. */
+  private readonly displacedClaims = new Map<string, Dict[]>();
+  /** Completions dropped while this peer's claim held the entry, at most DISPLACED_PER_ENTRY per entry. */
+  private readonly unprovenCompletions = new Map<string, Dict[]>();
+  /**
+   * The claims made here that a better claim of another peer displaced, the first one lost per entry, with or without
+   * a completion under it (Java's displacedHere), kept while the claim lives (until it lapses, its stamp is half the
+   * drift ceiling old, or the entry is gone), after any re-offers are spent too: a winner's targeted rounds may start
+   * late, and this peer is the only source of its completion (owner decision 1 of 2026-11-23, as the core). The
+   * entries a relayed or non-seed DIGEST is answered with on a dial-only peer.
+   */
+  private readonly displacedHeld = new Map<string, Dict>();
+  /** This peer's completions whose claim a better claim displaced, offered again (the losing side of rule two). */
+  private readonly displacedOwn = new Map<string, { signed: Dict; space: string; offers: number; next: number }>();
+  /** The highest epoch the ordered log decided per entry: there the log alone names the holder. */
+  private readonly logDecidedEpochs = new Map<string, number>();
+  /** Completions counted twice: this peer did the work and a displaced holder's authentic completion arrived after. */
+  duplicateCompletions = 0;
+  /** Displaced holders' completions this peer's takes acknowledged instead of doing the work again. */
+  displacedAcknowledged = 0;
+  /** Offers of this peer's displaced claims, made again. */
+  displacedReoffers = 0;
+
+  /**
+   * Whether this peer's take of the entry is to acknowledge a displaced holder's authentic completion rather than do
+   * the work again (rule two of SPEC §7.4): its take comes back empty, or its complete writes no result.
+   */
+  knowsDisplacedCompletion(entryId: string): boolean {
+    const held = this.claims.get(entryId)?.["claim"] as Dict | undefined;
+    return held !== undefined && this.outbidCompletions.get(entryId) === wire.claimNumber(held["epoch"]);
+  }
+
+  /** Merges a claim into the lattice and notes which claim the merge displaced. */
+  private mergeHeldClaim(entryId: string, signed: Dict): Dict {
+    const held = this.claims.get(entryId);
+    const kept = wire.mergeClaims(held, signed);
+    if (kept !== held) {
+      this.claims.set(entryId, kept);
+    }
+    if (held !== undefined) {
+      this.noteDisplaced(entryId, kept, kept === held ? signed : held);
+    }
+    return kept;
+  }
+
+  private noteDisplaced(entryId: string, kept: Dict, lost: Dict): void {
+    const keptClaim = kept["claim"] as Dict, lostClaim = lost["claim"] as Dict;
+    if (kept === lost || keptClaim["holder"] === lostClaim["holder"]) {
+      return; // the same holder's renewal or attestation upgrade displaces nobody
+    }
+    const self = this.identity.peerId;
+    if (holderPeer(keptClaim) === self) {
+      const lines = this.displacedClaims.get(entryId) ?? [];
+      if (!lines.some((c) => sameClaim(c["claim"] as Dict, lostClaim))) {
+        lines.push(lost);
+        lines.splice(0, Math.max(0, lines.length - DISPLACED_PER_ENTRY));
+      }
+      this.displacedClaims.set(entryId, lines);
+      capLines(this.displacedClaims);
+      const displacedPeer = holderPeer(lostClaim);
+      if (displacedPeer !== self) {
+        this.fileDisplacedPull(entryId, displacedPeer);
+      }
+    } else if (holderPeer(lostClaim) === self) {
+      if (!this.displacedHeld.has(entryId)) {
+        // The claim made here this peer first lost on the entry, with or without a completion under it (Java's
+        // displacedHere): kept past the re-offers too, while the claim lives, for a relayed DIGEST (decision 1).
+        this.displacedHeld.set(entryId, lost);
+        capLines(this.displacedHeld);
+      }
+      const done = this.completedHere.get(entryId);
+      if (done !== undefined && done.epoch === wire.claimNumber(lostClaim["epoch"])) {
+        if (!this.displacedOwn.has(entryId)) {
+          this.displacedOwn.set(entryId, { signed: lost, space: done.space, offers: 0, next: this.monotonic() });
+          capLines(this.displacedOwn);
+        }
+      }
+    }
+  }
+
+  /** Keeps a completion dropped while this peer's claim holds the entry; returns whether a displaced claim is known. */
+  private rememberUnproven(entryId: string, dto: Dict): boolean {
+    const held = this.claims.get(entryId)?.["claim"] as Dict | undefined;
+    if (held === undefined || holderPeer(held) !== this.identity.peerId || !(dto["stateSig"] instanceof Uint8Array)
+        || (dto["signer"] != null && dto["signer"] === held["holder"])) {
+      return false; // not this peer's claim, or the held claim's own completion coming back
+    }
+    const lines = this.unprovenCompletions.get(entryId) ?? [];
+    if (!lines.some((d) => equals(d["stateSig"] as Uint8Array, dto["stateSig"] as Uint8Array))) {
+      lines.push(dto);
+      lines.splice(0, Math.max(0, lines.length - DISPLACED_PER_ENTRY));
+    }
+    this.unprovenCompletions.set(entryId, lines);
+    capLines(this.unprovenCompletions);
+    return this.displacedClaims.has(entryId);
+  }
+
+  /** Judges each completion dropped here for an entry against each claim this peer's claim displaced for it. */
+  private judgeDisplaced(entryId: string): void {
+    const claims = this.displacedClaims.get(entryId);
+    const states = this.unprovenCompletions.get(entryId);
+    if (claims === undefined || states === undefined) {
+      return;
+    }
+    for (const dto of [...states]) {
+      for (const claim of [...claims]) {
+        const holder = (claim["claim"] as Dict)["holder"];
+        if (dto["signer"] == null || dto["signer"] === holder) {
+          this.noteOutbidCompletion(entryId, claim, dto);
+        }
+      }
+    }
+  }
+
+  /**
+   * Judges a completion this replica dropped because this peer's held claim displaces the claim it was made under
+   * (rule two of SPEC §7.4). While the entry is present here, a live displaced holder's authentic completion makes
+   * this peer's take acknowledge it instead of doing the work again; when this peer already completed it with its
+   * own work, both did the work, and it is counted once as a duplicate. A revoked holder's completion is no evidence,
+   * nor is one at an epoch the ordered log decided.
+   */
+  private noteOutbidCompletion(entryId: string, proof: Dict, received: Dict): void {
+    if (!received["completed"]) {
+      return;
+    }
+    const displaced = proof["claim"] as Dict;
+    const held = this.claims.get(entryId)?.["claim"] as Dict | undefined;
+    const state = this.states.get(entryId);
+    if (displaced["entryId"] !== entryId || held === undefined || state === undefined
+        || holderPeer(held) !== this.identity.peerId || held["holder"] === displaced["holder"]
+        || wire.claimNumber(displaced["epoch"]) > wire.claimNumber(held["epoch"])
+        || wire.mergeClaims(this.claims.get(entryId), proof) !== this.claims.get(entryId)) {
+      return;
+    }
+    const decided = this.logDecidedEpochs.get(entryId);
+    if (decided !== undefined && wire.claimNumber(displaced["epoch"]) <= decided) {
+      return;
+    }
+    const now = this.now();
+    const heldEpoch = wire.claimNumber(held["epoch"]);
+    let duplicate: boolean;
+    if (present(state)) {
+      if (wire.claimNumber(held["expiresAtMillis"]) <= now || wire.claimNumber(displaced["expiresAtMillis"]) <= now
+          || this.outbidCompletions.get(entryId) === heldEpoch) {
+        return;
+      }
+      duplicate = false;
+    } else if (state["completed"] && this.completedHere.get(entryId)?.epoch === heldEpoch) {
+      duplicate = true;
+    } else {
+      return;
+    }
+    const record = (received["record"] as Dict | null | undefined) ?? (state["record"] as Dict | undefined);
+    if (record === undefined || record === null || record["spaceId"] !== (state["record"] as Dict)["spaceId"]
+        || this.holderRevoked(proof)
+        || !this.verifyState(received["record"] == null ? { ...received, record } : received, record, proof)) {
+      return;
+    }
+    if (duplicate) {
+      this.completedHere.delete(entryId);
+      this.duplicateCompletions += 1;
+    } else {
+      this.outbidCompletions.set(entryId, heldEpoch);
+      capLines(this.outbidCompletions);
+    }
+  }
+
+  /** A state showing the entry present while one of this peer's completions of it waits to be offered: due again. */
+  private staleOffered(dto: Dict): void {
+    if (this.displacedOwn.size === 0 || dto["completed"] || !present(dto)) {
+      return;
+    }
+    const entryId = (dto["record"] as Dict | undefined)?.["entryId"] ?? dto["entryId"];
+    const line = typeof entryId === "string" ? this.displacedOwn.get(entryId) : undefined;
+    if (line !== undefined && this.monotonic() >= line.next) {
+      this.reofferDue = true;
+    }
+  }
+
+  private reofferDue = false;
+
+  /**
+   * Offers again each displaced claim of this peer's that is due, as the claim delta it first travelled in, and moves
+   * its next offer back (at once, then no sooner than 1 s, 2 s, 4 s ... after the previous one, at most six offers,
+   * while the claim is live and younger than half the drift ceiling); drops a line that is spent.
+   */
+  private offerDisplaced(): void {
+    if (this.displacedOwn.size === 0) {
+      return;
+    }
+    const mono = this.monotonic();
+    const now = this.now();
+    for (const [entryId, line] of [...this.displacedOwn]) {
+      const claim = line.signed["claim"] as Dict;
+      const decided = this.logDecidedEpochs.get(entryId);
+      if (line.offers >= REOFFER_MAX || wire.claimNumber(claim["expiresAtMillis"]) <= now
+          || now - wire.hlcPhysical(claim["stamp"]) > wire.MAX_HLC_SKEW_MILLIS / 2
+          || !this.states.has(entryId)
+          || (decided !== undefined && wire.claimNumber(claim["epoch"]) <= decided)) {
+        this.displacedOwn.delete(entryId);
+        continue;
+      }
+      if (line.offers === 0 || (this.reofferDue && mono >= line.next)) {
+        line.next = mono + REOFFER_BACKOFF_MILLIS * 2 ** line.offers;
+        line.offers += 1;
+        this.displacedReoffers += 1;
+        this.send("RUMOR", wire.rumorBody(`space:${line.space}`, `c:${entryId}:${String(claim["stamp"])}`, 6,
+          wire.claimDelta(entryId, line.signed)));
+      }
+    }
+    this.reofferDue = false;
+  }
+
+  // ------------------------------------------------- targeted rounds toward displaced holders (owner decision 4)
+  // As Java's ReplicatedSpace.displacedPulls (srad/agentspaces-event-loop.md §10.29, phase 6, owner decision 4 of
+  // 2026-11-23): a displaced holder's completion may have one source only, the holder itself, since a replica holding
+  // the better claim drops it (SPEC §11a.4), and anti-entropy repairs only a round's opener. So while this peer's take
+  // of the entry is open, it opens rounds with each holder its claim displaced rather than wait for a random partner
+  // pick (or, on a dial-only peer, for a pull through its seed, which drops the completion): at once, then after 1, 2,
+  // 4, 8 and 16 s on the monotonic clock, at most DISPLACED_PULL_MAX rounds, ending when it learns the completion,
+  // completes the entry itself, or no longer holds the claim. No wire change: a round is the usual DIGEST, sent through
+  // the seed in a RELAY_FRAME when the holder is not on a link of this peer's own.
+
+  /** Per entry this peer's claim won: the holders it displaced and the targeted rounds so far. Bounded. */
+  private readonly displacedPulls = new Map<string, { holders: Set<string>; rounds: number; next: number }>();
+  /** Targeted anti-entropy rounds opened toward holders this peer's claim displaced (Java displacedPullRounds). */
+  displacedPullRounds = 0;
+
+  /** Files a displaced holder for the targeted rounds and brings the task forward to its next round. */
+  private fileDisplacedPull(entryId: string, holder: string): void {
+    const now = this.monotonic();
+    let pull = this.displacedPulls.get(entryId);
+    if (pull === undefined) {
+      pull = { holders: new Set(), rounds: 0, next: now };
+      this.displacedPulls.set(entryId, pull);
+      capLines(this.displacedPulls);
+    }
+    if (!pull.holders.has(holder)) {
+      pull.holders.add(holder);
+      if (pull.rounds > 0) {
+        pull.next = Math.min(pull.next, now); // a newly displaced holder is asked at once
+      }
+    }
+    const loop = this.loop;
+    if (!loop.has(DISPLACED_PULL_TASK)) {
+      loop.add(DISPLACED_PULL_TASK, (nowMono) => this.pullDisplacedHolders(nowMono), null);
+    }
+    const due = loop.dueOf(DISPLACED_PULL_TASK);
+    if (due === null || pull.next < due) {
+      loop.reschedule(DISPLACED_PULL_TASK, pull.next);
+    }
+  }
+
+  /**
+   * Opens the targeted rounds that are due and drops the lines whose take is no longer open here: this peer no longer
+   * holds the claim, it has lapsed, the entry is no longer present, the displaced completion is already known, or the
+   * rounds are spent. Returns the next round's deadline on the monotonic clock, or null for none.
+   */
+  private pullDisplacedHolders(nowMono: number): number | null {
+    const self = this.identity.peerId;
+    const wall = this.now();
+    const partners = new Map<string, Set<string>>(); // holder -> the entries it is asked for (one round names all)
+    let next = Number.POSITIVE_INFINITY;
+    for (const [entryId, pull] of [...this.displacedPulls]) {
+      const held = this.claims.get(entryId)?.["claim"] as Dict | undefined;
+      const state = this.states.get(entryId);
+      const open = held !== undefined && holderPeer(held) === self && state !== undefined && present(state)
+        && wire.claimNumber(held["expiresAtMillis"]) > wall
+        && this.outbidCompletions.get(entryId) !== wire.claimNumber(held["epoch"]);
+      if (!open || pull.rounds >= DISPLACED_PULL_MAX) {
+        this.displacedPulls.delete(entryId);
+        continue;
+      }
+      if (nowMono >= pull.next) {
+        for (const holder of pull.holders) {
+          let asked = partners.get(holder);
+          if (asked === undefined) {
+            asked = new Set();
+            partners.set(holder, asked);
+          }
+          asked.add(entryId);
+        }
+        pull.next = nowMono + REOFFER_BACKOFF_MILLIS * 2 ** pull.rounds;
+        pull.rounds += 1;
+      }
+      next = Math.min(next, pull.next);
+    }
+    for (const [holder, entryIds] of partners) {
+      this.displacedPullRounds += 1;
+      try {
+        this.targetedRound(holder, entryIds);
+      } catch {
+        // the next round is due on its backoff
+      }
+    }
+    return Number.isFinite(next) ? next : null;
+  }
+
+  /**
+   * One anti-entropy round with a named member (Java GossipBus.antiEntropyWith): a text DIGEST of the asked entries' spaces,
+   * the form every member answers (a 0.6.0 one, and one under `wire.ae=2` answers it as a 0.6.0 member would), with a
+   * PULL_RESP of what this peer lacks. It names the space whether this peer pulls it or only joined it, as a dial-only
+   * peer does. Directly on a link of this peer's own; through the seed, which drops a frame addressed to anyone else,
+   * in a RELAY_FRAME, and the holder's PULL_RESP comes back the same way.
+   */
+  private targetedRound(holder: string, entryIds: Set<string>): void {
+    // One round names the space of every entry the holder is asked for (Java's antiEntropyWith digests every stream):
+    // a holder displaced in two spaces is asked for both at once.
+    const digests: Dict = {};
+    for (const entryId of entryIds) {
+      const space = this.spaceNameOf(entryId);
+      if (space !== null) {
+        digests[`space:${space}`] = this.spaceDigest(space);
+      } else {
+        Object.assign(digests, this.fullDigests());
+      }
+    }
+    this.sendAddressed("DIGEST", wire.digestBody(digests), holder);
+  }
+
+  /** The name of the joined space an entry belongs to, or null when no joined space holds it. */
+  private spaceNameOf(entryId: string): string | null {
+    const spaceId = (this.states.get(entryId)?.["record"] as Dict | undefined)?.["spaceId"];
+    for (const space of this.joinedSpaces) {
+      if (wireSpaceId(this.group, space) === spaceId) {
+        return space;
+      }
+    }
+    return null;
+  }
+
+  /** Forgets the settle lines of collected entries. */
+  private forgetSettleLines(entryId: string): void {
+    this.outbidCompletions.delete(entryId);
+    this.completedHere.delete(entryId);
+    this.displacedClaims.delete(entryId);
+    this.unprovenCompletions.delete(entryId);
+    this.displacedOwn.delete(entryId);
+    this.displacedHeld.delete(entryId);
+    this.displacedPulls.delete(entryId);
+    this.logDecidedEpochs.delete(entryId);
+  }
+
+  /**
+   * Completes an entry this peer's claim holds, with no result, when the holder that claim displaced already completed
+   * it (rule two of SPEC §7.4): every replica converges on one completion and the displaced holder's result stays the
+   * only one. Returns whether it did; the caller then writes no result.
+   */
+  acknowledgeDisplacedCompletion(space: string, entryId: string, agent: AgentIdentity | null = null): boolean {
+    if (!this.knowsDisplacedCompletion(entryId)) {
+      return false;
+    }
+    this.requireHeld(space, entryId, agent);
+    this.completeEntry(space, entryId, agent);
+    return true;
   }
   // ------------------------------------------------- replication by entry (SPEC annex I.6, §5.2, §7.2, §7.3, v0.1.35)
   // srad/replication-by-entry.md RE-L-01: the form per partner from its current card (the audit, the hashed round of
@@ -3728,6 +5140,7 @@ export class Peer {
 
   private noteReplicationHints(issuer: string, hints: Dict): void {
     this.hinted.at = Number.NaN;
+    this.wakeCollector(); // a hint that comes or goes moves the horizon's streak, judged once per round
     const toggle = (set: Set<string>, on: boolean): void => {
       if (on) {
         set.add(issuer);
@@ -4014,7 +5427,7 @@ export class Peer {
     if (want.length > 0) {
       this.pacing.wantsSent += 1;
     }
-    this.send("DIGEST", wire.digestRecord({ want: want.length > 0 ? want : null,
+    this.sendAddressed("DIGEST", wire.digestRecord({ want: want.length > 0 ? want : null,
       tree: rooted ? roots as unknown as { [stream: string]: Dict[] } : null }), from);
   }
 
@@ -4079,7 +5492,7 @@ export class Peer {
     if (asked !== null) {
       this.pacing.budgetedAnswers += 1;
     }
-    this.send("PULL_RESP", wire.pullRespBody(deltas, remainder), from);
+    this.sendAddressed("PULL_RESP", wire.pullRespBody(deltas, remainder), from); // through the seed, as answerTextPull
   }
 
   /**
@@ -4269,7 +5682,8 @@ export class Peer {
    * differ from this peer's on a stream both hold, a targeted round with the pinger, at most once per round per member,
    * so a persistent difference costs one round per period and no more. An absent value is no information.
    */
-  private onProbeHashes(from: string, ping: Dict): void {
+  private onProbeHashes(from: string, ping: Dict,
+                        answer: (body: Uint8Array) => void = (body) => this.send("ACK", body, from)): void {
     const trie = this.audits(from);
     const hashes = ping["hashes"] as Dict | undefined;
     let mismatch = false;
@@ -4285,7 +5699,7 @@ export class Peer {
       mismatch = !equals(this.rootDigest(trie), root) && !equals(this.rootDigest(!trie), root);
     }
     const probe = this.probeDigests(trie);
-    this.send("ACK", wire.probeBody("ACK", ping["nonce"] as number | bigint, probe.root, probe.hashes), from);
+    answer(wire.probeBody("ACK", ping["nonce"] as number | bigint, probe.root, probe.hashes));
     const now = this.now();
     // As Java's node, a probe opens a round only while this peer's own rounds have backed off: a peer that reconciles
     // at its usual pace repairs the difference there, and a probe's round would only double it (SPEC §5.2).
@@ -4413,6 +5827,7 @@ export class Peer {
     const added = !this.refusedAck.has(line);
     this.acknowledgeLine(line, String(record["spaceId"]));
     this.ackForgetAt.set(line, this.now() + COLLECTED_ACK_HOLD_MILLIS);
+    this.collectBy(this.ackForgetAt.get(line)!);
     if (added) {
       this.collectedReoffersAcknowledged += 1;
     }
@@ -4422,6 +5837,8 @@ export class Peer {
   private forgetRefusedAfter(line: string, at: number): void {
     if (this.refusedAck.has(line)) {
       this.ackForgetAt.set(line, Math.max(at, this.now() + COLLECTED_ACK_HOLD_MILLIS));
+
+      this.collectBy(this.ackForgetAt.get(line)!);
     }
   }
 

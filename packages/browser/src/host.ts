@@ -34,7 +34,8 @@
  */
 
 import {
-  Binder, HttpDialer, Identity, Peer, Space, Template, WsDialer, bytes, capabilities, cbor, parseSeed, platform,
+  Binder, HttpDialer, Identity, Peer, RedialTable, Space, Template, WsDialer, bytes, capabilities, cbor, monotonicMillis,
+  parseSeed, platform,
 } from "@agentspaces/client";
 import type { AgentIdentity, BinderOptions, Bound, Repeating, Residency, Seed, SpaceEvent, Subscription } from "@agentspaces/client";
 import { IndexedDbKeyStore, STATE_STORE } from "./idb.js";
@@ -60,11 +61,18 @@ export type ResidentHostOptions = {
   /** Where the host reports; `console.info` by default, `null` for silence. */
   log?: ((line: string) => void) | null;
   clock?: () => number;
-  /** How long the host waits between dial attempts after a lost or refused resume; 5 s by default. */
+  /**
+   * The first wait between dial attempts after a lost or refused resume; 5 s by default. The waits follow the redial
+   * table, 1, 2, 4 and 6 times it and then wrap, each with a spread of +/-10% (owner decision 1 of 2026-11-23).
+   */
   reconnectIntervalMs?: number;
 };
 
 export const DEFAULT_TICK_MILLIS = 1000;
+/** How often the host runs an anti-entropy round, by time (EL-P-07). */
+export const ANTI_ENTROPY_MILLIS = 10_000;
+/** How often the host re-advertises itself, by time: half its advertisement's ten-minute lease. */
+export const INTRODUCE_MILLIS = 300_000;
 export const DEFAULT_LOCK_WAIT_MILLIS = 3000;
 export const DEFAULT_SNAPSHOT_MILLIS = 30_000;
 export const DEFAULT_PAGE_TIMEOUT_MILLIS = 15_000;
@@ -155,6 +163,8 @@ export class ResidentHost {
   private readonly sink: (line: string) => void;
   private readonly clock: () => number;
   private readonly reconnectIntervalMs: number;
+  /** This host's position in the redial table: reset by a dial that connects and by a resume (a wake). */
+  readonly redialTable = new RedialTable();
 
   constructor(options: ResidentHostOptions) {
     this.shared = options.shared;
@@ -220,7 +230,7 @@ export class ResidentHost {
         if (page === undefined) {
           throw new Error("this page is not attached; say hello first");
         }
-        page.lastBeat = this.clock();
+        page.lastBeat = this.mono();
         page.active = request.active;
         this.onActivity();
         return null;
@@ -359,7 +369,7 @@ export class ResidentHost {
     if (this.config !== null && this.config.group !== config.group) {
       throw new Error(`this host serves group ${this.config.group}, not ${config.group}`);
     }
-    this.pages.set(port, { id: pageId, active, lastBeat: this.clock() });
+    this.pages.set(port, { id: pageId, active, lastBeat: this.mono() });
     try {
       await this.start(config);
       if (active && this.paused) {
@@ -507,6 +517,7 @@ export class ResidentHost {
     this.paused = false;
     this.reason = null;
     this.resumes += 1;
+    this.redialTable.reset(); // a wake dials at once, and a later wait starts from the table's first
     const now = this.clock();
     for (const [entryId, hold] of [...this.holds]) {
       if (hold.expiresAt <= now) {
@@ -534,6 +545,7 @@ export class ResidentHost {
       peer.pullSpace(name);
     }
     this.connected = true;
+    this.redialTable.reset();
     this.startTick();
     this.log(`resumed: connected to ${peer.currentSeed()?.host ?? "?"}`);
     this.broadcastState();
@@ -549,7 +561,7 @@ export class ResidentHost {
       if (!this.paused && this.peer !== null && !this.connected) {
         this.dial().catch(() => undefined);
       }
-    }, this.reconnectIntervalMs);
+    }, this.redialTable.next(this.reconnectIntervalMs));
   }
 
   private clearRetry(): void {
@@ -566,24 +578,39 @@ export class ResidentHost {
     const period = this.config?.tickMillis ?? DEFAULT_TICK_MILLIS;
     this.tick?.stop();
     this.cadenceKnown = false; // a pause is not a drift: the first tick after a start sets the cadence
+    const started = peer.monotonic();
+    this.nextAntiEntropyAt = started + ANTI_ENTROPY_MILLIS;
+    this.nextIntroduceAt = started + INTRODUCE_MILLIS;
     this.tick = peer.every(period, () => this.onTick(period));
   }
 
+  /** When the next anti-entropy round and the next self-advertisement are due, on the peer's monotonic clock. */
+  private nextAntiEntropyAt = 0;
+  private nextIntroduceAt = 0;
+
   /**
-   * One tick: lapsed members, an anti-entropy round every ten seconds, the advertisement every
-   * five minutes, the sweep that judges EXPIRED and REAPPEARED, the holds, the silent pages, and
-   * the periodic snapshot.
+   * One tick: lapsed members, an anti-entropy round every ten seconds and the advertisement every five minutes, paced
+   * by time (EL-P-07, SPEC v0.1.36 §9.5: counted in ticks, a tab the browser throttled to a tick a minute went ten
+   * minutes between rounds and five hours between advertisements, past the advertisement's ten-minute lease), the
+   * sweep that judges EXPIRED and REAPPEARED, the holds, the silent pages, and the periodic snapshot.
    */
   private onTick(period: number): void {
     const peer = this.requirePeer();
     const now = this.clock();
-    this.observeCadence(now, period);
+    // Local periods (the cadence rule, page silence, the snapshot interval) on the monotonic clock (SPEC v0.1.36
+    // §9.5): a wall step is no late tick and silences no page. Hold expiries stay on the wall: they are lease stamps.
+    const local = this.mono();
+    this.observeCadence(local, period);
     this.ticks += 1;
     peer.expireMembers();
-    if (this.ticks % Math.max(1, Math.round(10_000 / period)) === 0) {
+    const mono = peer.monotonic();
+    if (mono >= this.nextAntiEntropyAt) {
+      // Never a burst after a stall: the next round is a whole period from this one.
+      this.nextAntiEntropyAt = Math.max(this.nextAntiEntropyAt + ANTI_ENTROPY_MILLIS, mono + 1);
       peer.antiEntropyRound();
     }
-    if (this.ticks % Math.max(1, Math.round(300_000 / period)) === 0) {
+    if (mono >= this.nextIntroduceAt) {
+      this.nextIntroduceAt = Math.max(this.nextIntroduceAt + INTRODUCE_MILLIS, mono + 1);
       peer.introduce();
     }
     for (const space of this.spaces.values()) {
@@ -594,9 +621,9 @@ export class ResidentHost {
       this.pushContentProgress();
     }
     this.renewHolds(now);
-    this.sweepPages(now);
+    this.sweepPages(local);
     const snapshotMillis = this.config?.snapshotMillis ?? DEFAULT_SNAPSHOT_MILLIS;
-    if (snapshotMillis > 0 && now - this.lastSnapshot >= snapshotMillis) {
+    if (snapshotMillis > 0 && local - this.lastSnapshot >= snapshotMillis) {
       void this.saveSnapshot();
     }
     this.connected = peer.connected();
@@ -683,6 +710,11 @@ export class ResidentHost {
     }
   }
 
+  /** The monotonic clock local periods are judged on: the peer's (virtual in a test), else the runtime's. */
+  private mono(): number {
+    return this.peer !== null ? this.peer.monotonic() : monotonicMillis();
+  }
+
   private sweepPages(now: number): void {
     const timeout = this.config?.pageTimeoutMillis ?? DEFAULT_PAGE_TIMEOUT_MILLIS;
     for (const [port, page] of [...this.pages]) {
@@ -711,7 +743,7 @@ export class ResidentHost {
     if (this.peer === null || this.state === null) {
       return;
     }
-    this.lastSnapshot = this.clock();
+    this.lastSnapshot = this.mono();
     try {
       await this.state.save(SNAPSHOT, cbor.dumps(this.peer.exportSnapshot()));
     } catch (e) {

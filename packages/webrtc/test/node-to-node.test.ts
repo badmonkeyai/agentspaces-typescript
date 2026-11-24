@@ -81,6 +81,8 @@ test("two node-datachannel bindings open a channel and exchange chunked frames",
   const atBob: Uint8Array[] = [];
   const atAlice: Uint8Array[] = [];
   fromAlice.onFrame((f) => atBob.push(f));
+  let progressed = 0;
+  fromAlice.onProgress?.(() => { progressed += 1; }); // owner decision 4 of 2026-11-23: chunks of a frame arriving
   toBob.onFrame((f) => atAlice.push(f));
   const small = new TextEncoder().encode("hello");
   const big = new Uint8Array(200_000);
@@ -95,6 +97,7 @@ test("two node-datachannel bindings open a channel and exchange chunked frames",
   assert.deepEqual(atBob[0], small);
   assert.deepEqual(atBob[1], big);
   assert.deepEqual(atAlice[0], new TextEncoder().encode("pong"));
+  assert.equal(progressed, Math.ceil(big.length / 16383) - 1, "each chunk before a frame's last reports progress");
   assert.ok(aliceBinding.counters.chunksSent >= 1 + Math.ceil(big.length / 16383));
   assert.equal(aliceBinding.counters.sessionsOpened, 1);
 

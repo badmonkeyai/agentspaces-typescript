@@ -40,6 +40,13 @@ export interface FrameChannel {
   send(frame: Uint8Array): void;
   /** Registers the one receiver; frames that arrived before it are delivered to it in order. */
   onFrame(receiver: (frame: Uint8Array) => void): void;
+  /**
+   * Registers the one listener for bytes of a frame still arriving: called when the channel reads part of a frame it
+   * cannot deliver yet (a large frame over a slow link), so a peer counts that progress as the remote's answer (owner
+   * decision 4 of 2026-11-23, SPEC v0.1.37's dead-seed row). Local only; nothing on the wire. Optional: a channel
+   * whose runtime hands it whole messages only (a WebSocket) has no partial frame to report.
+   */
+  onProgress?(listener: () => void): void;
   /** Registers a listener for the channel's end; fires once, at once if it has already ended. */
   onClose(listener: (reason: string) => void): void;
   /** Ends the channel; idempotent. */
@@ -103,6 +110,26 @@ export class ChannelEvents {
   private early: Uint8Array[] = [];
   private readonly closeListeners: ((reason: string) => void)[] = [];
   private closedReason: string | null = null;
+  private progressListener: (() => void) | null = null;
+  /** Reads that brought part of a frame and no whole one (see {@link FrameChannel.onProgress}). */
+  partialReads = 0;
+
+  onProgress(listener: () => void): void {
+    this.progressListener = listener;
+  }
+
+  /** Bytes of a frame still arriving were read: tells the progress listener, if any. */
+  progress(): void {
+    if (this.closedReason !== null) {
+      return;
+    }
+    this.partialReads += 1;
+    try {
+      this.progressListener?.();
+    } catch {
+      // a listener's failure never stops the reader
+    }
+  }
 
   get closed(): boolean {
     return this.closedReason !== null;

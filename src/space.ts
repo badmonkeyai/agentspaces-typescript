@@ -322,6 +322,11 @@ export class Taken<T> {
   complete(result: object | null = null, lease: number | string = "1h", tags: Dict = {},
            resultSpace: Space | null = null): string | null {
     this.space.peer.requireHeld(this.space.name, this.entryId, this.space.agent);
+    // Rule two of the settle guarantee (SPEC §7.4): the holder this take displaced completed the entry, so this take
+    // acknowledges that completion with none of its own result, and throws as a lapsed take does.
+    if (this.space.peer.acknowledgeDisplacedCompletion(this.space.name, this.entryId, this.space.agent)) {
+      throw new Error(`the take of ${this.entryId} acknowledged a displaced holder's completion; no result written`);
+    }
     let resultId: string | null = null;
     if (result !== null) {
       resultId = (resultSpace ?? this.space).write(result, lease, tags);
@@ -391,18 +396,53 @@ export class Motion {
   }
 }
 
+/**
+ * A take as a worker method's context hands it out (Java's `TakeContext.renew`, srad/agentspaces-event-loop.md §10.33,
+ * I-05): its renewal obeys the binder's end, so a library renewing from inside the method (an LLM stream's keepalive)
+ * cannot keep a hung handler's entry past the hold limit, after its agent is unbound, or after a wake found its lease
+ * lapsed. A refused renewal renews nothing and does not throw, as Java's; the lease lapses to another taker. Completing
+ * and releasing go to the take itself.
+ */
+class ContextTaken<T> extends Taken<T> {
+  constructor(private readonly inner: Taken<T>, private readonly renewable: () => boolean,
+              private readonly refused: () => void) {
+    super(inner.space, inner.entryId, inner.value, inner.leaseMillis);
+  }
+
+  override complete(...args: Parameters<Taken<T>["complete"]>): string | null {
+    return this.inner.complete(...args);
+  }
+
+  override renew(lease: number | string | null = null): void {
+    if (!this.renewable()) {
+      this.refused();
+      return;
+    }
+    this.inner.renew(lease);
+  }
+
+  override release(): void {
+    this.inner.release();
+  }
+}
+
+/** What the binder says about a running take's renewals: whether they may still renew, and a refusal's count. */
+export type TakeGuard = { renewable: () => boolean; refused?: () => void };
+
 const currentTake = contextStore<Taken<unknown>>();
 
 /**
  * The take a worker method runs under: the binder runs the call inside it,
  * so a listener (a model call's lease renewal, say) finds it without a parameter.
+ * Run with a guard, the context hands out the take with its renewal under the guard.
  */
 export const TakeContext = {
   current<T = unknown>(): Taken<T> | null {
     return (currentTake.get() as Taken<T> | undefined) ?? null;
   },
-  run<R>(taken: Taken<unknown>, fn: () => R): R {
-    return currentTake.run(taken, fn);
+  run<R>(taken: Taken<unknown>, fn: () => R, guard: TakeGuard | null = null): R {
+    const held = guard === null ? taken : new ContextTaken(taken, guard.renewable, guard.refused ?? (() => {}));
+    return currentTake.run(held, fn);
   },
 };
 
@@ -575,17 +615,24 @@ export class Space {
 
   /** The first match, waiting up to `timeout` (pulling the space) for one. */
   async read<T>(template: Template<T>, timeout: number | string | null = null): Promise<T | null> {
-    const deadline = Date.now() + (timeout === null ? 0 : durationMillis(timeout));
+    // On the peer's monotonic clock and timers (SPEC v0.1.36 §9.5: waits on the time source), woken by a fold rather
+    // than polling every 200 ms; the space is pulled at most once per 600 ms settle window.
+    const deadline = this.peer.monotonic() + (timeout === null ? 0 : durationMillis(timeout));
+    let pulledAt = Number.NEGATIVE_INFINITY;
     for (;;) {
       const found = this.entries(template, 1);
       if (found.length > 0) {
         return found[0]!.value;
       }
-      if (Date.now() >= deadline) {
+      const now = this.peer.monotonic();
+      if (now >= deadline) {
         return null;
       }
-      this.peer.pullSpace(this.name);
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      if (now - pulledAt >= 600) {
+        pulledAt = now;
+        this.peer.pullSpace(this.name);
+      }
+      await this.peer.awaitFold(Math.min(600, deadline - now));
     }
   }
 
@@ -619,6 +666,7 @@ export class Space {
     }
     this.watchers.set(key, { template: template as Template<unknown>, judged: new Map(),
       emit: (e) => subscription.emit("event", e) });
+    this.peer.loop.wake(SPACE_SWEEP_TASK); // a lapse already past is judged for the new watcher at once
     return subscription;
   }
 
@@ -651,7 +699,7 @@ export class Space {
    * (HLC round five, 2026-11-08: a live console page spent 95% of its main thread decoding lapsed
    * entries it had already reported).
    */
-  private deliver(dto: Dict, kind: EventKind, mark: string = kind): void {
+  private deliver(dto: Dict, kind: EventKind, mark: string = kind): boolean {
     const record = (dto["record"] as Dict | undefined) ?? {};
     const entryId = String(record["entryId"]);
     const judging: Watcher[] = [];
@@ -661,11 +709,11 @@ export class Space {
       }
     }
     if (judging.length === 0) {
-      return;
+      return true;
     }
     const raw = this.peer.payloadOf(dto);
     if (raw === null) {
-      return; // a referenced payload not here yet: the event waits for a later fold or read
+      return false; // a referenced payload not here yet: the event waits for a later fold, read or sweep
     }
     const read = readDocument(raw);
     if (read === null) {
@@ -673,7 +721,7 @@ export class Space {
       for (const { judged } of judging) {
         judged.set(entryId, (judged.get(entryId) ?? new Set<string>()).add(mark));
       }
-      return;
+      return true;
     }
     const payload = read.value as Dict;
     const tags = (record["tags"] as Dict | undefined) ?? {};
@@ -687,6 +735,7 @@ export class Space {
         issuer: String(record["issuer"]), type: String(record["type"]), expiresAtMillis: leaseExpiryOf(dto),
         completed: kind === COMPLETED, taken: kind === TAKEN } });
     }
+    return true;
   }
 
   /**
@@ -701,6 +750,9 @@ export class Space {
     }
     if (dto["completed"] || present(dto)) {
       this.deliver(dto, dto["completed"] ? COMPLETED : WRITTEN);
+      if (present(dto) && this.watchers.size > 0) {
+        sweepBy(this.peer, leaseExpiryOf(dto)); // the lapse is due work: EXPIRED at the lease's end, not on a ticker
+      }
     } else if (previous !== undefined && present(previous)) {
       this.deliver(dto, EXPIRED);
     }
@@ -719,6 +771,9 @@ export class Space {
       return;
     }
     this.deliver(dto, TAKEN, `${TAKEN}:${String(claim["epoch"])}`);
+    if (this.watchers.size > 0) {
+      sweepBy(this.peer, Number(claim["expiresAtMillis"])); // REAPPEARED at the claim's lapse
+    }
   }
 
   /** Forgets what every watcher judged of entries the replica collected (SPEC §7.3, HLC round five, 2026-11-08). */
@@ -735,24 +790,62 @@ export class Space {
    * claim epoch. A lapse every watcher already judged costs a lookup and no decode (HLC round five,
    * 2026-11-08).
    */
-  sweep(): void {
+  sweep(): number | null {
     if (this.watchers.size === 0) {
-      return;
+      return null;
     }
     const now = this.peer.now();
+    let next: number | null = null;
+    const due = (at: number): void => {
+      next = next === null ? at : Math.min(next, at);
+    };
     for (const [entryId, dto] of this.peer.states) {
       if (!this.mine(dto) || !present(dto)) {
         continue;
       }
-      if (leaseExpiryOf(dto) <= now) {
-        this.deliver(dto, EXPIRED);
+      const expiry = leaseExpiryOf(dto);
+      if (expiry <= now) {
+        if (!this.deliver(dto, EXPIRED)) {
+          due(now + SWEEP_RETRY_MILLIS); // its payload is still on its way: judged again shortly
+        }
         continue;
       }
+      due(expiry);
       const claim = this.peer.claims.get(entryId)?.["claim"] as Dict | undefined;
-      if (claim !== undefined && Number(claim["expiresAtMillis"] ?? 0) <= now) {
-        this.deliver(dto, REAPPEARED, `${REAPPEARED}:${String(claim["epoch"])}`);
+      if (claim !== undefined) {
+        const lapse = Number(claim["expiresAtMillis"] ?? 0);
+        if (lapse <= now) {
+          if (!this.deliver(dto, REAPPEARED, `${REAPPEARED}:${String(claim["epoch"])}`)) {
+            due(now + SWEEP_RETRY_MILLIS);
+          }
+        } else {
+          due(lapse);
+        }
       }
     }
+    return next;
+  }
+}
+
+/** How soon a sweep judges again a lapse whose event waits for its payload. */
+const SWEEP_RETRY_MILLIS = 1_000;
+
+/** The name of the space sweep on the peer's loop. */
+export const SPACE_SWEEP_TASK = "space-sweep";
+
+/**
+ * Brings the peer's space sweep forward to the wall instant `wallMillis` when that is sooner than its deadline (SPEC
+ * v0.1.36 §9.5: the space sweep runs when the earliest lapse falls due, and on each fold).
+ */
+function sweepBy(peer: Peer, wallMillis: number): void {
+  if (!Number.isFinite(wallMillis)) {
+    return;
+  }
+  const loop = peer.loop;
+  const at = loop.now() + Math.max(0, wallMillis - peer.now());
+  const current = loop.dueOf(SPACE_SWEEP_TASK);
+  if (current === null || at < current) {
+    loop.reschedule(SPACE_SWEEP_TASK, at);
   }
 }
 
@@ -783,17 +876,24 @@ function install(peer: Peer): Space[] {
         s.onCollected(entryIds);
       }
     };
-    // EXPIRED and REAPPEARED are judged by the clock, not by a fold; the timer
-    // never keeps the process alive on its own.
-    peer.every(250, () => {
+    // EXPIRED and REAPPEARED are judged by the clock, not by a fold: due work on the peer's loop at the earliest
+    // lapse of any watched entry (SPEC v0.1.36 §9.5; was a 250 ms ticker), brought forward by each fold and by a new
+    // watcher, and asked again on a wall step. The loop's timer never keeps the process alive on its own.
+    peer.loop.add(SPACE_SWEEP_TASK, (nowMono) => {
+      let next: number | null = null;
       for (const s of [...spaces]) {
         try {
-          s.sweep();
+          const at = s.sweep();
+          if (at !== null) {
+            next = next === null ? at : Math.min(next, at);
+          }
         } catch {
-          // a watcher that throws does not stop the sweep
+          // a watcher that throws does not stop the sweep; the space is judged again shortly
+          next = Math.min(next ?? Number.POSITIVE_INFINITY, peer.now() + SWEEP_RETRY_MILLIS);
         }
       }
-    });
+      return next === null ? null : nowMono + Math.max(0, next - peer.now());
+    }, null);
   }
   return holder.agentspacesSpaces;
 }

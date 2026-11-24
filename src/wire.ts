@@ -700,7 +700,8 @@ export function agentCard(group: string, identity: Identity, localName: string,
                           agentPublicKey: Uint8Array | null = null,
                           actions: Dict[] | null = null,
                           agentCertificate: Dict | null = null,
-                          ui: Dict | null = null): Dict {
+                          ui: Dict | null = null,
+                          threads: Dict[] | null = null): Dict {
   const agent = identity.agent(localName);
   const card: Dict = { id: `aspace://${group}/agent/${agent}`, issuer: identity.peerId,
     group, issued: issuedIso, ttl: ttlIso, agent, description, goals, consumes,
@@ -724,7 +725,22 @@ export function agentCard(group: string, identity: Identity, localName: string,
   if (ui !== null) {
     card["ui"] = ui; // v0.1.26 (ISSUE-UiComponents): what the agent can show
   }
+  if (threads !== null && threads.length > 0) {
+    // v0.1.38: the conversations the agent answers, appended last; an empty list is the absent field, so the card
+    // keeps its v0.1.37 bytes
+    records.checkThreads(threads.map((t, i) => records.conform(t, records.CHAT_THREAD, `threads[${i}]`)), "threads");
+    card["threads"] = threads;
+  }
   return card;
+}
+
+/**
+ * One conversation an agent answers in Java field order (SPEC §6.1, v0.1.38): space, key, scope. `exact` takes the
+ * thread the key names, `tree` it and every `key:<sub>` thread under it, `all` every thread of the space (key empty).
+ * Throws when the space, the key, or the scope breaks the rules a reader enforces.
+ */
+export function chatThread(space: string, key: string, scope: "exact" | "tree" | "all" = "exact"): Dict {
+  return records.conform({ space, key, scope }, records.CHAT_THREAD, "thread") as Dict;
 }
 
 /** One component of a UiDeclaration in Java field order (SPEC §6.1a.3): id, catalogId, component, entry, controls, role. */

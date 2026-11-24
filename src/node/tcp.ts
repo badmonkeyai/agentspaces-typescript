@@ -62,6 +62,15 @@ export class TcpChannel implements FrameChannel {
     this.events.onClose(listener);
   }
 
+  onProgress(listener: () => void): void {
+    this.events.onProgress(listener);
+  }
+
+  /** Reads that brought part of a frame and no whole one. */
+  get partialReads(): number {
+    return this.events.partialReads;
+  }
+
   close(): void {
     this.socket.destroy();
     this.events.close("closed by this end");
@@ -80,6 +89,7 @@ export class TcpChannel implements FrameChannel {
   private onData(chunk: Uint8Array): void {
     this.append(chunk);
     let offset = 0;
+    let delivered = false;
     while (this.buffered - offset >= 4) {
       const length = readInt32be(this.buffer, offset);
       if (length <= 0 || length > MAX_FRAME_BYTES) {
@@ -93,12 +103,18 @@ export class TcpChannel implements FrameChannel {
       }
       const frame = this.buffer.slice(offset + 4, offset + 4 + length);
       offset += 4 + length;
+      delivered = true;
       this.events.deliver(frame);
     }
     if (offset > 0) {
       // Keep what remains at the front; the capacity stays for the next frame.
       this.buffer.copyWithin(0, offset, this.buffered);
       this.buffered -= offset;
+    }
+    if (!delivered && chunk.length > 0) {
+      // Bytes of a frame still arriving: the remote is writing (owner decision 4 of 2026-11-23). A read that delivered
+      // a frame is reported by the frame itself.
+      this.events.progress();
     }
   }
 

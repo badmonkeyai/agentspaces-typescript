@@ -87,8 +87,8 @@ export async function invoke<T = Dict>(peer: Peer, action: RemoteAction, value: 
   const input = toPayload(value);
   const baseline = new Set(results.entries(template, 1_000).map((e) => e.entryId));
   taskSpace.write(value, options.lease ?? "10m");
-  const deadline = Date.now() + (options.timeoutMillis ?? 30_000);
-  while (Date.now() < deadline) {
+  const deadline = peer.monotonic() + (options.timeoutMillis ?? 30_000); // a local period, on the peer's clock
+  while (peer.monotonic() < deadline) {
     for (const e of results.entries(template, 1_000)) {
       if (baseline.has(e.entryId)) {
         continue;
@@ -98,7 +98,7 @@ export async function invoke<T = Dict>(peer: Peer, action: RemoteAction, value: 
       }
     }
     peer.pullSpace(results.name);
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => peer.timers.setTimeout(() => resolve(undefined), 100));
   }
   return null;
 }

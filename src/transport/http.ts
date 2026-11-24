@@ -88,6 +88,40 @@ export function decodeBatch(body: Uint8Array): Uint8Array[] {
   return frames;
 }
 
+/**
+ * Reads a response body whole, telling `progress` after each part that arrives (owner decision 4 of 2026-11-23: bytes
+ * of a frame still arriving count as the remote's answer). Refuses a body over the bound as it grows, before any copy.
+ * A runtime with no body stream reads it at once, with no progress to report.
+ */
+export async function readBody(response: Response, progress: () => void): Promise<Uint8Array> {
+  const reader = response.body?.getReader();
+  if (reader === undefined) {
+    return new Uint8Array(await response.arrayBuffer());
+  }
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    total += value.length;
+    if (total > MAX_BODY) {
+      await reader.cancel().catch(() => undefined);
+      throw new Error(`body exceeds ${MAX_BODY} bytes`);
+    }
+    parts.push(value);
+    progress();
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    body.set(part, offset);
+    offset += part.length;
+  }
+  return body;
+}
+
 export class HttpChannel implements FrameChannel {
   private readonly events = new ChannelEvents();
   private readonly outbound: Uint8Array[] = [];
@@ -129,6 +163,10 @@ export class HttpChannel implements FrameChannel {
 
   onClose(listener: (reason: string) => void): void {
     this.events.onClose(listener);
+  }
+
+  onProgress(listener: () => void): void {
+    this.events.onProgress(listener);
   }
 
   close(): void {
@@ -216,7 +254,7 @@ export class HttpChannel implements FrameChannel {
           return;
         }
         const seq = Number(response.headers.get("aspace-seq") ?? -1);
-        const frames = decodeBatch(new Uint8Array(await response.arrayBuffer()));
+        const frames = decodeBatch(await readBody(response, () => this.events.progress()));
         if (seq === ack + 1) {
           for (const frame of frames) {
             this.events.deliver(frame);

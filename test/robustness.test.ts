@@ -11,6 +11,7 @@ import { concat } from "../src/bytes.js";
 import { dumps } from "../src/cbor.js";
 import { Identity } from "../src/identity.js";
 import { Peer } from "../src/peer.js";
+import { REDIAL_SPREAD, RedialTable } from "../src/redial.js";
 import * as wire from "../src/wire.js";
 import type { Dict } from "../src/wire.js";
 import "../src/node/index.js";
@@ -299,26 +300,33 @@ test("with its redial off a peer leaves a lost link to its owner's next dial (sw
 test("reconnect rounds back off and go on until the owner closes the peer (swarm retries, ROBUSTNESS.md §10.3 E5)", async () => {
   const peer = new Peer(Identity.generate(), GROUP);
   peer.reconnectIntervalMs = 20;
+  // Every wait at the low edge of its slot's spread (20, 40, 80 and 120 ms, each less a tenth): the bounds below are
+  // the table's, a tenth either way. The third gap read 73 ms at the final gate (srad/agentspaces-event-loop.md
+  // §10.49) against a bound of 75 that forgot the spread; this pins the edge instead of meeting it by chance.
+  peer.redialTable = new RedialTable(() => 0);
   const internals = peer as unknown as {
     running: boolean;
-    dial(seed: unknown): Promise<void>;
-    reconnect(rounds: number, lastTried: number): void;
+    openSeed(seed: unknown): Promise<void>;
+    reconnect(held: number | null): void;
   };
   const dials: number[] = [];
   internals.running = true;
   peer.seeds = [{ host: "127.0.0.1", port: 9, scheme: "tcp" } as never];
-  internals.dial = () => {
+  internals.openSeed = () => {
     dials.push(Date.now());
     if (dials.length >= 8) {
       internals.running = false; // the owner closes the peer
     }
     return Promise.reject(new Error("refused"));
   };
-  internals.reconnect(0, 0);
+  internals.reconnect(null);
   assert.ok(await until(() => dials.length >= 8, 5000), `the dials went on: ${dials.length}`);
   const gaps = dials.slice(1).map((t, i) => t - dials[i]!);
-  assert.ok(gaps[0]! >= 18 && gaps[2]! >= 75, `the pauses back off: ${gaps}`);
-  assert.ok(gaps.every((g) => g <= 120 * 1.25 + 60), `and stop growing at six times the interval: ${gaps}`);
+  const low = 1 - REDIAL_SPREAD;
+  // a timer may fire up to a millisecond before Date.now() shows its wait whole
+  assert.ok(gaps[0]! >= 20 * low - 1 && gaps[1]! >= 40 * low - 1 && gaps[2]! >= 80 * low - 1,
+    `the pauses back off: ${gaps}`);
+  assert.ok(gaps.every((g) => g <= 120 * 1.1 + 60), `and stop growing at six times the interval: ${gaps}`);
 });
 
 test("a seed that drops each link at once gets the backoff and no dial loop (swarm retries, ROBUSTNESS.md §10.6)", async () => {

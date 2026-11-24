@@ -717,14 +717,62 @@ export const CARD_SPILL = schema("CardSpill", required([["root", "String"], ["si
   }
   return true;
 });
+// AgentCard threads, 2026-11-23 (SPEC §6.1, v0.1.38): the conversations an agent answers, each a space, a thread key,
+// and a scope; the rules of Java's ChatThread and AgentCard constructors, which its decoder calls.
+
+/** How far a thread key reaches: that thread, it and every `key:<sub>` thread under it, or every thread of the space. */
+export const CHAT_THREAD_SCOPES = ["exact", "tree", "all"] as const;
+export const CHAT_THREAD_MAX_SPACE = 128;
+export const CHAT_THREAD_MAX_KEY = 128;
+/** The most threads a card names. */
+export const AGENT_CARD_MAX_THREADS = 16;
+
+/** Whether any code unit is white space as Java's `Character.isWhitespace` reads it. */
+const JAVA_WHITESPACE = /[\t\n\v\f\r\x1c-\x20\u1680\u2000-\u2006\u2008-\u200a\u2028\u2029\u205f\u3000]/;
+
+/** Whether `text` is 1 to `max` code units with no white space: a thread's space, or a key under exact or tree. */
+function isThreadName(text: string, max: number): boolean {
+  return text.length > 0 && text.length <= max && !JAVA_WHITESPACE.test(text);
+}
+
+export const CHAT_THREAD = schema("ChatThread", required([["space", "String"], ["key", "String"],
+  ["scope", enumOf(...CHAT_THREAD_SCOPES)]]),
+(t, path) => {
+  if (!isThreadName(t["space"] as string, CHAT_THREAD_MAX_SPACE)) {
+    refuse(`${path}.space`, `1 to ${CHAT_THREAD_MAX_SPACE} characters with no white space`);
+  }
+  const key = t["key"] as string;
+  if (t["scope"] === "all" ? key.length > 0 : !isThreadName(key, CHAT_THREAD_MAX_KEY)) {
+    refuse(`${path}.key`, t["scope"] === "all" ? "empty when the scope is all"
+      : `1 to ${CHAT_THREAD_MAX_KEY} characters with no white space`);
+  }
+  return true;
+});
+
+/** Checks a card's threads (v0.1.38): at most {@link AGENT_CARD_MAX_THREADS}, all distinct. */
+export function checkThreads(threads: readonly CborValue[], path: string): void {
+  if (threads.length > AGENT_CARD_MAX_THREADS) {
+    refuse(path, `names at most ${AGENT_CARD_MAX_THREADS} threads`);
+  }
+  const seen = new Set(threads.map((t) => JSON.stringify([(t as Dict)["space"], (t as Dict)["key"], (t as Dict)["scope"]])));
+  if (seen.size !== threads.length) {
+    refuse(path, "repeats a thread");
+  }
+}
+
 export const AGENT_CARD = schema("AgentCard", required([...AD_HEAD, ["agent", "AgentId"], ["description", "String"],
   ["goals", listOf("String")], ["consumes", listOf("String")], ["produces", listOf("String")],
   ["costHints", mapOf("String")], ["spaceBindings", mapOf("String")], ["agentPublicKey", "bytes", "omitNull"],
   ["actions", listOf(CARD_ACTION), "omitNull"], ["agentCertificate", AGENT_CERTIFICATE, "omitNull"],
-  ["ui", UI_DECLARATION, "omitNull"], ["spill", CARD_SPILL, "omitNull"]]),
+  ["ui", UI_DECLARATION, "omitNull"], ["spill", CARD_SPILL, "omitNull"],
+  // v0.1.38: appended last, absent when empty, so a card without threads keeps its v0.1.37 bytes
+  ["threads", listOf(CHAT_THREAD), "omitEmpty"]]),
 (card, path) => {
   if (card["spill"] !== undefined) {
     checkStub(card, path, AGENT_CARD_SPILL_SET, []);
+  }
+  if (card["threads"] !== undefined) {
+    checkThreads(card["threads"] as CborValue[], `${path}.threads`);
   }
   return true;
 });

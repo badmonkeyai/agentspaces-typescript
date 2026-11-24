@@ -21,8 +21,13 @@
  *
  *     const aggregate = new Aggregate(pipes);
  *     aggregate.start("load", 12.5);
- *     aggregate.run(300);                       // ticks on a timer
- *     const value = await aggregate.awaitSettled("load", Settle.after(3, 0.01), 20_000);
+ *     aggregate.run();                          // a round every ROUND_PERIOD_MILLIS (1 s), as Java's
+ *     const value = await aggregate.awaitSettled("load", Settle.after("5s", 0.01), 20_000);
+ *
+ * Timing (SPEC v0.1.36 §8, §9.5): a round every second by default, on the peer's timers; an epoch whose estimate has
+ * not moved for {@link QUIET_MILLIS} goes quiet (no shares until a share moves it again) and is forgotten after
+ * {@link RETENTION_MILLIS} without activity; a settle rule is a span (`Settle.after("40s", tol)`) or a count of
+ * rounds (`Settle.after(40, tol)`, read as 40 rounds of one second).
  */
 
 import { CborDouble, canonicalMap, dumps } from "../cbor.js";
@@ -31,22 +36,48 @@ import { AGGREGATE_FRAME, readRecord } from "../records.js";
 import * as wire from "../wire.js";
 import type { Dict } from "../wire.js";
 import type { Pipes } from "./pipes.js";
+import { durationMillis } from "../space.js";
+import { monotonicMillis } from "../time.js";
 
 export const TYPE = "aspace:cap/aggregate";
 export type Mode = "avg" | "sum" | "count" | "min" | "max";
 
-/** When an estimate counts as settled: unchanged within `tolerance` for `ticks` consecutive ticks. */
+/** One protocol round (Java's PushSumAggregate.ROUND_PERIOD): a share per epoch per second. */
+export const ROUND_PERIOD_MILLIS = 1_000;
+/** An epoch whose estimate has not moved for this long stops sharing until a share moves it (Java: 30 s). */
+export const QUIET_MILLIS = 30_000;
+/** An epoch with no activity for this long is forgotten (Java: one hour). */
+export const RETENTION_MILLIS = 60 * 60_000;
+
+/**
+ * When an estimate counts as settled: present and within `tolerance` of the previous round's value for `ticks`
+ * consecutive rounds (the count form, rounds of {@link ROUND_PERIOD_MILLIS}), or, with a span, for that span of time
+ * (`spanMillis`, counted in rounds of one second, the span rounded up), in which case an epoch that went quiet settles
+ * at its last move plus the span with no further share (SPEC §8, v0.1.36).
+ */
 export class Settle {
   static readonly FIRST = new Settle(0, 0);
 
-  constructor(readonly ticks: number, readonly tolerance: number) {
-    if (ticks < 0 || tolerance < 0) {
-      throw new Error("ticks and tolerance are not negative");
+  constructor(readonly ticks: number, readonly tolerance: number, readonly spanMillis: number | null = null) {
+    if (ticks < 0 || tolerance < 0 || (spanMillis !== null && !(spanMillis >= 0))) {
+      throw new Error("ticks, span and tolerance are not negative");
     }
   }
 
-  static after(ticks: number, tolerance: number): Settle {
-    return new Settle(ticks, tolerance);
+  /**
+   * A span (`"40s"`, `"PT40S"`) settles after that long without a move; a number is the count form, read as that many
+   * rounds of one second (Java's `settleTicks`).
+   */
+  static after(spanOrTicks: number | string, tolerance: number): Settle {
+    if (typeof spanOrTicks === "string") {
+      return Settle.span(durationMillis(spanOrTicks), tolerance);
+    }
+    return new Settle(spanOrTicks, tolerance);
+  }
+
+  /** The span form in milliseconds. */
+  static span(millis: number, tolerance: number): Settle {
+    return new Settle(Math.ceil(Math.max(0, millis) / ROUND_PERIOD_MILLIS), tolerance, Math.max(0, millis));
   }
 
   stable(previous: number | null, current: number): boolean {
@@ -61,7 +92,7 @@ export class Settle {
 export type Estimate = { epochId: string; mode: Mode; value: number; ticks: number };
 
 type Watch = { epochs: (id: string) => boolean; settle: Settle; listener: (e: Estimate) => void;
-  tracks: Map<string, { last: number | null; stable: number; fired: boolean; seen: number }> };
+  tracks: Map<string, { last: number | null; stable: number; fired: boolean; seen: number; movedAt: number }> };
 
 /** One node's share of every epoch it joined or heard about. */
 export class Aggregate {
@@ -73,7 +104,13 @@ export class Aggregate {
   private readonly declared = new Map<string, Mode>();
   private readonly ticks = new Map<string, number>();
   private readonly watches: Watch[] = [];
-  private timer: NodeJS.Timeout | null = null;
+  private timer: { stop(): void } | null = null;
+  /** When each epoch's estimate last moved or a share reached it, on the monotonic clock (quiet and retention). */
+  private readonly activeAt = new Map<string, number>();
+  private readonly lastEstimate = new Map<string, number | null>();
+  /** Epochs forgotten after the retention, and rounds in which a quiet epoch shared nothing. */
+  evicted = 0;
+  quietRounds = 0;
   /** Frames heard per epoch: the evidence a settle rule needs. */
   private readonly received = new Map<string, number>();
 
@@ -116,6 +153,7 @@ export class Aggregate {
   /** Joins an epoch with this node's value under `mode`. */
   start(epochId: string, value: number, mode: Mode = "avg"): void {
     this.declared.set(epochId, mode);
+    this.touch(epochId);
     if (mode === "avg" || mode === "sum") {
       const e = this.epoch(epochId);
       e.value += value;
@@ -134,8 +172,56 @@ export class Aggregate {
     return this.knownEpochs();
   }
 
+  /** The monotonic clock of the peer's timers. */
+  private mono(): number {
+    const peer = this.pipes.peer as { monotonic?: () => number };
+    return typeof peer.monotonic === "function" ? peer.monotonic() : monotonicMillis();
+  }
+
+  /** Notes activity on an epoch (a start, a share heard, a move of its estimate). */
+  private touch(epochId: string): void {
+    this.activeAt.set(epochId, this.mono());
+  }
+
+  /** Whether an epoch is quiet: its estimate has not moved, and nothing reached it, for QUIET_MILLIS. */
+  isQuiet(epochId: string): boolean {
+    return this.mono() - (this.activeAt.get(epochId) ?? this.mono()) >= QUIET_MILLIS;
+  }
+
+  /** Moves each epoch's activity on a move of its estimate, and forgets the epochs past their retention. */
+  private ageEpochs(): void {
+    const now = this.mono();
+    for (const epochId of this.knownEpochs()) {
+      const estimate = this.estimate(epochId);
+      const before = this.lastEstimate.get(epochId) ?? null;
+      if (!this.activeAt.has(epochId) || (estimate !== null && (before === null || moved(before, estimate)))) {
+        this.activeAt.set(epochId, now);
+      }
+      this.lastEstimate.set(epochId, estimate);
+      if (now - this.activeAt.get(epochId)! >= RETENTION_MILLIS) {
+        this.forget(epochId);
+      }
+    }
+  }
+
+  private forget(epochId: string): void {
+    this.epochs.delete(epochId);
+    this.rosters.delete(epochId);
+    this.extrema.delete(epochId);
+    this.declared.delete(epochId);
+    this.ticks.delete(epochId);
+    this.received.delete(epochId);
+    this.activeAt.delete(epochId);
+    this.lastEstimate.delete(epochId);
+    for (const watch of this.watches) {
+      watch.tracks.delete(epochId);
+    }
+    this.evicted += 1;
+  }
+
   /** One protocol round: halve each push-sum mass and push the other half to one sampled member. */
   tick(): void {
+    this.ageEpochs();
     const participants = this.participants();
     if (participants.length === 0) {
       // Mass held is mass kept: halve only when a participant takes the other half.
@@ -145,18 +231,26 @@ export class Aggregate {
     }
     const targets = [participants[Math.floor(Math.random() * participants.length)]!];
     const frames: Dict[] = [];
+    // A quiet epoch shares nothing (SPEC §8, v0.1.17/v0.1.36): its mass stays here until a share moves it again.
+    const quiet = new Set([...this.knownEpochs()].filter((id) => this.isQuiet(id)));
+    this.quietRounds += quiet.size;
     for (const [epochId, e] of this.epochs) {
+      if (quiet.has(epochId)) {
+        continue;
+      }
       e.value /= 2;
       e.weight /= 2;
       frames.push(wire.aggregateShareFrame(epochId, e.value, e.weight));
     }
     for (const [epochId, ex] of this.extrema) {
-      if (!Number.isNaN(ex.value)) {
+      if (!Number.isNaN(ex.value) && !quiet.has(epochId)) {
         frames.push(wire.aggregateExtremumFrame(epochId, ex.max, ex.value));
       }
     }
     for (const [epochId, members] of this.rosters) {
-      frames.push(wire.aggregateRosterFrame(epochId, [...members].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))));
+      if (!quiet.has(epochId)) {
+        frames.push(wire.aggregateRosterFrame(epochId, [...members].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))));
+      }
     }
     for (const to of targets) {
       for (const frame of frames) {
@@ -167,16 +261,19 @@ export class Aggregate {
     this.evaluateWatches(false);
   }
 
-  /** Ticks on a timer until `close()`. */
-  run(intervalMillis = 300): void {
+  /**
+   * Runs a round every `intervalMillis` (one second by default, Java's `ROUND_PERIOD`; it was 300 ms, which settled a
+   * count-form rule more than three times sooner than Java's) on the peer's timers, until `close()`.
+   */
+  run(intervalMillis = ROUND_PERIOD_MILLIS): void {
     if (this.timer === null) {
-      this.timer = setInterval(() => this.tick(), intervalMillis);
+      this.timer = this.pipes.peer.every(intervalMillis, () => this.tick());
     }
   }
 
   close(): void {
     if (this.timer !== null) {
-      clearInterval(this.timer);
+      this.timer.stop();
       this.timer = null;
     }
   }
@@ -203,12 +300,13 @@ export class Aggregate {
   /** Resolves when the epoch's estimate settles under the rule, on the protocol tick; null at the timeout. */
   awaitSettled(epochId: string, settle: Settle = Settle.FIRST, timeoutMillis = 30_000): Promise<number | null> {
     return new Promise((resolve) => {
+      const timers = this.pipes.peer.timers;
       const close = this.onEstimate((e) => e === epochId, settle, (estimate) => {
-        clearTimeout(timer);
+        timers.clearTimeout(timer);
         close();
         resolve(estimate.value);
       });
-      const timer = setTimeout(() => { close(); resolve(null); }, timeoutMillis);
+      const timer = timers.setTimeout(() => { close(); resolve(null); }, timeoutMillis);
     });
   }
 
@@ -246,19 +344,32 @@ export class Aggregate {
         }
         let track = watch.tracks.get(epochId);
         if (track === undefined) {
-          track = { last: null, stable: 0, fired: false, seen: 0 };
+          track = { last: null, stable: 0, fired: false, seen: 0, movedAt: this.mono() };
           watch.tracks.set(epochId, track);
         }
         if (track.fired || now === null) {
           continue;
         }
+        const span = watch.settle.spanMillis;
         if (receipts <= track.seen && !alone) {
-          continue; // no new evidence: the streak neither grows nor resets
+          // No new evidence: the count's streak neither grows nor resets. A span settles on that silence once the
+          // epoch was heard at all, at its last move plus the span (SPEC §8, v0.1.36).
+          if (span === null || track.last === null || receipts === 0 || this.mono() - track.movedAt < span
+              || !watch.settle.stable(track.last, now)) {
+            continue;
+          }
+          track.stable = Math.max(track.stable, 1);
+        } else {
+          track.seen = receipts;
+          const stable = watch.settle.stable(track.last, now);
+          track.stable = stable ? track.stable + 1 : 0;
+          if (!stable) {
+            track.movedAt = this.mono();
+          }
+          track.last = now;
         }
-        track.seen = receipts;
-        track.stable = watch.settle.stable(track.last, now) ? track.stable + 1 : 0;
-        track.last = now;
-        if (track.stable >= watch.settle.ticks) {
+        if (span !== null ? track.last !== null && this.mono() - track.movedAt >= span && track.stable >= 1
+          : track.stable >= watch.settle.ticks) {
           track.fired = true;
           const estimate: Estimate = { epochId, mode: this.declared.get(epochId) ?? "avg", value: now, ticks };
           queueMicrotask(() => watch.listener(estimate));
@@ -315,6 +426,9 @@ export class Aggregate {
     if (heard) {
       const id = String(heard["epochId"]);
       this.received.set(id, (this.received.get(id) ?? 0) + 1);
+      if (share !== null && share !== undefined) {
+        this.touch(id); // a share moves the epoch: it shares again (quiet ends on the first activity)
+      }
     }
     if (share && typeof share["epochId"] === "string") {
       const value = (share["value"] as CborDouble).value;
@@ -333,4 +447,10 @@ export class Aggregate {
       }
     }
   }
+}
+
+/** Whether an estimate moved between two rounds (relative, absolute below 1e-9, as the settle rule judges). */
+function moved(previous: number, current: number): boolean {
+  const scale = Math.max(Math.abs(previous), Math.abs(current), 1e-9);
+  return Math.abs(current - previous) > 1e-9 * scale;
 }
