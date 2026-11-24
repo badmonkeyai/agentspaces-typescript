@@ -53,7 +53,10 @@ export type CellConfig = {
   tickMillis: number;
   /** The alarm cadence while idle; default the card refresh interval (half the card TTL), 60 s when no card. */
   idleMillis: number | null;
-  /** The alarm cadence while disconnected; default 5 s. */
+  /**
+   * The first wait of the alarm while disconnected; default 5 s. The waits follow the redial table, 1, 2, 4 and 6
+   * times it and then wrap, each with a spread of +/-10% (owner decision 1 of 2026-11-23).
+   */
   reconnectMillis: number;
   /** How often the peer's state snapshot is written to SQLite; default 10 s. */
   snapshotMillis: number;

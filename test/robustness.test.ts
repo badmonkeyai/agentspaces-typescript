@@ -301,24 +301,24 @@ test("reconnect rounds back off and go on until the owner closes the peer (swarm
   peer.reconnectIntervalMs = 20;
   const internals = peer as unknown as {
     running: boolean;
-    dial(seed: unknown): Promise<void>;
-    reconnect(rounds: number, lastTried: number): void;
+    openSeed(seed: unknown): Promise<void>;
+    reconnect(held: number | null): void;
   };
   const dials: number[] = [];
   internals.running = true;
   peer.seeds = [{ host: "127.0.0.1", port: 9, scheme: "tcp" } as never];
-  internals.dial = () => {
+  internals.openSeed = () => {
     dials.push(Date.now());
     if (dials.length >= 8) {
       internals.running = false; // the owner closes the peer
     }
     return Promise.reject(new Error("refused"));
   };
-  internals.reconnect(0, 0);
+  internals.reconnect(null);
   assert.ok(await until(() => dials.length >= 8, 5000), `the dials went on: ${dials.length}`);
   const gaps = dials.slice(1).map((t, i) => t - dials[i]!);
   assert.ok(gaps[0]! >= 18 && gaps[2]! >= 75, `the pauses back off: ${gaps}`);
-  assert.ok(gaps.every((g) => g <= 120 * 1.25 + 60), `and stop growing at six times the interval: ${gaps}`);
+  assert.ok(gaps.every((g) => g <= 120 * 1.1 + 60), `and stop growing at six times the interval: ${gaps}`);
 });
 
 test("a seed that drops each link at once gets the backoff and no dial loop (swarm retries, ROBUSTNESS.md §10.6)", async () => {

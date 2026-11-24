@@ -470,3 +470,69 @@ test("a host whose tick drifts three times drops to visitor duties (bindings clo
     await service.stop();
   }
 });
+
+test("the host paces anti-entropy and its advertisement by time, so a throttled tab keeps both (EL-P-07)", async () => {
+  // A background tab's timers fire about once a minute. Counted in ticks, its rounds came every ten minutes and its
+  // advertisement every five hours, past the advertisement's ten-minute lease; by time, every tick that comes late
+  // runs what fell due. Virtual time, no sleep.
+  const { VirtualTime, Watchdog, Peer } = await import("@agentspaces/client");
+  const time = new VirtualTime();
+  const host = new ResidentHost({ shared: true, log: null, clock: time.wall });
+  const peer = new Peer(Identity.generate(), GROUP, time.wall);
+  peer.timers = time;
+  peer.watchdog = new Watchdog(time);
+  let rounds = 0;
+  let intros = 0;
+  (peer as unknown as { antiEntropyRound(): null }).antiEntropyRound = () => { rounds += 1; return null; };
+  (peer as unknown as { introduce(): void }).introduce = () => { intros += 1; };
+  const inner = host as unknown as { peer: unknown; config: unknown; startTick(): void; onTick(period: number): void;
+    tick: { stop(): void } | null };
+  inner.peer = peer;
+  inner.config = { group: GROUP, seeds: [], database: "pace", tickMillis: 1000, snapshotMillis: 0 };
+  inner.startTick();
+  inner.tick?.stop(); // the browser throttles the 1 s tick: it is driven by hand, once a minute
+  for (let minute = 0; minute < 11; minute++) {
+    time.advance(60_000);
+    inner.onTick(1000);
+  }
+  assert.equal(rounds, 11, "a round on every late tick: each found one due");
+  assert.equal(intros, 2, "the advertisement every five minutes, inside its ten-minute lease");
+  peer.close();
+});
+
+test("page beats and the cadence rule read the monotonic clock: a wall step drops no page and counts no drift",
+  async () => {
+    // SPEC v0.1.36 §9.5: local periods on a monotonic clock. Before, a forward NTP step longer than the page timeout
+    // dropped every page at the next tick (and with no active page the host pauses), and counted a drift.
+    const { VirtualTime, Watchdog, Peer } = await import("@agentspaces/client");
+    const time = new VirtualTime();
+    const host = new ResidentHost({ shared: true, log: null, clock: time.wall });
+    const peer = new Peer(Identity.generate(), GROUP, time.wall);
+    peer.timers = time;
+    peer.watchdog = new Watchdog(time);
+    const inner = host as unknown as { peer: unknown; config: unknown; onTick(period: number): void;
+      pages: Map<unknown, { id: string; active: boolean; lastBeat: number }>;
+      handle(port: unknown, request: unknown): Promise<unknown>; drifts: number };
+    inner.peer = peer;
+    inner.config = { group: GROUP, seeds: [], database: "steps", tickMillis: 1000, snapshotMillis: 0,
+      pageTimeoutMillis: 30_000 };
+    const port = { postMessage: () => undefined, close: () => undefined };
+    inner.pages.set(port, { id: "p1", active: true, lastBeat: 0 });
+    await inner.handle(port, { t: "beat", active: true });
+    for (let i = 0; i < 5; i++) {
+      time.advance(1000);
+      inner.onTick(1000);
+    }
+    time.stepWall(3_600_000); // NTP corrects the wall an hour forward
+    for (let i = 0; i < 5; i++) {
+      time.advance(1000);
+      inner.onTick(1000);
+      await inner.handle(port, { t: "beat", active: true });
+    }
+    assert.equal(inner.pages.size, 1, "the beating page was kept");
+    assert.equal(inner.drifts, 0, "a wall step is no late tick");
+    time.advance(31_000);
+    inner.onTick(1000);
+    assert.equal(inner.pages.size, 0, "a page that stops beating is still dropped after its timeout");
+    peer.close();
+  });

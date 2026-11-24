@@ -44,16 +44,31 @@ const TASK = "com.acme.Task#v1";
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 
-/** Timers the test runs by hand: `tick()` runs every repeating task once. */
+/**
+ * Timers the test runs by hand on the test's settable clock, which is both the wall and the monotonic clock here:
+ * `tick()` runs every repeating task once and every timeout due by now. The peer's due work (the space sweep and the
+ * tombstone collection, SPEC v0.1.36 §9.5) arms timeouts at its deadlines, so moving the clock past one and ticking
+ * runs it, as the 1 s collector ticker did before.
+ */
 class ManualTimers implements TimerPort {
   private readonly tasks = new Set<() => void>();
+  private readonly timeouts = new Map<number, { at: number; fn: () => void }>();
+  private next = 1;
 
-  setTimeout(): unknown {
-    return null;
+  constructor(private readonly clock: () => number = () => NOW) {}
+
+  now(): number {
+    return this.clock();
   }
 
-  clearTimeout(): void {
-    // nothing is scheduled to clear
+  setTimeout(fn: () => void, millis: number): unknown {
+    const id = this.next++;
+    this.timeouts.set(id, { at: this.clock() + Math.max(0, millis), fn });
+    return id;
+  }
+
+  clearTimeout(handle: unknown): void {
+    this.timeouts.delete(handle as number);
   }
 
   every(_periodMillis: number, fn: () => void): Repeating {
@@ -65,13 +80,21 @@ class ManualTimers implements TimerPort {
     for (const fn of [...this.tasks]) {
       fn();
     }
+    for (let guard = 0; guard < 1_000; guard++) {
+      const due = [...this.timeouts].filter(([, t]) => t.at <= this.clock()).sort((x, y) => x[1].at - y[1].at)[0];
+      if (due === undefined) {
+        break;
+      }
+      this.timeouts.delete(due[0]);
+      due[1].fn();
+    }
   }
 }
 
 /** A peer on a settable clock and hand-run timers, whose sends go nowhere. */
 class ClockPeer extends Peer {
   private frameCounter = 0;
-  readonly manual = new ManualTimers();
+  readonly manual = new ManualTimers(() => this.clock.millis);
 
   constructor(private readonly clock = { millis: NOW }) {
     super(Identity.generate(), GROUP, () => clock.millis);
@@ -268,7 +291,7 @@ class RumorPeer extends Peer {
 
   constructor(private readonly clock: { millis: number }) {
     super(Identity.generate(), GROUP, () => clock.millis);
-    this.timers = new ManualTimers();
+    this.timers = new ManualTimers(() => clock.millis);
   }
 
   protected send(kind: string, body: Uint8Array): void {

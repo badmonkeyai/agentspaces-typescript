@@ -16,8 +16,9 @@
 
 /**
  * The service host (srad/agentspaces-js.md JS-R-04, JS-R-06, JS-R-07): a
- * Node process that listens on `tcp` and `ws`, dials its seeds, ticks at a
- * fixed period and reports its true cadence to the duties it carries, serves
+ * Node process that listens on `tcp` and `ws`, dials its seeds, runs its
+ * housekeeping as due work on its peer's loop (and ticks at its period while
+ * it carries duties, reporting its true cadence to them), serves
  * anti-entropy and relays rumors through the core `Peer`, advertises its
  * endpoints and `js.residency=service`, drops to visitor duties while its
  * tick drifts and takes them back when it recovers, and drains on `SIGTERM`
@@ -25,6 +26,7 @@
  */
 
 import { Identity, Peer, Seed } from "@agentspaces/client";
+import type { LoopHealth } from "@agentspaces/client";
 import type { ReplicationOptions } from "@agentspaces/client";
 import type { FrameChannel, Listener, ListenerHandle, Residency } from "@agentspaces/client";
 import { TcpListener } from "@agentspaces/client/node";
@@ -61,7 +63,7 @@ export type ServiceHostOptions = {
   signals?: boolean;
   /** Where the host reports; `console.error` by default, `null` for silence. */
   log?: ((line: string) => void) | null;
-  /** The clock, for tests of the drift rule. */
+  /** The wall clock (stamps and expiries); the drift rule reads the peer's monotonic clock. */
   clock?: () => number;
 } & ReplicationOptions;
 
@@ -69,6 +71,11 @@ export type ServiceHostOptions = {
 export const DRIFT_TICKS = 3;
 export const DRIFT_FACTOR = 2;
 export const RECOVERY_MILLIS = 60_000;
+/** How often the host runs an anti-entropy round, and re-advertises itself (half its ten-minute lease), by time. */
+export const ANTI_ENTROPY_MILLIS = 10_000;
+export const INTRODUCE_MILLIS = 300_000;
+/** The host's work on its peer's loop. */
+export const HOST_TASK = "service-host";
 
 export class ServiceHost {
   readonly peer: Peer;
@@ -81,7 +88,11 @@ export class ServiceHost {
   private consecutiveDrifts = 0;
   private lastDriftAt = 0;
   private lastTickAt = 0;
-  private timer: NodeJS.Timeout | null = null;
+  private started = false;
+  private inFlight: Promise<void> | null = null;
+  private nextAntiEntropyAt = 0;
+  private nextIntroduceAt = 0;
+  private unhookMembers: (() => void) | null = null;
   private readonly duties: Duty[] = [];
   private readonly bound: ListenerHandle[] = [];
   private readonly seeds: Seed[];
@@ -117,6 +128,17 @@ export class ServiceHost {
     if (this.residency === "visitor") {
       duty.suspend();
     }
+    if (this.duties.length === 1) {
+      this.lastTickAt = this.peer.monotonic(); // the cadence is judged from here: the idle host's long sleeps were no drift
+    }
+    if (this.started) {
+      this.peer.loop.wake(HOST_TASK); // a duty ticks at the host's period from now on
+    }
+  }
+
+  /** The host loop's report (due work on the peer's loop, watched by the watchdog): runs, lateness, re-arms. */
+  loopHealth(): LoopHealth {
+    return this.peer.loop.health();
   }
 
   async start(): Promise<void> {
@@ -136,8 +158,19 @@ export class ServiceHost {
     } else {
       this.peer.introduce(); // a hub with no seeds introduces itself to whoever connects
     }
-    this.lastTickAt = this.clock();
-    this.timer = setInterval(() => { void this.tick(); }, this.tickMillis);
+    // The cadence rule is a local period: judged on the monotonic clock (SPEC v0.1.36 §9.5), so a wall step is no late
+    // tick, and a step back does not hold the recovery off for its length.
+    this.lastTickAt = this.peer.monotonic();
+    const mono = this.peer.monotonic();
+    this.nextAntiEntropyAt = mono + ANTI_ENTROPY_MILLIS;
+    this.nextIntroduceAt = mono + INTRODUCE_MILLIS;
+    this.started = true;
+    // Due work, not a fixed-rate ticker (SPEC v0.1.36 §9.5): the host runs when a member's advertisement lapses, an
+    // anti-entropy round or the advertisement falls due, or the view changes; a host that carries duties (a Raft
+    // voter, whose heartbeat is its base period) runs every tickMillis, as Java's ordered-log nodes are a registered
+    // exception to the idle-wake goal.
+    this.peer.loop.add(HOST_TASK, (now) => this.runDue(now));
+    this.unhookMembers = this.peer.onMembersChanged(() => this.peer.loop.wake(HOST_TASK));
     if (this.signals) {
       process.once("SIGTERM", this.signalHandler);
       process.once("SIGINT", this.signalHandler);
@@ -152,16 +185,12 @@ export class ServiceHost {
    * the cadence this host really keeps.
    */
   async tick(): Promise<void> {
-    const now = this.clock();
-    this.observeCadence(now);
+    const now = this.peer.monotonic();
+    if (this.duties.length > 0) {
+      this.observeCadence(now); // the cadence is the duties' period; an idle host sleeps between due runs
+    }
     this.ticks += 1;
-    this.peer.expireMembers();
-    if (this.ticks % 10 === 0) {
-      this.peer.antiEntropyRound();
-    }
-    if (this.ticks % 300 === 0) {
-      this.peer.introduce();
-    }
+    this.housekeeping();
     for (const duty of this.duties) {
       try {
         await duty.tick?.();
@@ -169,6 +198,40 @@ export class ServiceHost {
         this.log(`duty tick failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
+  }
+
+  /** Lapsed members, then the anti-entropy round and the advertisement when due by time (EL-P-07). */
+  private housekeeping(): void {
+    this.peer.expireMembers();
+    const mono = this.peer.monotonic();
+    if (mono >= this.nextAntiEntropyAt) {
+      // Paced by time: counted in ticks, a host whose tick drifted ran its rounds that much less often.
+      this.nextAntiEntropyAt = Math.max(this.nextAntiEntropyAt + ANTI_ENTROPY_MILLIS, mono + 1);
+      this.peer.antiEntropyRound();
+    }
+    if (mono >= this.nextIntroduceAt) {
+      this.nextIntroduceAt = Math.max(this.nextIntroduceAt + INTRODUCE_MILLIS, mono + 1);
+      this.peer.introduce();
+    }
+  }
+
+  /** One run on the loop: the host's tick (never two at once), then its next deadline. */
+  private runDue(now: number): number | null {
+    if (this.inFlight === null) {
+      this.inFlight = this.tick().finally(() => { this.inFlight = null; });
+    } else {
+      // The previous run's duties are still awaited: the housekeeping runs, the duties wait for the next period, and
+      // the loop never re-arms at a deadline already past (which would spin).
+      this.housekeeping();
+      return now + this.tickMillis;
+    }
+    if (this.duties.length > 0) {
+      return now + this.tickMillis;
+    }
+    const expiry = this.peer.nextMemberExpiry();
+    const lapse = expiry === null ? Number.POSITIVE_INFINITY
+      : now + Math.max(this.tickMillis, expiry - this.peer.now() + 1);
+    return Math.min(this.nextAntiEntropyAt, this.nextIntroduceAt, lapse);
   }
 
   /**
@@ -209,15 +272,17 @@ export class ServiceHost {
   }
 
   private async drain(): Promise<void> {
-    if (this.timer !== null) {
-      clearInterval(this.timer);
-      this.timer = null;
+    if (this.started) {
+      this.started = false;
+      this.peer.loop.remove(HOST_TASK);
+      this.unhookMembers?.();
+      this.unhookMembers = null;
     }
     if (this.signals) {
       process.removeListener("SIGTERM", this.signalHandler);
       process.removeListener("SIGINT", this.signalHandler);
     }
-    const deadline = this.clock() + this.drainMillis;
+    const deadline = this.peer.monotonic() + this.drainMillis;
     for (const duty of this.duties.splice(0)) {
       try {
         duty.suspend();
@@ -230,7 +295,7 @@ export class ServiceHost {
       handle();
     }
     this.peer.close();
-    if (this.clock() > deadline) {
+    if (this.peer.monotonic() > deadline) {
       this.log("drain exceeded its bound");
     }
     this.log(`agentspaces-node ${this.peer.identity.peerId} stopped`);

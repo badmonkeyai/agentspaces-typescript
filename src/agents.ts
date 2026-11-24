@@ -77,6 +77,7 @@ import { ReduceBinding, ReduceMode } from "./reduce.js";
 import { COMPLETED, Class, Contribution, EntryType, EventKind, Motion, Space, SpaceEvent, TakeContext, Tagged, Template,
   Taken, WRITTEN, durationMillis, fromPayload, schemaOf, toPayload } from "./space.js";
 import { Aggregate, Settle } from "./capabilities/aggregate.js";
+import { TtlFloor } from "./ttl.js";
 import * as votes from "./vote.js";
 import * as wire from "./wire.js";
 import type { Dict } from "./wire.js";
@@ -94,6 +95,9 @@ const SPEC = Symbol.for("agentspaces.spec");
 type Verb = "take" | "orderedTake" | "notify" | "bid" | "ballot" | "decision" | "estimate" | "propose" | "join"
   | "reduce";
 type Binding = { verb: Verb; cue?: EntryType; space: string; produces?: EntryType | EntryType[]; [attr: string]: unknown };
+
+/** The lease and TTL members of the verbs the TTL floor judges at bind. */
+const TTL_MEMBERS = ["lease", "takeLease", "ticketLease", "resultLease", "accumulatorLease", "subscriptionLease"];
 type Spec = { name: string; description: string; goals: string[] };
 /** A declared A2UI component (SPEC §6.1a.3): the TypeScript form of `@UiComponent`. */
 export type UiComponentDecl = { catalog: string; component: string; id?: string; entry?: string; controls?: string[];
@@ -239,12 +243,21 @@ export function ballot(space: string, options: { prefix?: string; lease?: number
  * estimate has settled under the rule, as `@OnEstimate` does; the method
  * receives an `Estimate` and may return an entry for `resultSpace`. Needs a
  * `new Binder(peer, { aggregate })`.
+ *
+ * `settle` is a span, as Java's `@OnEstimate(settle = "PT40S")` (SPEC v0.1.36 §8): `"40s"`, `"PT40S"`, or
+ * milliseconds. `ticks` is the older count form, read as that many rounds of one second (Java's `settleTicks`); before
+ * the round moved to one second, `ticks: 40` settled after about 12 s where Java's took 40 s. A `settle` wins. With
+ * neither, the estimate settles after {@link ON_ESTIMATE_DEFAULT_SETTLE_MILLIS} (8 s) without a move, as Java's
+ * `@OnEstimate` does when `settle` is empty; `settle: 0` (or `"PT0S"`) is the explicit fire-at-once.
  */
-export function onEstimate(options: { epochs?: string; ticks?: number; tolerance?: number; resultSpace?: string;
-  resultLease?: number | string; produces?: EntryType } = {}): MethodDecorator {
-  return mark({ verb: "estimate", space: "", epochs: options.epochs ?? "", ticks: options.ticks ?? 0,
-    tolerance: options.tolerance ?? 0, resultSpace: options.resultSpace, resultLease: options.resultLease ?? "1h",
-    produces: options.produces });
+/** The settle span of an `@onEstimate` that names neither `settle` nor `ticks` (Java `@OnEstimate`'s default, 8 s). */
+export const ON_ESTIMATE_DEFAULT_SETTLE_MILLIS = 8_000;
+
+export function onEstimate(options: { epochs?: string; settle?: number | string; ticks?: number; tolerance?: number;
+  resultSpace?: string; resultLease?: number | string; produces?: EntryType } = {}): MethodDecorator {
+  return mark({ verb: "estimate", space: "", epochs: options.epochs ?? "", settle: options.settle,
+    ticks: options.ticks, tolerance: options.tolerance ?? 0, resultSpace: options.resultSpace,
+    resultLease: options.resultLease ?? "1h", produces: options.produces });
 }
 
 export type PartSpec = { type: EntryType; space?: string; key?: string; keyTag?: string; optional?: boolean;
@@ -363,6 +376,11 @@ export function onDecision(space: string, options: { prefix?: string; resultSpac
 // ------------------------------------------------------------------ binder
 
 /** A bound agent: its loops, watches, and join and reduce bindings, closed together. */
+/** A take whose handler runs now: its space, the take, its binder renewer, and whether a wake found it lapsed. */
+type HeldTake = { space: Space; taken: Taken<unknown>; renewer: Renewer | null; late: boolean };
+/** A running take's renewal: stopped when the handler returns, run at once on a wake. */
+type Renewer = { stop(): void; now(): void };
+
 export class Bound {
   card: Dict | null = null;
   /** The data-use entry ids the binder declared and renews. */
@@ -395,7 +413,18 @@ export type BinderOptions = { agent?: AgentIdentity | null; agentName?: string; 
    */
   committed?: CommittedSource | null;
   /** The residency of the running host (§3.6); `platform().residency` when the host declares none. */
-  residency?: Residency };
+  residency?: Residency;
+  /**
+   * The TTL floor every lease and TTL member of the bound verbs is judged by at bind (SPEC v0.1.36 §9.5; Java's
+   * `AgentBinder.ttlFloor`): lenient by default, so a value under 60 s warns once; a strict floor refuses the bind.
+   */
+  ttlFloor?: TtlFloor | null;
+  /**
+   * How long an `@orderedTake` handler may hold its entry before the binder stops renewing its take lease, so the
+   * entry lapses to another member's clerk as if the handler had crashed (Java's hold limit, owner decision 2 of
+   * 2026-11-22). Off (null) by default: a long handler keeps its entry while it runs (owner answer 12).
+   */
+  holdLimit?: number | string | null };
 
 /**
  * Runs decorated agents over one peer. `agent` (an `AgentIdentity`) makes
@@ -415,6 +444,26 @@ export class Binder {
   readonly ordered: OrderedLog | null;
   readonly committed: CommittedSource | null;
   readonly residency: Residency;
+  readonly ttlFloor: TtlFloor;
+  readonly holdLimitMillis: number | null;
+  /** `@orderedTake` take-lease renewals made while handlers ran, and renewals stopped by the hold limit. */
+  takeRenewals = 0;
+  holdLimitStops = 0;
+  /**
+   * Renewals a handler asked for through its {@link TakeContext} after the binder's end (its agent unbound, the hold
+   * limit passed, or its lease found lapsed on a wake): refused, so the entry lapses to another taker (I-05).
+   */
+  contextRenewalsRefused = 0;
+  /**
+   * Takes a wake or a wall step found lapsed on their wall-time lease while their handler ran (owner decision of
+   * 2026-11-23 on C05): they renew no more, and their result is late, so it is neither written nor completed.
+   */
+  lateTakes = 0;
+  /** Results of late takes that were dropped when their handler returned. */
+  lateResults = 0;
+  /** The takes whose handlers run now, re-checked against their leases on every wake (C05). */
+  private readonly held = new Set<HeldTake>();
+  private unwatchWakes: (() => void) | null = null;
   private readonly spaces = new Map<string, Space>();
 
   constructor(readonly peer: Peer, options: BinderOptions = {}) {
@@ -427,6 +476,30 @@ export class Binder {
     this.ordered = options.ordered ?? null;
     this.committed = options.committed ?? null;
     this.residency = options.residency ?? platform().residency;
+    this.ttlFloor = options.ttlFloor ?? new TtlFloor();
+    this.ttlFloor.check("binder.cardTtl", durationMillis(this.cardTtl)); // the AgentCard's TTL, renewed at half
+    this.holdLimitMillis = options.holdLimit === undefined || options.holdLimit === null ? null
+      : durationMillis(options.holdLimit);
+  }
+
+  /** Judges every lease and TTL member of a binding against the TTL floor, keyed `binder.<Agent>.<method>.<member>`. */
+  private judgeTtls(agent: string, method: string, binding: Binding): void {
+    const registerVerb: { [verb: string]: string } = { orderedTake: "orderedTake", join: "join", reduce: "reduce" };
+    for (const member of TTL_MEMBERS) {
+      const value = binding[member];
+      if (value === undefined || value === null || value === "") {
+        continue;
+      }
+      let millis: number;
+      try {
+        millis = durationMillis(value as number | string);
+      } catch {
+        continue; // an unreadable value is the verb's own refusal to make
+      }
+      const verb = registerVerb[binding.verb];
+      this.ttlFloor.check(`binder.${agent}.${method}.${member}`, millis,
+        verb === undefined ? null : `${verb}.${member}`);
+    }
   }
 
   space(name: string): Space {
@@ -448,6 +521,9 @@ export class Binder {
     // without what it needs, fails before any loop starts.
     for (const [name, , binding] of methods) {
       this.judge(bound, name, binding);
+    }
+    for (const [name, , binding] of methods) {
+      this.judgeTtls(type.name, name, binding); // the TTL floor (SPEC v0.1.36 §9.5), before any loop starts
     }
     const consumes: string[] = [];
     const produces: string[] = [];
@@ -711,10 +787,40 @@ export class Binder {
   private async finishTake(bound: Bound, instance: object, method: Method, binding: Binding, space: Space,
                            taken: Taken<unknown>): Promise<void> {
     let result: unknown;
+    // An ordered take's lease is renewed at half the lease while its handler runs (owner answer 12, as Java's
+    // renewTakeWhileRunning), and stops when the handler returns, before the complete, or when the agent is unbound.
+    const ordered = binding.verb === "orderedTake";
+    const heldSince = this.peer.monotonic();
+    const held: HeldTake = { space, taken, renewer: null, late: false };
+    held.renewer = ordered ? this.renewWhileRunning(bound, taken, heldSince, held) : null;
+    // §10.33 (I-05): a renewal from inside the method obeys the same end as the binder's own renewer: the agent
+    // unbound, or (an ordered take) the hold limit passed; and, on every take, a lease a wake found lapsed (C05).
+    const limit = ordered ? this.holdLimitMillis : null;
+    const guard = {
+      renewable: () => bound.running && !held.late
+        && (limit === null || this.peer.monotonic() - heldSince < limit),
+      refused: () => {
+        this.contextRenewalsRefused += 1;
+      },
+    };
+    this.holdTake(held);
     try {
-      result = await TakeContext.run(taken, () => method.call(instance, taken.value as never));
+      result = await TakeContext.run(taken, () => method.call(instance, taken.value as never), guard);
     } catch {
       return; // the lease lapses and the entry reappears for another worker
+    } finally {
+      held.renewer?.stop();
+      this.releaseTake(held);
+    }
+    if (held.late || this.leaseLapsed(held)) {
+      // C05: a lease that lapsed while the handler ran (a sleep, a wall step) may be another taker's now: the result
+      // is late, written nowhere, and the entry is left to whoever holds it.
+      if (!held.late) {
+        held.late = true;
+        this.lateTakes += 1;
+      }
+      this.lateResults += 1;
+      return;
     }
     try {
       if (result === null || result === undefined || result instanceof Motion || result instanceof Contribution
@@ -730,6 +836,99 @@ export class Binder {
       }
     } catch {
       // the completion is retried by nobody: the lease lapses
+    }
+  }
+
+  /**
+   * Renews a held take every half lease until stopped, the agent unbound, the hold limit passed (judged on the
+   * monotonic clock: a sleep is no hung handler), or a wake found its lease lapsed. `now()` runs the renewal at once,
+   * which a wake asks for a take whose lease still holds.
+   */
+  private renewWhileRunning(bound: Bound, taken: Taken<unknown>, heldSince = this.peer.monotonic(),
+                            held: HeldTake | null = null): Renewer {
+    const lease = taken.leaseMillis;
+    const limit = this.holdLimitMillis;
+    let stopped = false;
+    const run = (): void => {
+      if (stopped) {
+        return;
+      }
+      if (held?.late) {
+        stop(); // a wake found the lease lapsed: the result is late and nothing is renewed
+        return;
+      }
+      if (!bound.running) {
+        stop(); // its agent was unbound while the handler ran
+        return;
+      }
+      if (limit !== null && this.peer.monotonic() - heldSince >= limit) {
+        this.holdLimitStops += 1;
+        stop(); // taken as hung: the entry lapses to another member's clerk at the lease's end
+        return;
+      }
+      try {
+        taken.renew(lease);
+        this.takeRenewals += 1;
+      } catch {
+        stop(); // the take no longer holds the entry
+      }
+    };
+    const repeating = this.peer.every(Math.max(1, Math.floor(lease / 2)), run);
+    const stop = (): void => {
+      stopped = true;
+      repeating.stop();
+    };
+    return { stop, now: run };
+  }
+
+  /** Files a running take for the wake re-check, watching the peer's wakes while any take is held. */
+  private holdTake(held: HeldTake): void {
+    this.held.add(held);
+    if (this.unwatchWakes === null) {
+      void this.peer.loop; // the loop's watchdog is what sees a wall step or a late wake
+      const offStep = this.peer.onWallStepped(() => this.recheckHeld());
+      const offLate = this.peer.onLateWoke(() => this.recheckHeld());
+      this.unwatchWakes = () => {
+        offStep();
+        offLate();
+      };
+    }
+  }
+
+  private releaseTake(held: HeldTake): void {
+    this.held.delete(held);
+    if (this.held.size === 0 && this.unwatchWakes !== null) {
+      this.unwatchWakes();
+      this.unwatchWakes = null;
+    }
+  }
+
+  /**
+   * Whether the take's wall-time lease has run out, as the replica holds the entry's claim now: no claim, or one whose
+   * expiry has passed. A better claim of another holder is not a lapse; the take's complete refuses it as before.
+   */
+  private leaseLapsed(held: HeldTake): boolean {
+    const claim = this.peer.claims.get(held.taken.entryId)?.["claim"] as Dict | undefined;
+    return claim === undefined || !(Number(claim["expiresAtMillis"]) > this.peer.now());
+  }
+
+  /**
+   * Owner decision of 2026-11-23 on C05: on every wake or wall step, each running take is judged at once against its
+   * wall-time lease. One that lapsed while the process slept stops renewing (its binder renewer and its context) and
+   * its result is late; one that still holds is renewed at once, as Java asks every wall-anchored renewal again.
+   */
+  private recheckHeld(): void {
+    for (const held of [...this.held]) {
+      if (held.late) {
+        continue;
+      }
+      if (this.leaseLapsed(held)) {
+        held.late = true;
+        this.lateTakes += 1;
+        held.renewer?.stop();
+      } else {
+        held.renewer?.now();
+      }
     }
   }
 
@@ -983,8 +1182,13 @@ export class Binder {
     }
     const prefix = String(binding.epochs ?? "");
     const space = binding.resultSpace ? this.space(String(binding.resultSpace)) : null;
-    const close = this.aggregate.onEstimate((id) => id.startsWith(prefix),
-      Settle.after(Number(binding.ticks ?? 0), Number(binding.tolerance ?? 0)), (estimate) => {
+    const tolerance = Number(binding.tolerance ?? 0);
+    const settle = binding.settle !== undefined && binding.settle !== null
+      ? Settle.span(durationMillis(binding.settle as number | string), tolerance)
+      : binding.ticks !== undefined && binding.ticks !== null
+        ? Settle.after(Number(binding.ticks), tolerance)
+        : Settle.span(ON_ESTIMATE_DEFAULT_SETTLE_MILLIS, tolerance); // Java's default: no rule is 8 s, not at once
+    const close = this.aggregate.onEstimate((id) => id.startsWith(prefix), settle, (estimate) => {
         void Promise.resolve().then(async () => {
           try {
             const result = await method.call(instance, estimate as never);

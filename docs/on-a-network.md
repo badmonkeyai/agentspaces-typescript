@@ -81,11 +81,23 @@ certificate, its actor's revocation, then its stamps.
 
 The peer counts a kind of `Envelope.Kind` this client does not speak in
 `peer.ignoredKinds`, and the reader goes on. A lost socket is a hiccup: the
-peer re-dials the seeds one dial at a time, pausing after each round of refusals
-for `reconnectIntervalMs` (5 s), then 10, 20 and 30 s with a random spread, until
-`close()` (swarm retries, ROBUSTNESS.md §10.3 E5). A link that ends within
-`reconnectIntervalMs` of its dial counts as a refused round, so a seed that accepts
-each dial and drops it at once gets the same pauses (§10.6). The peer then introduces
+peer re-dials the seeds until `close()` (swarm retries, ROBUSTNESS.md §10.3 E5).
+
+- Each round dials the seeds in list order, one start every 250 ms (RFC 8305).
+  A refused dial starts the next at once. The first to answer wins, the seeds not
+  yet started are not dialled, and a channel that opens late is closed. The seed
+  whose link just ended is dialled last.
+- After a round in which no seed answered, the peer waits the redial table:
+  5, 10, 20, 30 s, then 5 s again, each with a spread of +/-10%.
+- The table goes back to 5 s only when a link that held at least
+  `reconnectIntervalMs` (5 s) ends, and that end is redialled at once. A link that
+  ends sooner counts as a failed round and waits the next step, so a seed that
+  accepts each dial and drops it at once climbs the table (§10.6).
+- A wake from sleep also resets the table. With no link, it dials at once. With the
+  link up, it PINGs the seed; no frame back within the 2 s ping timeout closes the
+  link and fails over to the next seed at once (the dead-seed rule).
+
+The peer then introduces
 itself again and pulls again what it had pulled (revocations, advertisements, spaces),
 counting in `peer.reconnects`; `peer.connected()` says whether the link is up.
 A host whose own durable timer owns every dial, as the workers cell's alarm does,

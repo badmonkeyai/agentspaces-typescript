@@ -23,6 +23,7 @@
  */
 
 import { CryptoPort, cryptoPort } from "./crypto.js";
+import { monotonicMillis } from "./time.js";
 
 /** Persistent storage for keys and small secrets, one value per name. */
 export interface KeyStore {
@@ -64,14 +65,21 @@ export interface TimerPort {
   clearTimeout(handle: unknown): void;
   /** Runs `fn` every `periodMillis`, reporting how late each run fired. */
   every(periodMillis: number, fn: () => void): Repeating;
+  /**
+   * The monotonic clock these timers run on, in milliseconds (SPEC v0.1.36 §9.5: local periods on a monotonic clock).
+   * Optional, so an older port still fits; without it the runtime's `performance.now()` is read ({@link monotonicOf}).
+   */
+  now?(): number;
 }
 
-/** The runtime's own timers, with drift measured against the schedule. */
+/** The runtime's own timers, with drift measured against the schedule on the monotonic clock. */
 export const systemTimers: TimerPort = {
   setTimeout: (fn, millis) => globalThis.setTimeout(fn, millis),
   clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
+  now: monotonicMillis,
   every(periodMillis, fn) {
-    let next = Date.now() + periodMillis;
+    // Judged on the monotonic clock (EL-C-04): a wall step neither fires a burst of runs nor stalls the schedule.
+    let next = monotonicMillis() + periodMillis;
     let handle: ReturnType<typeof setTimeout> | null = null;
     let stopped = false;
     const state = {
@@ -85,14 +93,14 @@ export const systemTimers: TimerPort = {
       },
     };
     const schedule = (): void => {
-      handle = globalThis.setTimeout(run, Math.max(0, next - Date.now()));
+      handle = globalThis.setTimeout(run, Math.max(0, next - monotonicMillis()));
       unrefIfPossible(handle);
     };
     const run = (): void => {
       if (stopped) {
         return;
       }
-      const now = Date.now();
+      const now = monotonicMillis();
       state.lastDriftMillis = Math.max(0, now - next);
       state.lateRuns = state.lastDriftMillis > periodMillis ? state.lateRuns + 1 : 0;
       next = Math.max(next + periodMillis, now + 1);

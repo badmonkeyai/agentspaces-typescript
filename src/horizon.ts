@@ -155,4 +155,18 @@ export class HorizonMode {
     }
     return this.mode === "PER_ENTRY" ? "per-entry" : "legacy";
   }
+
+  /**
+   * When this mode next needs a judgement to move (due work, SPEC v0.1.36 §9.5): one round on while a fully hinted
+   * view counts its streak, the end of the settle wait while settling, never once engaged or while unhinted.
+   */
+  nextJudgement(now: number, hinted: boolean, roundMillis: number, maxLeaseMillis: number): number | null {
+    if (!hinted || this.mode === "PER_ENTRY") {
+      return null;
+    }
+    if (this.mode === "SETTLING") {
+      return this.engagedAt + Math.max(0, maxLeaseMillis) + LAPSED_GRACE_MILLIS;
+    }
+    return (this.countedAt ?? now) + Math.max(1, roundMillis);
+  }
 }

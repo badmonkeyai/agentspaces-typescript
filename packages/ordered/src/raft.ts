@@ -26,7 +26,7 @@
  * twice in a term and never loses an acknowledged entry.
  */
 
-import { cbor, records, wire } from "@agentspaces/client";
+import { WALL_STEP_MILLIS, cbor, monotonicMillis, records, wire } from "@agentspaces/client";
 
 type Dict = wire.Dict;
 import { LogEntry, LogStore, MemoryLogStore } from "./store.js";
@@ -59,6 +59,8 @@ export type RaftOptions = {
   random?: () => number;
   /** Who may drive or submit (the profile's authorizer); the default admits the member set and any client. */
   authorizer?: (peer: string, operation: Operation) => boolean;
+  /** The monotonic clock the leader's lease guard reads; the runtime's by default (a test passes virtual time). */
+  monotonic?: () => number;
 };
 
 /** RaftMessages.Frame: exactly one field set, every other null, in Java record order. */
@@ -101,6 +103,16 @@ export class RaftLog {
   private durable: Promise<void> = Promise.resolve();
   clientSubmits = 0;
   clientSubmitsRefused = 0;
+  private readonly monotonic: () => number;
+  /** When this leader last sent its heartbeat, on the monotonic clock; null while not leading. */
+  private lastHeartbeatAt: number | null = null;
+  /**
+   * The lease the last card advertised (SPEC v0.1.36 §8): fixed between publications, so the card changes only at a
+   * role or term change and once half the lease has passed, rather than on every tick as `leaseUntil` moved.
+   */
+  private advertised: { until: number; issuedAt: number; issuedMono: number; span: number; term: number } | null = null;
+  /** Times this leader stood down under its lease guard. */
+  leaseStepDowns = 0;
 
   constructor(private readonly pipes: RaftPipes, members: string[],
               applied: (command: Uint8Array, index: number) => void, options: RaftOptions = {}) {
@@ -115,6 +127,7 @@ export class RaftLog {
     this.random = options.random ?? Math.random;
     this.authorizer = options.authorizer ?? ((peer, operation) => operation === "RAFT_CLIENT"
       || this.members.includes(peer));
+    this.monotonic = options.monotonic ?? monotonicMillis;
     this.electionTimeout = this.newElectionTimeout();
     this.loaded = this.store.load().then((state) => {
       this.term = state.term;
@@ -139,6 +152,7 @@ export class RaftLog {
   suspend(): void {
     this.suspended = true;
     this.role = "FOLLOWER";
+    this.lastHeartbeatAt = null;
     this.leaderHint = null;
   }
 
@@ -187,19 +201,77 @@ export class RaftLog {
     this.tickMillis = tickMillis;
   }
 
-  /** RaftLog.describe: the capability advertisement's parameters (the host adds the envelope fields). */
+  /**
+   * RaftLog.describe: the capability advertisement's parameters (the host adds the envelope fields). A leader's
+   * `leaseUntil` is renewed only at a role or term change and once half of it has passed (SPEC v0.1.36 §8; Java's
+   * lease card), so the parameters, and the card the host publishes on their change, stay put in between.
+   */
   parameters(): { [key: string]: string } {
     const parameters: { [key: string]: string } = { members: String(this.members.length),
       role: this.role.toLowerCase(), term: String(this.term) };
     if (this.role === "LEADER") {
-      parameters["leaseUntil"] = new Date(this.clock() + this.tickMillis * this.electionTimeout).toISOString()
-        .replace(/\.000Z$/, "Z");
+      const now = this.clock();
+      const mono = this.monotonic();
+      const lease = this.advertised;
+      // Half the lease is judged on the monotonic clock, as Java's leaseIssuedNanos is (SPEC v0.1.36 §9.5). A wall
+      // step since the issue (the wall and the monotonic clock no longer agree on the time since) renews the card at
+      // once: its leaseUntil was written on the old wall, so a reader would judge it lapsed or far too long.
+      if (lease === null || lease.term !== this.term || mono >= lease.issuedMono + lease.span / 2
+          || Math.abs((now - lease.issuedAt) - (mono - lease.issuedMono)) > WALL_STEP_MILLIS) {
+        const span = this.tickMillis * this.electionTimeout;
+        this.advertised = { until: now + span, issuedAt: now, issuedMono: mono, span, term: this.term };
+      }
+      parameters["leaseUntil"] = new Date(this.advertised!.until).toISOString().replace(/\.000Z$/, "Z");
+    } else {
+      this.advertised = null;
     }
     return parameters;
   }
 
+  /** The shortest election timeout a follower draws: five base periods. */
+  private minElectionMillis(): number {
+    return 5 * this.tickMillis;
+  }
+
+  /**
+   * The leader's lease guard (SPEC v0.1.36 §8; owner answer 2): a leader that sent no heartbeat for the minimum
+   * election timeout, or whose advertised lease ran out, may have been replaced while it was wedged; it stands down
+   * before it acts. Returns whether it stood down.
+   */
+  private guardLease(): boolean {
+    if (this.role !== "LEADER") {
+      return false;
+    }
+    const silent = this.lastHeartbeatAt !== null && this.monotonic() - this.lastHeartbeatAt > this.minElectionMillis();
+    // The advertised lease's end on the monotonic clock (Java's armLeaseGuard): a wall step neither ends it early nor
+    // stretches it.
+    const lapsed = this.advertised !== null && this.advertised.term === this.term
+      && this.monotonic() >= this.advertised.issuedMono + this.advertised.span;
+    if (!silent && !lapsed) {
+      return false;
+    }
+    this.role = "FOLLOWER";
+    this.leaderHint = null;
+    this.lastHeartbeatAt = null;
+    this.advertised = null;
+    this.electionElapsed = 0;
+    this.leaseStepDowns++;
+    return true;
+  }
+
+  /** Sends the heartbeat (an append) to every other member, and notes when. */
+  private heartbeat(): void {
+    for (const member of this.members) {
+      if (member !== this.self) {
+        this.send(member, this.appendFor(member));
+      }
+    }
+    this.lastHeartbeatAt = this.monotonic();
+  }
+
   /** RaftLog.submit: appends when leading, forwards under the leader hint, or returns false. */
   async submit(command: Uint8Array): Promise<boolean> {
+    this.guardLease();
     if (this.role === "LEADER") {
       const entry: LogEntry = { term: this.term, command };
       this.log.push(entry);
@@ -222,13 +294,9 @@ export class RaftLog {
     if (this.suspended) {
       return;
     }
-    if (this.role === "LEADER") {
-      for (const member of this.members) {
-        if (member !== this.self) {
-          this.send(member, this.appendFor(member));
-        }
-      }
-    } else {
+    if (this.role === "LEADER" && !this.guardLease()) {
+      this.heartbeat();
+    } else if (this.role !== "LEADER") {
       this.electionElapsed++;
       if (this.electionElapsed >= this.electionTimeout) {
         await this.startElection();
@@ -337,11 +405,8 @@ export class RaftLog {
         this.matchIndex.set(member, 0);
       }
       this.matchIndex.set(this.self, this.log.length);
-      for (const member of this.members) {
-        if (member !== this.self) {
-          this.send(member, this.appendFor(member));
-        }
-      }
+      this.advertised = null;
+      this.heartbeat();
     }
   }
 
@@ -439,6 +504,7 @@ export class RaftLog {
       changed = true;
     }
     this.role = "FOLLOWER";
+    this.lastHeartbeatAt = null;
     this.votesGranted.clear();
     this.electionElapsed = 0;
     this.electionTimeout = this.newElectionTimeout();
@@ -468,6 +534,9 @@ export class RaftLog {
   }
 
   private advanceCommit(): void {
+    if (this.guardLease()) {
+      return; // a leader past its lease commits nothing: a newer leader may already have
+    }
     this.matchIndex.set(this.self, this.log.length);
     for (let candidate = this.log.length; candidate > this.commitIndex; candidate--) {
       if (this.log[candidate - 1].term !== this.term) {

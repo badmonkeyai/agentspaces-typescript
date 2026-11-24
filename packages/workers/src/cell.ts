@@ -24,9 +24,10 @@
  * housekeeping timer runs the per-second duties for as long as the object
  * is live; the one connection is outbound, `wss` to the configured seeds
  * (`ws` under the `dev-local` profile). The alarm owns every dial, with the
- * core's redial off: it dials again at once when the socket closes (at the
- * reconnect cadence when the link ended within it of its dial) and on each
- * alarm while down. The self-advertisement
+ * core's redial off: it dials again at once when the socket closes (after
+ * the redial table's next wait when the link ended within the reconnect
+ * cadence of its dial) and on each alarm while down, after the table's next
+ * wait. The self-advertisement
  * carries `js.residency=cell`. On eviction nothing runs: every claim and
  * lease the cell held lapses on its own clock, and the next alarm brings
  * the same identity back (the pause rule). Only the public Durable Objects
@@ -38,10 +39,11 @@
  */
 
 import { DurableObject } from "cloudflare:workers";
-import { Binder, Peer, Space, Taken, Template, WsDialer, cbor, durationMillis, eq, instantIso, parseDurationMillis,
-  social } from "@agentspaces/client";
-import type { BinderOptions, Bound, Dialer, Entry, FrameChannel, Seed, WebSocketLike, wire } from "@agentspaces/client";
+import { Binder, Peer, RedialTable, Space, Taken, Template, WsDialer, cbor, durationMillis, eq, instantIso,
+  parseDurationMillis, social } from "@agentspaces/client";
+import type { BinderOptions, Bound, Entry, WebSocketLike, wire } from "@agentspaces/client";
 import { ConnectorRuntime } from "@agentspaces/connect";
+import { DialTracker, TrackedDialer } from "./tracked.js";
 import type { ConnectorOptions } from "@agentspaces/connect";
 import { CellConfig, DEFAULT_IDLE_MILLIS, cellConfig } from "./config.js";
 import { SqliteKeyStore, blobOf, bytesOf, loadOrCreateIdentity } from "./keystore.js";
@@ -91,34 +93,6 @@ function whereTemplate(schema: string, where: Where): Template<Dict> {
   return new Template<Dict>(schema, conditions);
 }
 
-/**
- * A dialer wrapper that reports whether a dial is in flight, so the alarm never starts a second one, and when a
- * dialed link ends, with the time it came up.
- */
-class TrackedDialer implements Dialer {
-  readonly scheme: string;
-  constructor(private readonly inner: Dialer, private readonly track: (dialing: boolean) => void,
-              private readonly ended: (linkedAt: number) => void) {
-    this.scheme = inner.scheme;
-  }
-
-  expand(seed: Seed, resolve: boolean): Promise<Seed[]> {
-    return this.inner.expand === undefined ? Promise.resolve([seed]) : this.inner.expand(seed, resolve);
-  }
-
-  async dial(seed: Seed): Promise<FrameChannel> {
-    this.track(true);
-    try {
-      const channel = await this.inner.dial(seed);
-      const linkedAt = Date.now();
-      channel.onClose(() => this.ended(linkedAt));
-      return channel;
-    } finally {
-      this.track(false);
-    }
-  }
-}
-
 export abstract class CellHost<Env extends CellEnv = CellEnv> extends DurableObject<Env> {
   readonly config: CellConfig;
   readonly keys: SqliteKeyStore;
@@ -129,7 +103,13 @@ export abstract class CellHost<Env extends CellEnv = CellEnv> extends DurableObj
   ticks = 0;
   alarms = 0;
   dials = 0;
-  private dialing = false;
+  /**
+   * The cell's position in the redial table (owner decision 1 of 2026-11-23): each alarm while down waits the next
+   * wait. A link that outlived the reconnect cadence resets it, and so does a wake.
+   */
+  readonly redialTable = new RedialTable();
+  /** The seed dials in flight: the core's staggered dials overlap, and the alarm never starts a second join. */
+  private readonly dialTracker = new DialTracker();
   private paused = false;
   private started = false;
   private lastBusyAt = 0;
@@ -176,8 +156,8 @@ export abstract class CellHost<Env extends CellEnv = CellEnv> extends DurableObj
     for (const scheme of ["ws", "wss"] as const) {
       const inner = this.peer.dialers.get(scheme) ?? new WsDialer(scheme, (url, protocols) =>
         new (globalThis as unknown as { WebSocket: new (u: string, p: string[]) => WebSocketLike }).WebSocket(url, protocols));
-      this.peer.registerDialer(new TrackedDialer(inner, (dialing) => { this.dialing = dialing; },
-        (linkedAt) => { void this.linkEnded(linkedAt); }));
+      this.peer.registerDialer(new TrackedDialer(inner, this.dialTracker,
+        (linkedAt) => { void this.linkEnded(linkedAt); }, () => this.peer.currentChannel()));
     }
     this.restore();
     await this.onBoot();
@@ -274,17 +254,21 @@ export abstract class CellHost<Env extends CellEnv = CellEnv> extends DurableObj
   }
 
   /**
-   * The dialed link ended: the alarm dials again at once, or at the reconnect cadence when the link ended within it
-   * of its dial, so a seed that drops each link at once gets no dial loop (swarm retries, ROBUSTNESS.md §10.6).
+   * The dialed link ended: the alarm dials again at once, or after the redial table's next wait when it ended within
+   * the reconnect cadence of its dial, so a seed that drops each link at once gets no dial loop (swarm retries, ROBUSTNESS.md §10.6).
    */
   private async linkEnded(linkedAt: number): Promise<void> {
     if (this.paused) {
       return;
     }
     const quick = Date.now() - linkedAt < this.config.reconnectMillis;
-    this.log(`link lost; re-dialing on the next alarm${quick ? `, in ${this.config.reconnectMillis} ms` : ""}`);
+    if (!quick) {
+      this.redialTable.reset(); // the link held: it succeeded
+    }
+    const wait = quick ? Math.round(this.redialTable.next(this.config.reconnectMillis)) : 0;
+    this.log(`link lost; re-dialing on the next alarm${quick ? `, in ${wait} ms` : ""}`);
     try {
-      await this.scheduleAlarm(quick ? this.config.reconnectMillis : 0);
+      await this.scheduleAlarm(wait);
     } catch (e) {
       this.log(`alarm not armed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -294,13 +278,14 @@ export abstract class CellHost<Env extends CellEnv = CellEnv> extends DurableObj
   async webSocketClose(_ws: unknown, code: number): Promise<void> {
     await this.ready;
     this.log(`socket closed (${code}); reconnecting on the next alarm`);
-    await this.scheduleAlarm(this.config.reconnectMillis);
+    await this.scheduleAlarm(this.redialTable.next(this.config.reconnectMillis));
   }
 
   /** Connects if needed and arms the alarm; idempotent. */
   async wake(): Promise<CellStatus> {
     await this.ready;
     this.paused = false;
+    this.redialTable.reset(); // a wake dials at once, and a later wait starts from the table's first
     await this.ensureConnected();
     await this.scheduleAlarm();
     return this.status();
@@ -359,12 +344,12 @@ export abstract class CellHost<Env extends CellEnv = CellEnv> extends DurableObj
     return undefined;
   }
 
-  /** Arms the alarm: the reconnect cadence while down, the busy cadence while busy, the idle one otherwise. */
+  /** Arms the alarm: the redial table's next wait while down, the busy cadence while busy, the idle one otherwise. */
   protected async scheduleAlarm(delayMillis: number | null = null): Promise<void> {
     if (this.paused) {
       return;
     }
-    const delay = delayMillis ?? (!this.peer.connected() ? this.config.reconnectMillis
+    const delay = delayMillis ?? (!this.peer.connected() ? this.redialTable.next(this.config.reconnectMillis)
       : this.busy() ? this.config.tickMillis : this.idleMillis());
     await this.ctx.storage.setAlarm(Date.now() + Math.max(1, delay));
   }
@@ -374,7 +359,7 @@ export abstract class CellHost<Env extends CellEnv = CellEnv> extends DurableObj
     if (this.peer.connected()) {
       return true;
     }
-    if (this.dialing) {
+    if (this.dialTracker.dialing) {
       return false;
     }
     try {

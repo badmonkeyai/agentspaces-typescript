@@ -37,6 +37,7 @@ import { BootstrapTimeoutError, Peer } from "../src/peer.js";
 import * as social from "../src/social.js";
 import * as wire from "../src/wire.js";
 import type { Dict } from "../src/wire.js";
+import { VirtualTime, Watchdog } from "../src/time.js";
 import "../src/node/index.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -293,33 +294,47 @@ test("groupFromDocument selects by id, by name, or the only group", () => {
 
 // ------------------------------------------------------------- connectAny
 
-test("connectAny dials the seeds in order and fails over on a lost socket (DB-X-02)", async () => {
+test("connectAny dials the seeds in list order 250 ms apart, a refusal starting the next at once, the first to "
+  + "answer wins, and a lost link fails over with its seed dialled last (DB-X-02)", async () => {
+  // Owner decision 2 of 2026-11-23 (RFC 8305): the seeds are dialled in list order, one start every 250 ms; a refused
+  // dial starts the next at once; the first to answer wins and the seeds not yet started are never dialled; the seed
+  // whose link just ended is dialled last. Real sockets; the stagger and the redial table run on virtual time, so the
+  // only way the third seed is dialled is a stagger the winner failed to cancel.
   const dead = await deadPort();
   const a = new FakeSeed();
   const b = new FakeSeed();
   await a.listen();
   await b.listen();
-  const peer = new Peer(Identity.generate(), "zTsBootstrap");
-  peer.reconnectIntervalMs = 100;
+  const time = new VirtualTime(Date.now());
+  const peer = new Peer(Identity.generate(), "zTsBootstrap", time.wall);
+  peer.timers = time;
+  peer.watchdog = new Watchdog(time);
+  const seeds = [{ host: "127.0.0.1", port: dead }, { host: "127.0.0.1", port: a.port },
+    { host: "127.0.0.1", port: b.port }];
   try {
-    await peer.connectAny([{ host: "127.0.0.1", port: dead }, { host: "127.0.0.1", port: a.port },
-      { host: "127.0.0.1", port: b.port }]);
-    assert.equal(peer.currentSeed()?.port, a.port, "the first seed that answered");
+    await peer.connectAny(seeds);
     assert.ok(peer.connected());
+    assert.equal(peer.currentSeed()?.port, a.port, "the dead seed refused, which started a at once, and a won");
     assert.ok(await until(() => a.kindsOn(0).length >= 2, 5000));
     assert.deepEqual(a.kindsOn(0).slice(0, 2), ["RUMOR", "DIGEST"]);
-    assert.equal(b.connections.length, 0, "the next seed is not dialed while the link holds");
+    time.advance(1_000); // four staggers: a stagger left armed would dial b now
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(b.connections.length, 0, "b, after the winner, was never dialled");
 
-    // Seed A drops the link: the peer tries the next seed first, not A again.
-    a.connections[0].destroy();
-    assert.ok(await until(() => b.kindsOn(0).length >= 2, 5000), "failed over to B");
+    // a drops a link that held: a is the lost seed, so the round goes dead (refused), then b at once, and a is last.
+    time.advance(30_000);
+    a.connections[0]!.destroy();
+    assert.ok(await until(() => b.kindsOn(0).length >= 2, 5000), "failed over to b");
     assert.equal(peer.currentSeed()?.port, b.port);
     assert.equal(peer.reconnects, 1);
-    assert.equal(a.connections.length, 1, "A was not re-dialed before B");
+    time.advance(1_000);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(a.connections.length, 1, "a, the lost seed, came last and was never dialled");
 
-    // B goes away for good: the round continues through the dead seed back to A.
+    // b goes away for good after it held: b is now last, the dead seed refuses, and a answers.
+    time.advance(30_000);
     b.close();
-    assert.ok(await until(() => a.connections.length === 2 && a.kindsOn(1).length >= 2, 5000), "back to A");
+    assert.ok(await until(() => a.connections.length === 2 && a.kindsOn(1).length >= 2, 5000), "back to a");
     assert.equal(peer.currentSeed()?.port, a.port);
     assert.equal(peer.reconnects, 2);
   } finally {

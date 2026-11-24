@@ -18,7 +18,10 @@ decorator's first argument. An `@entry` class names its wire schema; a
 `notNull`, or any function) over fields and tags; `watch` is an
 `EventEmitter` and `events` an async iterator, each delivering `WRITTEN`,
 `TAKEN`, and `COMPLETED` once per entry; `TakeContext.current()` (an
-`AsyncLocalStorage`) is the take a worker runs under.
+`AsyncLocalStorage`) is the take a worker runs under. Its `renew()` obeys the
+binder: it renews nothing once the agent is unbound, an `@orderedTake`
+handler is past the binder's hold limit, or a wake found the take's lease
+lapsed (the handler's result is then late and is not written).
 
 ```ts
 @entry("ai.badmonkey.agentspaces.examples.fleet.ResearchFleet$ResearchTask#v1")
@@ -91,7 +94,8 @@ bytewise between equal lengths.
 `capabilities/` speaks the layer-4 pipes (`PIPE_DATA` frames addressed to a
 member): `Aggregate` (push-sum `avg`, roster `sum` and `count`, `min`, `max`,
 `estimate`, `Settle`, `awaitSettled`, `onEstimate`, and the `@onEstimate`
-decorator), `Semantic` (the hashing embedder with Java's `String.hashCode`
+decorator, which settles after 8 s without a move when it names no rule, as
+Java's does; `settle: "PT0S"` fires at once), `Semantic` (the hashing embedder with Java's `String.hashCode`
 so the vectors agree, `query`, `remoteQuery` over the query pipe, and
 answers to other members' queries), and `actions` and `invoke` (the actions
 the cards on the `ads` stream declare, invoked through the task space with

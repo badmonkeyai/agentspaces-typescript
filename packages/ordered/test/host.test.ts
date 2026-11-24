@@ -157,10 +157,12 @@ test("a claim the log commits after the taker's timeout still hands the entry to
     followers.forEach((v) => v.host.suspend());
     const started = Date.now();
     const taking = log.take("jobs", TASK, "clerk", 60_000, 100);
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    followers.forEach((v) => v.host.resume());
+    // The leader keeps ticking (its heartbeat) while its followers are away, as a live host does: a leader that sent
+    // no heartbeat for five base periods would stand down under its lease guard (SPEC v0.1.36 §8).
     let ticking = true;
     const pump = (async () => { while (ticking) { await tick(); } })();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    followers.forEach((v) => v.host.resume());
     const taken = await taking;
     const took = Date.now() - started;
     ticking = false;
