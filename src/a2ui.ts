@@ -17,7 +17,7 @@
 /**
  * The open A2UI records and component builders of agentspaces-a2ui in the TypeScript client (SPEC §6.1a.7).
  * The four records an application's agents write beside its surfaces,
- * `ChatMessage` (versions 1 and 2), `SharedFile` (versions 1 and 2), `WorkingOn` and `ChatProgress`, as `@entry`
+ * `ChatMessage` (versions 1 to 3), `SharedFile` (versions 1 and 2), `WorkingOn` and `ChatProgress`, as `@entry`
  * classes whose fields are in Java's declared order, so a record encodes to the bytes the Java vectors pin; a version
  * 2 field is left out of a version 1 record. Each factory refuses what the Java constructor refuses. The
  * builders shape the components of the open catalogs as `Surfaces` does in Java: `titleBar`, `menu`, `split` of
@@ -29,9 +29,9 @@ import { entry } from "./space.js";
 
 /** The open namespace of the records. */
 export const A2UI_NAMESPACE = "https://badmonkey.ai/agentspaces/a2ui/v1/";
-/** The member hint a reader of version 2 advertises, and its value. */
+/** The member hint a reader advertises, and its value: the newest version of the records it reads (3, the chat's confirm block). */
 export const A2UI_RECORDS_HINT = "a2ui.records";
-export const A2UI_RECORDS_VERSION = "2";
+export const A2UI_RECORDS_VERSION = "3";
 /** The A2A task states, in the specification's order. */
 export const TASK_STATES = ["submitted", "working", "input-required", "completed", "failed", "canceled"] as const;
 export type TaskState = (typeof TASK_STATES)[number];
@@ -53,6 +53,23 @@ export function writesV2(readerHints: Iterable<Record<string, string>>): boolean
 
 /** The version a writer writes for these readers: 2 when every one reads it, else 1. */
 export const versionFor = (readerHints: Iterable<Record<string, string>>): 1 | 2 => (writesV2(readerHints) ? 2 : 1);
+
+/** The newest version of a record by its simple name or IRI: 3 for ChatMessage, 2 for SharedFile, 1 for the rest. */
+export function latest(type: string): number {
+  const simple = type.slice(type.lastIndexOf("/") + 1);
+  return simple === "ChatMessage" ? 3 : simple === "SharedFile" ? 2 : 1;
+}
+
+/** The version a writer writes of a record whose newest is `latest`: the lowest level its readers advertise (1 for none), never above `latest`. */
+export function versionAt(readerHints: Iterable<Record<string, string>>, newest: number): number {
+  let v = newest;
+  for (const h of readerHints) {
+    const s = h[A2UI_RECORDS_HINT];
+    const level = s !== undefined && /^\d{1,9}$/.test(s) ? Number(s) : 1;
+    v = Math.min(v, Math.max(1, level));
+  }
+  return v;
+}
 
 /** A path in a tree of files: relative, `/`-separated, at most 512 bytes, no empty, `.` or `..` segment, no backslash or control character. */
 export function validPath(path: string): boolean {
@@ -80,10 +97,70 @@ const version = (v: number, record: string): 1 | 2 => {
 export interface From { kind: "person" | "agent"; name: string; peer: string }
 export interface Cite { file: string; path: string; name: string }
 
-/** One line of a thread in `conversations`; version 2 adds `format` and `cites`. */
+export const CONFIRM_KINDS = ["approval", "confirm", "review", "choice", "input"] as const;
+export const CONFIRM_OPTIONS = ["approve", "reject", "amend"] as const;
+export const CONFIRM_REASONS = ["none", "optional", "required"] as const;
+export const CONFIRM_VERDICTS = ["approved", "rejected", "amended", "expired", "cancelled"] as const;
+/** The longest question, summary or reason a line carries, in characters. */
+export const MAX_CONFIRM_TEXT = 2000;
+
+/**
+ * A desk's request as a chat shows it (ChatMessage version 3, SPEC §6.1a.7): the request, its state, the decision once
+ * there is one, and the verdicts a person may give. Fields in Java's declared order.
+ */
+export interface Confirm {
+  invocationId: string; desk: string; kind: string; question: string; action: string; arguments: string; summary: string;
+  deadline?: string | null; options: string[]; reasons: string; code: string; state: string; verdict: string; by: string[];
+  reason: string; approvals: number; quorum: number;
+}
+
+/** A person's answer to a confirm (ChatMessage version 3). */
+export interface Answer { invocationId: string; verdict: string; reason: string; amendedArguments: string }
+
+/** A confirm, checked as the Java record checks it, with its defaults. */
+export function confirm(v: Partial<Confirm> & { invocationId: string; question: string }): Confirm {
+  if (!v.invocationId || !v.invocationId.trim()) throw new RangeError("a confirm names the request it is for");
+  const kind = v.kind || "approval";
+  if (!(CONFIRM_KINDS as readonly string[]).includes(kind)) throw new RangeError(`a confirm's kind is one of ${CONFIRM_KINDS.join(", ")}: ${kind}`);
+  const question = v.question ?? "";
+  if (!question.trim()) throw new RangeError("a confirm carries the question a person answers");
+  const summary = v.summary ?? "";
+  if (question.length > MAX_CONFIRM_TEXT || summary.length > MAX_CONFIRM_TEXT) throw new RangeError("a confirm's question and summary are at most 2000 characters each");
+  const options = v.options && v.options.length ? [...v.options] : ["approve", "reject"];
+  for (const o of options) if (!(CONFIRM_OPTIONS as readonly string[]).includes(o)) throw new RangeError(`a confirm's options are approve, reject and amend: ${o}`);
+  const reasons = v.reasons || "optional";
+  if (!(CONFIRM_REASONS as readonly string[]).includes(reasons)) throw new RangeError(`a confirm's reasons is none, optional or required: ${reasons}`);
+  const state = v.state || "pending";
+  if (state !== "pending" && state !== "decided") throw new RangeError(`a confirm's state is pending or decided: ${state}`);
+  const verdict = v.verdict ?? "";
+  if ((state === "decided") !== (CONFIRM_VERDICTS as readonly string[]).includes(verdict)) {
+    throw new RangeError(`a decided confirm carries its verdict, a pending one none: ${verdict}`);
+  }
+  if ((v.approvals ?? 0) < 0) throw new RangeError("a confirm's approvals are not negative");
+  const c: Confirm = {
+    invocationId: v.invocationId, desk: v.desk ?? "", kind, question, action: v.action ?? "", arguments: v.arguments && v.arguments.trim() ? v.arguments : "{}",
+    summary, deadline: v.deadline ?? null, options, reasons, code: v.code ?? "", state, verdict, by: [...(v.by ?? [])], reason: v.reason ?? "",
+    approvals: v.approvals ?? 0, quorum: Math.max(1, v.quorum ?? 1),
+  };
+  if (c.deadline === null) delete c.deadline;   // absent from the wire, as Java leaves a null field out
+  return c;
+}
+
+/** An answer, checked as the Java record checks it. */
+export function answer(v: Partial<Answer> & { invocationId: string; verdict: string }): Answer {
+  if (!v.invocationId || !v.invocationId.trim()) throw new RangeError("an answer names the request it answers");
+  if (!(CONFIRM_OPTIONS as readonly string[]).includes(v.verdict)) throw new RangeError(`an answer's verdict is approve, reject or amend: ${v.verdict}`);
+  const reason = v.reason ?? "";
+  if (reason.length > MAX_CONFIRM_TEXT) throw new RangeError("an answer's reason is at most 2000 characters");
+  const amendedArguments = v.amendedArguments ?? "";
+  if (amendedArguments && v.verdict !== "amend") throw new RangeError("only an amend carries amended arguments");
+  return { invocationId: v.invocationId, verdict: v.verdict, reason, amendedArguments };
+}
+
+/** One line of a thread in `conversations`; version 2 adds `format` and `cites`, version 3 `confirm` and `answer`. */
 @entry(A2UI_NAMESPACE + "ChatMessage")
 export class ChatMessage {
-  schemaVersion: 1 | 2 = 1;
+  schemaVersion: 1 | 2 | 3 = 1;
   id = "";
   key = "";
   from: From = { kind: "person", name: "", peer: "" };
@@ -93,13 +170,24 @@ export class ChatMessage {
   at = "";
   format?: string;
   cites?: Cite[];
+  confirm?: Confirm;
+  answer?: Answer;
 }
 
-/** A line, checked as the Java record checks it; a version 2 line takes `format` (plain by default) and `cites`. */
+/**
+ * A line, checked as the Java record checks it; a version 2 line takes `format` (plain by default) and `cites`, and a
+ * version 3 line may carry a `confirm` or an `answer`, never both.
+ */
 export function chatMessage(v: { schemaVersion?: number; id: string; key: string; from?: Partial<From>; text?: string; attachments?: string[];
-  inReplyTo?: string; at: string; format?: string; cites?: Array<Partial<Cite>> }): ChatMessage {
+  inReplyTo?: string; at: string; format?: string; cites?: Array<Partial<Cite>>; confirm?: Partial<Confirm> | null; answer?: Partial<Answer> | null }): ChatMessage {
   const m = new ChatMessage();
-  m.schemaVersion = version(v.schemaVersion ?? 1, "ChatMessage");
+  const sv = v.schemaVersion ?? 1;
+  if (sv !== 1 && sv !== 2 && sv !== 3) throw new RangeError(`a ChatMessage has schemaVersion 1, 2 or 3: ${sv}`);
+  m.schemaVersion = sv;
+  const hasConfirm = v.confirm !== undefined && v.confirm !== null;
+  const hasAnswer = v.answer !== undefined && v.answer !== null;
+  if (sv < 3 && (hasConfirm || hasAnswer)) throw new RangeError(`a version ${sv} ChatMessage carries no confirm and no answer; write version 3 for them`);
+  if (hasConfirm && hasAnswer) throw new RangeError("a ChatMessage carries a confirm or an answer, not both");
   m.id = v.id;
   m.key = v.key;
   const kind = v.from?.kind || "person";
@@ -124,6 +212,10 @@ export function chatMessage(v: { schemaVersion?: number; id: string; key: string
     m.format = format;
     m.cites = cites;
   }
+  delete m.confirm;
+  delete m.answer;
+  if (hasConfirm) m.confirm = confirm(v.confirm as Confirm);
+  if (hasAnswer) m.answer = answer(v.answer as Answer);
   return m;
 }
 

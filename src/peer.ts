@@ -961,6 +961,13 @@ export class Peer {
   /** Whether the tombstone collection runs as due work on this peer's loop (from the first state or claim stored). */
   private collector = false;
   private pulledAds = false;
+  /**
+   * The pulls that went out on no link (a host pulls its spaces before it dials its seed): asked again once a link is
+   * up, so the first round after joining reaches the group (SPEC §5.3) rather than waiting for the next anti-entropy
+   * round. A space here is in {@link pulledSpaces} too.
+   */
+  private readonly unsentPulls = new Set<string>();
+  private unsentAdsPull = false;
 
   private founderId(): string | null {
     if (this.founder !== null) {
@@ -1054,8 +1061,33 @@ export class Peer {
 
   async connectAny(seeds: Seed[]): Promise<void> {
     await this.dialAny(seeds);
+    this.linkUp(false);
+  }
+
+  /** Whether a frame sent now goes anywhere: the dialed channel or an accepted link. */
+  private hasLink(): boolean {
+    return this.channel !== null || this.inbound.size > 0;
+  }
+
+  /**
+   * A link is up: introduces this peer, pulls the revocations, and pulls again. After the first connect (`everything`
+   * false) that is each pull that went out on no link, so a space pulled before the dial is reconciled at once (SPEC
+   * §5.3: the first anti-entropy round runs immediately after joining). After a reconnect it is every space and the
+   * ads pulled before, since the group moved on while the link was down (ROBUSTNESS.md §3.6).
+   */
+  private linkUp(everything: boolean): void {
+    const spaces = [...(everything ? this.pulledSpaces : this.unsentPulls)];
+    const ads = everything ? this.pulledAds : this.unsentAdsPull;
+    this.unsentPulls.clear();
+    this.unsentAdsPull = false;
     this.introduce();
     this.pullRevocations();
+    if (ads) {
+      this.pullAds();
+    }
+    for (const space of spaces) {
+      this.pullSpace(space);
+    }
   }
 
   /** The seed the link is on (or was tried last), if any. */
@@ -1408,14 +1440,7 @@ export class Peer {
       }
       this.reconnecting = false;
       this.reconnects += 1;
-      this.introduce();
-      this.pullRevocations();
-      if (this.pulledAds) {
-        this.pullAds();
-      }
-      for (const space of this.pulledSpaces) {
-        this.pullSpace(space);
-      }
+      this.linkUp(true);
     }).catch(() => {
       if (!this.running) {
         this.reconnecting = false;
@@ -1833,6 +1858,9 @@ export class Peer {
   /** Anti-entropy pull of the `ads` stream (SPEC §6.2): the cards and capability advertisements the group holds. */
   pullAds(): void {
     this.pulledAds = true;
+    if (!this.hasLink()) {
+      this.unsentAdsPull = true; // the frame below reaches no one: asked again when a link is up
+    }
     this.send("DIGEST", wire.digestBody({ ads: new Uint8Array() }), null, "dial");
   }
 
@@ -2627,6 +2655,9 @@ export class Peer {
   pullSpace(space: string): void {
     this.joinSpace(space);
     this.pulledSpaces.add(space);
+    if (!this.hasLink()) {
+      this.unsentPulls.add(space); // the frame below reaches no one: asked again when a link is up, not a round later
+    }
     // HLC round four, 2026-11-08 (D5): the digest names no entry, so the partner answers with every
     // state but those this replica refused and acknowledges.
     const digests = { [`space:${space}`]: utf8(this.acknowledgedLines(space)), ...revocationDigests() };

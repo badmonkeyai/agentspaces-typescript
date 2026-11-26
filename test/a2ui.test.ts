@@ -38,6 +38,7 @@ const hexOf = (b: Uint8Array) => Buffer.from(b).toString("hex");
 test("each record encodes to the Java vector's bytes, and its bytes decode to its fields", () => {
   const cases: Array<[string, (j: any) => object]> = [
     ["chat_message_v1", j => a2ui.chatMessage(j)], ["chat_message_v2", j => a2ui.chatMessage(j)],
+    ["chat_message_v3_confirm", j => a2ui.chatMessage(j)], ["chat_message_v3_answer", j => a2ui.chatMessage(j)],
     ["shared_file_v1", j => a2ui.sharedFile(j)], ["shared_file_v2", j => a2ui.sharedFile(j)],
     ["working_on_v1", j => a2ui.workingOn(j)], ["chat_progress_v1", j => a2ui.chatProgress(j)],
   ];
@@ -65,11 +66,43 @@ test("a record that breaks a bound is refused (SR-3)", () => {
   assert.throws(() => a2ui.workingOn({ agent: "a", since: at, files: ["a\\b"] }), /path must be relative/);
 });
 
+test("version 3 carries a desk's request or a person's answer, and older versions neither (srad/cards.md slice 6.4)", () => {
+  const at = "2026-11-10T09:00:00Z";
+  const ask = { invocationId: "inv-7", question: "Refund 250?" };
+  const line = a2ui.chatMessage({ schemaVersion: 3, id: "m", key: "leads", at, confirm: ask });
+  assert.deepEqual(line.confirm?.options, ["approve", "reject"]);
+  assert.equal(line.confirm?.reasons, "optional");
+  assert.equal(line.confirm?.quorum, 1);
+  assert.ok(!("deadline" in line.confirm!), "a null deadline is left out, as Java leaves it out");
+  assert.ok(!("answer" in line));
+  assert.ok(!("confirm" in a2ui.chatMessage({ schemaVersion: 3, id: "m", key: "k", at })), "a v3 line with neither block");
+  assert.throws(() => a2ui.chatMessage({ schemaVersion: 2, id: "m", key: "k", at, confirm: ask }), /version 3/);
+  assert.throws(() => a2ui.chatMessage({ schemaVersion: 3, id: "m", key: "k", at, confirm: ask, answer: { invocationId: "inv-7", verdict: "approve" } }), /not both/);
+  assert.throws(() => a2ui.chatMessage({ schemaVersion: 4, id: "m", key: "k", at }), /schemaVersion 1, 2 or 3/);
+  assert.throws(() => a2ui.confirm({ invocationId: "", question: "Go?" }), /request/);
+  assert.throws(() => a2ui.confirm({ invocationId: "i", question: " " }), /question/);
+  assert.throws(() => a2ui.confirm({ invocationId: "i", question: "Go?", kind: "vote" }), /kind/);
+  assert.throws(() => a2ui.confirm({ invocationId: "i", question: "Go?", options: ["maybe"] }), /options/);
+  assert.throws(() => a2ui.confirm({ invocationId: "i", question: "Go?", reasons: "always" }), /reasons/);
+  assert.throws(() => a2ui.confirm({ invocationId: "i", question: "Go?", state: "decided" }), /verdict/);
+  assert.throws(() => a2ui.confirm({ invocationId: "i", question: "Go?", verdict: "approved" }), /verdict/);
+  assert.throws(() => a2ui.confirm({ invocationId: "i", question: "x".repeat(2001) }), /2000/);
+  assert.throws(() => a2ui.answer({ invocationId: "inv-7", verdict: "yes" }), /verdict/);
+  assert.throws(() => a2ui.answer({ invocationId: "inv-7", verdict: "approve", amendedArguments: "{}" }), /amend/);
+});
+
 test("a writer writes version 2 only when every reader advertises the hint (FR-10)", () => {
   assert.equal(a2ui.versionFor([{ "a2ui.records": "2" }, { "a2ui.records": "3" }]), 2);
   assert.equal(a2ui.versionFor([{ "a2ui.records": "2" }, {}]), 1);
   assert.equal(a2ui.versionFor([{ "a2ui.records": "two" }]), 1);
   assert.equal(a2ui.versionFor([]), 2, "no reader but the writer");
+  // by level: the lowest any reader advertises, never above the type's newest
+  assert.equal(a2ui.A2UI_RECORDS_VERSION, "3");
+  assert.equal(a2ui.versionAt([{ "a2ui.records": "3" }], a2ui.latest("ChatMessage")), 3);
+  assert.equal(a2ui.versionAt([{ "a2ui.records": "3" }, { "a2ui.records": "2" }], a2ui.latest(a2ui.A2UI_NAMESPACE + "ChatMessage")), 2);
+  assert.equal(a2ui.versionAt([{ "a2ui.records": "3" }], a2ui.latest("SharedFile")), 2);
+  assert.equal(a2ui.versionAt([{ "a2ui.records": "3" }, {}], 3), 1);
+  assert.equal(a2ui.versionAt([], 3), 3);
 });
 
 test("the builders shape the six components as the Java Surfaces does", () => {

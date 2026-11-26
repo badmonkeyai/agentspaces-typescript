@@ -28,7 +28,7 @@ import test from "node:test";
 
 import { Identity, Peer } from "@agentspaces/client";
 import "@agentspaces/client/node";
-import { DRIFT_TICKS, RECOVERY_MILLIS, ServiceHost } from "../src/host.js";
+import { ANTI_ENTROPY_MILLIS, DRIFT_TICKS, RECOVERY_MILLIS, ServiceHost } from "../src/host.js";
 
 const GROUP = "zNodeHostGroup";
 const TASK = "com.acme.Task#v1";
@@ -79,6 +79,35 @@ test("a tcp hub relays between dial-only peers and advertises its endpoint and r
     await host.stop();
   }
   await assert.rejects(new Peer(Identity.generate(), GROUP).connect(h, p), /no seed answered/);
+});
+
+test("a host that pulls its spaces before it dials its seed gets the existing entries at once, not at anti-entropy", async () => {
+  // The Jungle Gym's step 09 (0.7.0 docs round): ServiceHost.start() pulls its spaces before connectAny, the pull
+  // went out on no link and vanished, and the host saw the group's entries only at its first anti-entropy round.
+  const hub = new ServiceHost(Identity.generate(), GROUP, {
+    tickMillis: 50, listeners: [{ scheme: "tcp", bind: "127.0.0.1:0" }], spaces: ["tasks"], log: null,
+  });
+  await hub.start();
+  const address = hub.addresses.get("tcp")!;
+  const [h, p] = [address.substring(0, address.lastIndexOf(":")), Number(address.substring(address.lastIndexOf(":") + 1))];
+  const writer = new Peer(Identity.generate(), GROUP);
+  const late = new ServiceHost(Identity.generate(), GROUP, {
+    listeners: [{ scheme: "tcp", bind: "127.0.0.1:0" }], seeds: [{ host: h, port: p }], spaces: ["tasks"], log: null,
+  });
+  try {
+    await writer.connect(h, p);
+    const id = writer.writeEntry("tasks", TASK, { topic: "before the late host" }, "w");
+    await until(() => hub.peer.states.has(id));
+    const answered = hub.peer.pullsAnswered;
+    await late.start();
+    // Well inside the first anti-entropy round, so only the pull after the connect can have brought it.
+    await until(() => late.peer.states.has(id), ANTI_ENTROPY_MILLIS / 5);
+    assert.ok(hub.peer.pullsAnswered > answered, "the hub answered the late host's pull");
+  } finally {
+    writer.close();
+    await late.stop();
+    await hub.stop();
+  }
 });
 
 test("a host whose tick drifts three times drops to visitor duties and recovers after 60 s of cadence (JS-R-06)", async () => {

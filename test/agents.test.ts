@@ -216,18 +216,46 @@ test("a pull names the revocation streams, and a join pulls them once", async ()
     ["credential-revocations", "revocations", "space:tasks"]);
   const digests = (loads(sent.at(-1)![1]) as Dict)["digests"] as Dict;
   assert.equal((digests["revocations"] as Uint8Array).length, 0, "an empty digest asks for all");
-  // A late joiner asks for the revocation streams as soon as it connects.
+  // A late joiner asks for the revocation streams as soon as it connects (a fresh peer: one that pulled a space with
+  // no link pulls that space again on the connect, the next test).
+  const joiner = new Peer(Identity.generate(), GROUP, clock.now);
+  const joined = capture(joiner);
+  const server = createServer((socket) => socket.destroy());
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await joiner.connect("127.0.0.1", (server.address() as AddressInfo).port);
+  } finally {
+    joiner.close();
+    peer.close();
+    await new Promise((resolve) => server.close(resolve));
+  }
+  assert.deepEqual(joined.filter(([kind]) => kind === "DIGEST").map(([, body]) => digestStreams(body)),
+    [["credential-revocations", "revocations", "view"]]); // the membership view rides the same pull
+});
+
+test("a space and the ads pulled before the first connect are pulled again on it, once (SPEC §5.3, the first round)", async () => {
+  // ServiceHost.start() pulls its spaces before it dials its seed: those frames reach no link, so the connect asks
+  // again rather than leaving the space to the next anti-entropy round (the Jungle Gym's step 09, 0.7.0 docs round).
+  const peer = new Peer(Identity.generate(), GROUP, new Clock(T0).now);
+  const sent = capture(peer);
+  peer.pullSpace("tasks");
+  peer.pullAds();
   const server = createServer((socket) => socket.destroy());
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   sent.length = 0;
   try {
     await peer.connect("127.0.0.1", (server.address() as AddressInfo).port);
+    peer.pullSpace("notes"); // pulled with the link up: goes out once, and nothing pulls it again
   } finally {
     peer.close();
     await new Promise((resolve) => server.close(resolve));
   }
-  assert.deepEqual(sent.filter(([kind]) => kind === "DIGEST").map(([, body]) => digestStreams(body)),
-    [["credential-revocations", "revocations", "view"]]); // the membership view rides the same pull
+  assert.deepEqual(sent.filter(([kind]) => kind === "DIGEST").map(([, body]) => digestStreams(body)), [
+    ["credential-revocations", "revocations", "view"],
+    ["ads"],
+    ["credential-revocations", "revocations", "space:tasks"],
+    ["credential-revocations", "revocations", "space:notes"],
+  ]);
 });
 
 test("a pull response carrying a credential revocation applies it", () => {
